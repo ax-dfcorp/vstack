@@ -3,17 +3,30 @@
  * Provides spawn, send, event waiting, and text collection utilities.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
+import { parseEnv } from "node:util";
 
 const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-// Auto-load .env.test so int tests work when invoked directly
-// (`node --import tsx --test tests/int-foo.mjs`) and not just via `npm test`.
-const ENV_FILE = resolve(DIR, ".env.test");
-if (existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
+// Load tracked defaults and optional machine-local overrides so integration
+// tests work when invoked directly. Environment supplied by the caller wins.
+const INHERITED_ENV_KEYS = new Set(Object.keys(process.env));
+for (const name of [".env.test", ".env.test.local"]) {
+	const path = resolve(DIR, name);
+	if (!existsSync(path)) continue;
+	for (const [key, value] of Object.entries(parseEnv(readFileSync(path, "utf8")))) {
+		if (!INHERITED_ENV_KEYS.has(key)) process.env[key] = value;
+	}
+}
 
 /**
  * Create an RPC harness for pi integration tests.

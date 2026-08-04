@@ -4,6 +4,20 @@
 
 set -euo pipefail
 
+# Load the repository test defaults, then optional machine-local overrides.
+# Usage: load_test_env "$DIR"
+load_test_env() {
+	local dir="$1"
+	local file
+	local restore_allexport=1
+	[[ "$-" == *a* ]] && restore_allexport=0
+	set -a
+	for file in "$dir/.env.test" "$dir/.env.test.local"; do
+		[[ -f "$file" ]] && source "$file"
+	done
+	(( restore_allexport )) && set +a
+}
+
 # Strip node_modules/.bin from PATH so we use the system pi, not the vendored one.
 __clean_path() {
 	echo "$PATH" | tr ':' '\n' | grep -v node_modules | tr '\n' ':'
@@ -17,6 +31,7 @@ setup_test_env() {
 	local log_suffix="${2:-.log}"  # optional: suffix for logfile, or "none" for no logfile
 
 	DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+	load_test_env "$DIR"
 	LOGDIR="$DIR/.test-output"
 	mkdir -p "$LOGDIR"
 
@@ -50,7 +65,7 @@ require_env() {
 	local var="$1"
 	local val="${!var:-}"
 	if [[ -z "$val" ]]; then
-		echo "ERROR: $var not set (see .env.test)"
+		echo "ERROR: $var not set (see .env.test or .env.test.local)"
 		exit 1
 	fi
 	echo "$val"
