@@ -44593,7 +44593,7 @@ function formatDurationShort(ms) {
   return `${ms}ms`;
 }
 function buildStreamIdleTimeoutErrorMessage(timeoutMs) {
-  return `Claude Code stream idle timeout after ${formatDurationShort(timeoutMs)} with no assistant/tool output; treating stalled stream as retryable 529 overloaded/rate limit condition. Retry after ${formatDurationShort(STREAM_IDLE_BACKOFF_HINT_MS)}.`;
+  return `Claude Code stream idle timeout after ${formatDurationShort(timeoutMs)} with no SDK activity; treating stalled stream as retryable 529 overloaded/rate limit condition. Retry after ${formatDurationShort(STREAM_IDLE_BACKOFF_HINT_MS)}.`;
 }
 function createStreamIdleWatchdog({
   clearTimer = (timer) => clearTimeout(timer),
@@ -44616,7 +44616,7 @@ function createStreamIdleWatchdog({
     timer = null;
   };
   const shouldMonitor = (state) => Boolean(
-    timeoutMs > 0 && state.activeQuery && state.currentPiStream && state.turnOutput && !state.turnStarted && !state.turnSawStreamEvent
+    timeoutMs > 0 && state.activeQuery && state.currentPiStream && state.turnOutput && !state.childExecutedToolPending
   );
   const schedule = () => {
     clear();
@@ -45665,6 +45665,7 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
         debug("consumeQuery: unhandled SDK message type", message.type);
         break;
     }
+    activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
   }
   if (accountProbe) {
     await Promise.race([
@@ -46036,8 +46037,7 @@ function streamClaudeAgentSdk(model, context, options) {
       activeQuery: abortCtx.activeQuery,
       currentPiStream: abortCtx.currentPiStream,
       turnOutput: abortCtx.turnOutput,
-      turnSawStreamEvent: abortCtx.turnSawStreamEvent,
-      turnStarted: abortCtx.turnStarted
+      childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded)
     }),
     onTimeout: ({ idleMs, timeoutMs }) => {
       if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;

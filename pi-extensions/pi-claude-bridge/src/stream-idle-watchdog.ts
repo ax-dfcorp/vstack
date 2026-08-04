@@ -11,8 +11,7 @@ export interface StreamIdleWatchdogState {
 	activeQuery: unknown | null;
 	currentPiStream: AssistantMessageEventStream | null;
 	turnOutput: AssistantMessage | null;
-	turnSawStreamEvent: boolean;
-	turnStarted: boolean;
+	childExecutedToolPending: boolean;
 }
 
 export interface StreamIdleTimeoutInfo {
@@ -64,7 +63,7 @@ export function formatDurationShort(ms: number): string {
 }
 
 export function buildStreamIdleTimeoutErrorMessage(timeoutMs: number): string {
-	return `Claude Code stream idle timeout after ${formatDurationShort(timeoutMs)} with no assistant/tool output; treating stalled stream as retryable 529 overloaded/rate limit condition. Retry after ${formatDurationShort(STREAM_IDLE_BACKOFF_HINT_MS)}.`;
+	return `Claude Code stream idle timeout after ${formatDurationShort(timeoutMs)} with no SDK activity; treating stalled stream as retryable 529 overloaded/rate limit condition. Retry after ${formatDurationShort(STREAM_IDLE_BACKOFF_HINT_MS)}.`;
 }
 
 export function createStreamIdleWatchdog({
@@ -98,8 +97,11 @@ export function createStreamIdleWatchdog({
 		&& state.activeQuery
 		&& state.currentPiStream
 		&& state.turnOutput
-		&& !state.turnStarted
-		&& !state.turnSawStreamEvent,
+		// A claude.ai connector executes inside the child and can legitimately
+		// suppress every SDK event while the remote service works. Pi-executed tool
+		// waits already have currentPiStream=null; this is the equivalent guard for
+		// child-executed tools. The caller refreshes after the result is observed.
+		&& !state.childExecutedToolPending,
 	);
 
 	const schedule = () => {

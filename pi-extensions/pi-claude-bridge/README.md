@@ -212,7 +212,7 @@ When Claude Code reports a rate-limit reset time, the bridge shows one clear `[r
 
 Allowed-warning rate-limit events are filtered before user notification. The bridge normalizes unambiguous numeric utilization (`0 < value < 1` as fractional, `1 < value <= 100` as percent), suppresses low or unit-ambiguous values such as exact `1`, and only shows a neutral warning at 80%+ instead of claiming an unverified `% used` value. Check Claude Code `/usage` for exact allowed-warning utilization.
 
-If Claude Code accepts a turn but produces no visible output, the bridge returns a retryable assistant error with a backoff hint instead of leaving Pi stuck waiting. Tune the first-output timeout with `CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT` (bare numbers are seconds; suffixes `ms`, `s`, and `m` are accepted). Default: `90s`; set `0` to disable.
+If Claude Code accepts a turn but produces no output—or stops producing SDK events after output or a Pi tool result—the bridge returns a retryable assistant error with a backoff hint instead of leaving Pi stuck waiting. The timer resets on every SDK event and pauses while a child-executed claude.ai connector is running. Tune it with `CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT` (bare numbers are seconds; suffixes `ms`, `s`, and `m` are accepted). Default: `90s`; set `0` to disable.
 
 ## Debugging
 

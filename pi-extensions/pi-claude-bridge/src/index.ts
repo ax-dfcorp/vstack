@@ -685,6 +685,10 @@ async function consumeQuery(
 				debug("consumeQuery: unhandled SDK message type", message.type);
 				break;
 		}
+		// noteChunk runs before message processing so its timestamp reflects when
+		// the SDK event arrived. Refresh again after processing because a child-
+		// executed connector result can make the stream monitorable again.
+		activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
 	}
 
 	if (accountProbe) {
@@ -1198,8 +1202,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				activeQuery: abortCtx.activeQuery,
 				currentPiStream: abortCtx.currentPiStream,
 				turnOutput: abortCtx.turnOutput,
-				turnSawStreamEvent: abortCtx.turnSawStreamEvent,
-				turnStarted: abortCtx.turnStarted,
+				childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded),
 			}),
 			onTimeout: ({ idleMs, timeoutMs }) => {
 				if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;

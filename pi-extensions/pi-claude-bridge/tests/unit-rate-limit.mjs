@@ -91,15 +91,14 @@ describe("stream-idle timeout", () => {
 		assert.match(message, new RegExp(String(STREAM_IDLE_BACKOFF_HINT_MS / 1000)));
 	});
 
-	it("fires only while a Pi stream is waiting for first assistant output", () => {
+	it("fires while an active Pi stream has no SDK activity", () => {
 		let now = 0;
 		const timers = [];
 		const state = {
 			activeQuery: {},
 			currentPiStream: {},
 			turnOutput: { timestamp: 0 },
-			turnSawStreamEvent: false,
-			turnStarted: false,
+			childExecutedToolPending: false,
 		};
 		const timeouts = [];
 		const watchdog = createStreamIdleWatchdog({
@@ -130,15 +129,14 @@ describe("stream-idle timeout", () => {
 		assert.equal(watchdog.timedOut(), true);
 	});
 
-	it("does not fire after visible stream output starts", () => {
+	it("continues monitoring after visible stream output starts", () => {
 		let now = 0;
 		let timer;
 		const state = {
 			activeQuery: {},
 			currentPiStream: {},
 			turnOutput: { timestamp: 0 },
-			turnSawStreamEvent: false,
-			turnStarted: false,
+			childExecutedToolPending: false,
 		};
 		const timeouts = [];
 		const watchdog = createStreamIdleWatchdog({
@@ -153,10 +151,53 @@ describe("stream-idle timeout", () => {
 			timeoutMs: 1_000,
 		});
 		watchdog.refresh();
-		state.turnSawStreamEvent = true;
-		now = 1_000;
+		now = 250;
+		watchdog.noteChunk(); // visible thinking/text/tool output
+		now = 1_250;
 		timer.fn();
-		assert.equal(timeouts.length, 0);
-		assert.equal(timer.cancelled, true);
+		assert.deepEqual(timeouts, [{ idleMs: 1_000, timeoutMs: 1_000 }]);
+	});
+
+	it("pauses for a child-executed connector and rearms after its result", () => {
+		let now = 0;
+		const timers = [];
+		const state = {
+			activeQuery: {},
+			currentPiStream: {},
+			turnOutput: { timestamp: 0 },
+			childExecutedToolPending: false,
+		};
+		const timeouts = [];
+		const watchdog = createStreamIdleWatchdog({
+			clearTimer: (timer) => { timer.cancelled = true; },
+			getState: () => state,
+			now: () => now,
+			onTimeout: (info) => timeouts.push(info),
+			setTimer: (fn, delayMs) => {
+				const timer = { cancelled: false, delayMs, fn };
+				timers.push(timer);
+				return timer;
+			},
+			timeoutMs: 1_000,
+		});
+
+		watchdog.refresh();
+		now = 400;
+		state.childExecutedToolPending = true;
+		watchdog.noteChunk();
+		assert.equal(timers.length, 1);
+		assert.equal(timers[0].cancelled, true);
+
+		// The result SDK message arrives while the connector is still marked
+		// pending; consumeQuery refreshes once more after recording the result.
+		now = 5_000;
+		watchdog.noteChunk();
+		state.childExecutedToolPending = false;
+		watchdog.refresh();
+		assert.equal(timers.at(-1).delayMs, 1_000);
+
+		now = 6_000;
+		timers.at(-1).fn();
+		assert.deepEqual(timeouts, [{ idleMs: 1_000, timeoutMs: 1_000 }]);
 	});
 });
