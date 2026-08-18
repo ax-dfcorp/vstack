@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import type { McpResult } from "./extract-tool-results.js";
+import type { DeferredUserPrompt } from "./user-prompt.js";
 
 export interface PendingToolCall {
 	toolName: string;
@@ -165,7 +166,7 @@ export class QueryContext {
 	resolvedToolResultIds = new Set<string>();
 	unmatchedToolResultIds = new Set<string>();
 	reportedToolResultMismatch = false;
-	deferredUserMessages: string[] = [];
+	deferredUserMessages: DeferredUserPrompt[] = [];
 	handledTerminalError = false;
 	// Once visible text/thinking or a complete tool call reaches Pi, the request
 	// must never be replayed on another account (duplicate side effects).

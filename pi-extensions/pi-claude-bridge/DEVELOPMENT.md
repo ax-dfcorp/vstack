@@ -12,6 +12,7 @@ Implementation details for contributors. End-user setup, settings, and troublesh
 - If a query tears down while parallel tool results are still queued or unresolved, the bridge writes diagnostics, marks the Claude session for rebuild, and re-imports delivered results from Pi history on the next turn.
 - Integrity events (mismatch, synthetic-result repair, stale-result reap, unmatched handler) are also appended to the pi session as `claude-bridge-integrity` custom entries — compact metadata only — so a post-mortem works from the session file alone.
 - Unpaired tool_uses in a session rebuild are paired with an explicit `is_error` result telling the model the output was lost and to re-run the tool if needed, instead of cc-session-io's bare `[no tool result recorded]` placeholder that models read as real output.
+- Session rebuilds and deferred steer/follow-up continuations preserve mixed text/image user content as real Anthropic image blocks. An output-less aborted assistant turn is labeled as interrupted rather than with the generic incompatible-content marker, so a later `continue` cannot mistake the interruption placeholder for a rejected image.
 
 ## Child-executed tools (claude.ai connectors)
 

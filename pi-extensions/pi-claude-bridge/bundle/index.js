@@ -27765,6 +27765,14 @@ function toolResultToAnthropicBlock(msg, sanitizedIds) {
 function hasToolUse(msg) {
   return msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some((block) => block.type === "toolCall");
 }
+function emptyAssistantPlaceholder(msg) {
+  const stopReason = msg.stopReason;
+  const errorMessage = msg.errorMessage;
+  if (stopReason === "aborted" || typeof errorMessage === "string" && /\babort(?:ed)?\b/i.test(errorMessage)) {
+    return "[Previous assistant turn was interrupted before responding]";
+  }
+  return "[incompatible content omitted]";
+}
 function convertPiMessages(messages, customToolNameToSdk) {
   const anthropicMessages = [];
   const sanitizedIds = /* @__PURE__ */ new Map();
@@ -27806,7 +27814,7 @@ function convertPiMessages(messages, customToolNameToSdk) {
           blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
         }
       }
-      if (!blocks.length) blocks.push({ type: "text", text: "[incompatible content omitted]" });
+      if (!blocks.length) blocks.push({ type: "text", text: emptyAssistantPlaceholder(msg) });
       anthropicMessages.push({ role: "assistant", content: blocks });
       if (hasToolUse(msg)) {
         const toolMessages = [];
@@ -27839,6 +27847,55 @@ function convertPiMessages(messages, customToolNameToSdk) {
     }
   }
   return { anthropicMessages, sanitizedIds };
+}
+
+// src/user-prompt.ts
+function extractUserPrompt(messages) {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "user") return null;
+  if (typeof last.content === "string") return last.content;
+  return messageContentToText(last.content) || "";
+}
+function extractUserPromptBlocks(messages) {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "user" || !Array.isArray(last.content)) return null;
+  let hasImage = false;
+  const blocks = [];
+  for (const block of last.content) {
+    if (block.type === "text" && block.text) {
+      blocks.push({ type: "text", text: block.text });
+    } else if (block.type === "image" && block.data && block.mimeType) {
+      hasImage = true;
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: block.mimeType,
+          data: block.data
+        }
+      });
+    }
+  }
+  return hasImage ? blocks : null;
+}
+function extractDeferredUserPrompt(messages) {
+  const text = extractUserPrompt(messages) ?? "";
+  const blocks = extractUserPromptBlocks(messages);
+  return text || blocks ? { text, blocks } : null;
+}
+async function* wrapPromptStream(blocks) {
+  yield {
+    type: "user",
+    message: { role: "user", content: blocks },
+    parent_tool_use_id: null
+  };
+}
+function deferredUserPromptText(prompt) {
+  return typeof prompt === "string" ? prompt : prompt.text;
+}
+function deferredUserPromptToSdkInput(prompt) {
+  if (typeof prompt === "string" || !prompt.blocks) return deferredUserPromptText(prompt);
+  return wrapPromptStream(prompt.blocks);
 }
 
 // src/models.ts
@@ -43783,7 +43840,7 @@ function spawnClaudeCodeWithDiagnostics(options) {
   };
 }
 
-// node_modules/cc-session-io/dist/chunk-D6EZBJOC.js
+// node_modules/cc-session-io/dist/chunk-7JUXR4CP.js
 import { randomUUID } from "crypto";
 import { mkdirSync as mkdirSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync3, existsSync as existsSync6, rmSync as rmSync2 } from "fs";
 import { dirname as dirname6 } from "path";
@@ -43832,7 +43889,11 @@ function getSessionPath(sessionId, projectPath, claudeDir) {
   return join9(getProjectDir(projectPath, claudeDir), `${sessionId}.jsonl`);
 }
 function repairToolPairing(messages) {
+  return repairWithOrigin(messages).messages;
+}
+function repairWithOrigin(messages) {
   const result = [];
+  const origin = [];
   let pending = null;
   const synthetic = (id) => ({
     type: "tool_result",
@@ -43843,10 +43904,11 @@ function repairToolPairing(messages) {
   const flushPending = () => {
     if (pending && pending.size > 0) {
       result.push({ role: "user", content: [...pending].map(synthetic) });
+      origin.push(null);
     }
     pending = null;
   };
-  for (const msg of messages) {
+  for (const [index, msg] of messages.entries()) {
     if (msg.role === "assistant") {
       flushPending();
       const ids = /* @__PURE__ */ new Set();
@@ -43856,6 +43918,7 @@ function repairToolPairing(messages) {
         }
       }
       result.push(msg);
+      origin.push(index);
       pending = ids.size > 0 ? ids : null;
       continue;
     }
@@ -43863,6 +43926,7 @@ function repairToolPairing(messages) {
     const hasToolResults = blocks?.some((b) => b.type === "tool_result") ?? false;
     if (!pending && !hasToolResults) {
       result.push(msg);
+      origin.push(index);
       continue;
     }
     const input = blocks ?? (typeof msg.content === "string" && msg.content ? [{ type: "text", text: msg.content }] : []);
@@ -43883,13 +43947,15 @@ function repairToolPairing(messages) {
     if (kept.length === 0) {
       if (result.length === 0) {
         result.push({ role: "user", content: [{ type: "text", text: "[orphaned tool result removed]" }] });
+        origin.push(null);
       }
       continue;
     }
     result.push({ ...msg, content: kept });
+    origin.push(index);
   }
   flushPending();
-  return result;
+  return { messages: result, origin };
 }
 var ADJECTIVES = [
   "ancient",
@@ -44007,7 +44073,7 @@ var Session = class {
     this._nextTimestamp = Date.now();
     for (let i = this._records.length - 1; i >= 0; i--) {
       const r = this._records[i];
-      if (r.type === "user" || r.type === "assistant") {
+      if (r.type === "user" || r.type === "assistant" || r.type === "attachment") {
         this._lastUuid = r.uuid;
         break;
       }
@@ -44022,6 +44088,11 @@ var Session = class {
     return this.records.filter(
       (r) => r.type === "user" || r.type === "assistant"
     );
+  }
+  /** Only attachment records — Claude Code's injected context (`@file`
+   *  expansions, skill listings, task reminders). */
+  get attachments() {
+    return this.records.filter((r) => r.type === "attachment");
   }
   baseFields() {
     const uuid3 = randomUUID();
@@ -44041,16 +44112,87 @@ var Session = class {
     this._lastUuid = uuid3;
     return record2;
   }
-  /** Add a user text message. Returns its uuid. */
-  addUserMessage(text) {
+  /** Add a user message, as plain text or content blocks. Returns its uuid. */
+  addUserMessage(content) {
+    if (Array.isArray(content) && content.length === 0) {
+      throw new Error("addUserMessage: content array is empty; Anthropic rejects empty message content");
+    }
     const base = this.baseFields();
     const record2 = {
       type: "user",
       ...base,
-      message: { role: "user", content: text }
+      message: { role: "user", content }
     };
     this._pendingRecords.push(record2);
     return base.uuid;
+  }
+  /**
+   * Append a record verbatim. The escape hatch for record types this library
+   * does not model — `queue-operation`, `last-prompt`, anything a future Claude
+   * Code release adds — and for carrying records from one session into another.
+   *
+   * Dangerous because nothing is synthesized or checked beyond `sessionId` and
+   * the parent link: the shape is whatever you pass, and Claude Code will read
+   * it back. `sessionId` is overwritten with this session's, since a record
+   * claiming another session is never what a caller wants. The record does not
+   * join the uuid chain, so a following message still parents to the last real
+   * message.
+   *
+   * The one guard is on `parentUuid`, because that is the failure that does not
+   * announce itself: a dangling parent makes Claude Code resume with empty
+   * context and answer confidently from nothing.
+   *
+   * Carrying an *attachment* into another session should use `addAttachment`
+   * instead: this method does not advance the chain, so an attachment appended
+   * through it becomes a leaf the next message skips over.
+   */
+  dangerousAppendRecord(record2, opts) {
+    const parentUuid = opts?.parentUuid !== void 0 ? opts.parentUuid : record2.parentUuid;
+    if (parentUuid != null) {
+      const known = this.records.some((r) => r.uuid === parentUuid);
+      if (!known) {
+        throw new Error(
+          `dangerousAppendRecord: parentUuid ${parentUuid} is not a record in this session; a dangling parent makes Claude Code resume with empty context`
+        );
+      }
+    }
+    this._pendingRecords.push({
+      ...record2,
+      ...parentUuid !== void 0 ? { parentUuid } : {},
+      sessionId: this.sessionId
+    });
+  }
+  /**
+   * Add an attachment record. `parentUuid` defaults to the record this session
+   * would currently chain from; pass it explicitly when re-attaching a record
+   * carried over from another session, where the message it belongs to has been
+   * given a new uuid. Returns the new record's uuid.
+   *
+   * Attachments are links in the uuid chain, not leaves hanging off it: the
+   * record that follows one parents to the attachment, so this advances the
+   * chain exactly as the message methods do. Measured across 605 real sessions —
+   * 3,526 records chain through an attachment, none skip it.
+   */
+  addAttachment(attachment, opts) {
+    const uuid3 = randomUUID();
+    const record2 = {
+      type: "attachment",
+      attachment,
+      uuid: uuid3,
+      parentUuid: opts?.parentUuid !== void 0 ? opts.parentUuid : this._lastUuid,
+      sessionId: this.sessionId,
+      timestamp: new Date(this._nextTimestamp++).toISOString(),
+      isSidechain: false,
+      cwd: this._cwd,
+      userType: "external",
+      version: this._version,
+      gitBranch: this._gitBranch,
+      slug: this._slug,
+      entrypoint: "cli"
+    };
+    this.dangerousAppendRecord(record2);
+    this._lastUuid = uuid3;
+    return uuid3;
   }
   /** Add an assistant message with the given content blocks. Returns its uuid. */
   addAssistantMessage(content, opts) {
@@ -44122,9 +44264,21 @@ var Session = class {
    * Import an array of Anthropic API-shaped messages, dispatching each to the
    * appropriate internal method based on role and content type.
    */
-  importMessages(messages) {
-    messages = repairToolPairing(messages);
-    for (const msg of messages) {
+  importMessages(messages, opts) {
+    const { messages: repaired, origin } = repairWithOrigin(messages);
+    const following = /* @__PURE__ */ new Map();
+    for (const a of opts?.attachments ?? []) {
+      if (a.afterIndex < 0 || a.afterIndex >= messages.length) {
+        console.warn(
+          `importMessages: attachment afterIndex ${a.afterIndex} is out of range (${messages.length} messages); not emitted`
+        );
+        continue;
+      }
+      const list = following.get(a.afterIndex);
+      if (list) list.push(a);
+      else following.set(a.afterIndex, [a]);
+    }
+    for (const [i, msg] of repaired.entries()) {
       if (msg.role === "assistant") {
         const content = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content;
         this.addAssistantMessage(content);
@@ -44135,17 +44289,22 @@ var Session = class {
           const toolResults = msg.content.filter(
             (b) => b.type === "tool_result"
           );
+          const rest = msg.content.filter(
+            (b) => b.type !== "tool_result"
+          );
           if (toolResults.length > 0) {
             this.addToolResults(toolResults.map((r) => ({
               toolUseId: r.tool_use_id,
               content: r.content,
               isError: r.is_error
             })));
-          } else {
-            const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-            this.addUserMessage(text || JSON.stringify(msg.content));
           }
+          if (rest.length > 0) this.addUserMessage(rest);
         }
+      }
+      const src = origin[i];
+      if (src !== null) {
+        for (const a of following.get(src) ?? []) this.addAttachment(a.attachment);
       }
     }
   }
@@ -45371,51 +45530,6 @@ function extractAllToolResults2(context) {
   }
   return results;
 }
-function extractUserPrompt(messages) {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user") return null;
-  if (typeof last.content === "string") return last.content;
-  return messageContentToText(last.content) || "";
-}
-function extractUserPromptBlocks(messages) {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user") return null;
-  if (typeof last.content === "string") {
-    debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
-    return null;
-  }
-  if (!Array.isArray(last.content)) {
-    debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
-    return null;
-  }
-  debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b) => b.type).join(",")}`);
-  let hasImage = false;
-  const blocks = [];
-  for (const block of last.content) {
-    if (block.type === "text" && block.text) {
-      blocks.push({ type: "text", text: block.text });
-    } else if (block.type === "image") {
-      debug(`image block: mimeType=${block.mimeType}, data length=${(block.data ?? "").length}, keys=${Object.keys(block).join(",")}`);
-      if (!block.data || !block.mimeType) {
-        debug(`image block missing data or mimeType, skipping`);
-        continue;
-      }
-      hasImage = true;
-      blocks.push({
-        type: "image",
-        source: { type: "base64", media_type: block.mimeType, data: block.data }
-      });
-    }
-  }
-  return hasImage ? blocks : null;
-}
-async function* wrapPromptStream(blocks) {
-  yield {
-    type: "user",
-    message: { role: "user", content: blocks },
-    parent_tool_use_id: null
-  };
-}
 function resolveMcpTools(context, excludeToolName) {
   const mcpTools = [];
   const customToolNameToSdk = /* @__PURE__ */ new Map();
@@ -45805,10 +45919,12 @@ function streamClaudeAgentSdk(model, context, options) {
       piUI?.notify(`Claude bridge: ${queryCtx.pendingToolCalls.size} tool handler(s) still waiting \u2014 provider may be stuck`, "warning");
     }
     if (lastMsgRole === "user") {
-      const userPrompt = extractUserPrompt(context.messages);
+      const userPrompt = extractDeferredUserPrompt(context.messages);
       if (userPrompt) {
         ctx().deferredUserMessages.push(userPrompt);
-        debug(`provider: deferred user message for replay after query: ${userPrompt.slice(0, 60)}`);
+        debug(
+          `provider: deferred user message for replay after query: ${userPrompt.text.slice(0, 60)}${userPrompt.blocks ? " [+images]" : ""}`
+        );
       }
     }
     if (sharedSession) sharedSession.cursor = context.messages.length;
@@ -46187,8 +46303,13 @@ function streamClaudeAgentSdk(model, context, options) {
     if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
     try {
       while (abortCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
-        const steerPrompt = abortCtx.deferredUserMessages.shift();
-        debug(`provider: replaying deferred user message: ${steerPrompt.slice(0, 60)}`);
+        const deferredPrompt = abortCtx.deferredUserMessages.shift();
+        const deferredText = deferredUserPromptText(deferredPrompt);
+        const steerPrompt = deferredUserPromptToSdkInput(deferredPrompt);
+        const hasDeferredImages = typeof deferredPrompt !== "string" && deferredPrompt.blocks !== null;
+        debug(
+          `provider: replaying deferred user message: ${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`
+        );
         abortCtx.resetTurnState(model);
         abortCtx.resetToolTracking();
         const resumeId = sharedSession?.sessionId;
@@ -46199,7 +46320,9 @@ function streamClaudeAgentSdk(model, context, options) {
         const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
         const contQuery = sdkQueryFactory({ prompt: steerPrompt, options: contOptions });
         abortCtx.activeQuery = contQuery;
-        debug(`provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${steerPrompt.slice(0, 60)}`);
+        debug(
+          `provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`
+        );
         try {
           const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
           if (continuation.failure) {

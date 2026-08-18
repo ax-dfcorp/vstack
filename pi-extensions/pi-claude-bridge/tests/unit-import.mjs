@@ -169,6 +169,19 @@ describe("thinking block filtering", () => {
 		assert.equal(result[0].content[0].text, "[incompatible content omitted]");
 	});
 
+	it("aborted assistant without compatible output gets an interruption marker", () => {
+		const result = convert([{
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "partial", thinkingSignature: "" }],
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+		}]);
+		assert.equal(
+			result[0].content[0].text,
+			"[Previous assistant turn was interrupted before responding]",
+		);
+	});
+
 	it("non-Claude assistant provider provenance is preserved", () => {
 		const result = convert([
 			{ role: "assistant", provider: "openai", model: "gpt-test", content: [{ type: "text", text: "hello" }] },
@@ -313,6 +326,28 @@ describe("message structure", () => {
 	it("user with array content containing text blocks", () => {
 		const result = convert([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
 		assert.deepEqual(result[0].content, [{ type: "text", text: "hi" }]);
+	});
+
+	it("user text and images preserve Anthropic image blocks", () => {
+		const result = convert([{
+			role: "user",
+			content: [
+				{ type: "text", text: "inspect this" },
+				{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+				{ type: "image", mimeType: "image/jpeg", data: "/9j/4AAQSkZJRg==" },
+			],
+		}]);
+		assert.deepEqual(result[0].content, [
+			{ type: "text", text: "inspect this" },
+			{
+				type: "image",
+				source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+			},
+			{
+				type: "image",
+				source: { type: "base64", media_type: "image/jpeg", data: "/9j/4AAQSkZJRg==" },
+			},
+		]);
 	});
 
 	it("user with empty text blocks in array → [image] fallback", () => {

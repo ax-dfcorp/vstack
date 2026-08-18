@@ -6,13 +6,19 @@ import {
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import {
 	LEGACY_PROVIDER_ID,
 	PROVIDER_ID,
 	isClaudeProvider,
-	messageContentToText,
 } from "./convert.js";
+import {
+	deferredUserPromptText,
+	deferredUserPromptToSdkInput,
+	extractDeferredUserPrompt,
+	extractUserPrompt,
+	extractUserPromptBlocks,
+	wrapPromptStream,
+} from "./user-prompt.js";
 import { buildModels, fallbackModelForPrimaryModel, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
@@ -272,56 +278,6 @@ function extractAllToolResults(context: Context): McpResult[] {
 	return results;
 }
 
-/** Extract the last user message from context as a prompt string. Returns null if last message is not a user message. */
-function extractUserPrompt(messages: Context["messages"]): string | null {
-	const last = messages[messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	if (typeof last.content === "string") return last.content;
-	return messageContentToText(last.content) || "";
-}
-
-/** Extract the last user message as ContentBlockParam[] (preserving images).
- *  Returns null if no images — caller should fall back to string prompt. */
-function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const last = messages[messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	if (typeof last.content === "string") {
-		debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
-		return null;
-	}
-	if (!Array.isArray(last.content)) {
-		debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
-		return null;
-	}
-	debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
-	let hasImage = false;
-	const blocks: ContentBlockParam[] = [];
-	for (const block of last.content) {
-		if (block.type === "text" && block.text) {
-			blocks.push({ type: "text", text: block.text });
-		} else if (block.type === "image") {
-			debug(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
-			if (!(block as any).data || !(block as any).mimeType) {
-				debug(`image block missing data or mimeType, skipping`);
-				continue;
-			}
-			hasImage = true;
-			blocks.push({
-				type: "image",
-				source: { type: "base64", media_type: block.mimeType as Base64ImageSource["media_type"], data: block.data },
-			});
-		}
-	}
-	return hasImage ? blocks : null;
-}
-
-async function* wrapPromptStream(blocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
-	yield {
-		type: "user",
-		message: { role: "user", content: blocks } as MessageParam,
-		parent_tool_use_id: null,
-	};
-}
 
 // --- Provider helpers: tool resolution ---
 
@@ -888,10 +844,12 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		// The bridge can't forward these mid-query (the SDK query is in progress),
 		// so we save them for replay as continuation queries after consumeQuery ends.
 		if (lastMsgRole === "user") {
-			const userPrompt = extractUserPrompt(context.messages);
+			const userPrompt = extractDeferredUserPrompt(context.messages);
 			if (userPrompt) {
 				ctx().deferredUserMessages.push(userPrompt);
-				debug(`provider: deferred user message for replay after query: ${userPrompt.slice(0, 60)}`);
+				debug(
+					`provider: deferred user message for replay after query: ${userPrompt.text.slice(0, 60)}${userPrompt.blocks ? " [+images]" : ""}`,
+				);
 			}
 		}
 
@@ -1363,8 +1321,13 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 
 			try {
 				while (abortCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
-					const steerPrompt = abortCtx.deferredUserMessages.shift()!;
-					debug(`provider: replaying deferred user message: ${steerPrompt.slice(0, 60)}`);
+					const deferredPrompt = abortCtx.deferredUserMessages.shift()!;
+					const deferredText = deferredUserPromptText(deferredPrompt);
+					const steerPrompt = deferredUserPromptToSdkInput(deferredPrompt);
+					const hasDeferredImages = typeof deferredPrompt !== "string" && deferredPrompt.blocks !== null;
+					debug(
+						`provider: replaying deferred user message: ${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`,
+					);
 					abortCtx.resetTurnState(model);
 					abortCtx.resetToolTracking();
 
@@ -1377,7 +1340,9 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 					const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
 					const contQuery = sdkQueryFactory({ prompt: steerPrompt, options: contOptions });
 					abortCtx.activeQuery = contQuery;
-					debug(`provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${steerPrompt.slice(0, 60)}`);
+					debug(
+						`provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`,
+					);
 
 					try {
 						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);

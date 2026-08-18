@@ -127,6 +127,18 @@ function hasToolUse(msg: PiMessage): boolean {
 	return msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some((block) => block.type === "toolCall");
 }
 
+function emptyAssistantPlaceholder(msg: PiMessage): string {
+	const stopReason = (msg as { stopReason?: unknown }).stopReason;
+	const errorMessage = (msg as { errorMessage?: unknown }).errorMessage;
+	if (
+		stopReason === "aborted" ||
+		(typeof errorMessage === "string" && /\babort(?:ed)?\b/i.test(errorMessage))
+	) {
+		return "[Previous assistant turn was interrupted before responding]";
+	}
+	return "[incompatible content omitted]";
+}
+
 /** Convert pi message array to Anthropic API format. */
 export function convertPiMessages(
 	messages: PiMessage[],
@@ -174,7 +186,7 @@ export function convertPiMessages(
 					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
 				}
 			}
-			if (!blocks.length) blocks.push({ type: "text", text: "[incompatible content omitted]" });
+			if (!blocks.length) blocks.push({ type: "text", text: emptyAssistantPlaceholder(msg) });
 			anthropicMessages.push({ role: "assistant", content: blocks });
 
 			// Pi may inject steer/followUp user messages between parallel tool
