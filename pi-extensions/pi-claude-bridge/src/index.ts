@@ -145,6 +145,7 @@ const ROTATION_STATE_KEY = Symbol("claude-bridge:rotationState");
 interface RotationRequestState {
 	excludedProfileIds: Set<string>;
 	attempts: number;
+	contextRebuildAttempted: boolean;
 }
 
 type BridgeStreamOptions = SimpleStreamOptions & {
@@ -471,6 +472,10 @@ interface ClaudeAttemptFailure {
 	kind?: ClaudeAccountFailureKind;
 	message: string;
 	rateLimitInfo?: Record<string, unknown>;
+}
+
+function isClaudeContextLengthFailure(message: string): boolean {
+	return /\bprompt is too long\b|\binput (?:is |was )?too long\b|\bcontext(?: window)? (?:is |was )?(?:too long|exceeded|overflow)|\bexceeds? (?:the )?context window\b/i.test(message);
 }
 
 interface ConsumeQueryResult {
@@ -922,16 +927,18 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const rotationState: RotationRequestState = rotationOptions?.[ROTATION_STATE_KEY] ?? {
 		excludedProfileIds: new Set<string>(),
 		attempts: 0,
+		contextRebuildAttempted: false,
 	};
 	let account: ClaudeAccountRoute | undefined;
 	if (router) {
 		try {
+			const accountFailover = rotationState.excludedProfileIds.size > 0;
 			account = router.acquire({
 				modelId: model.id,
 				sessionId: options?.sessionId,
 				excludedProfileIds: [...rotationState.excludedProfileIds],
-				forceRerank: rotationState.attempts > 0,
-				reason: rotationState.attempts > 0 ? "automatic-failover" : undefined,
+				forceRerank: accountFailover,
+				reason: accountFailover ? "automatic-failover" : undefined,
 			});
 			rotationState.attempts += 1;
 		} catch (error) {
@@ -1232,6 +1239,27 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
+	const requestContextRebuild = (failure: ClaudeAttemptFailure): boolean => {
+		const eligible = Boolean(
+			isClaudeContextLengthFailure(failure.message) &&
+			!rotationState.contextRebuildAttempted &&
+			sharedSession &&
+			attemptBuffer &&
+			!abortCtx.committedOutput &&
+			!wasAborted &&
+			!options?.signal?.aborted,
+		);
+		if (!eligible || !sharedSession) return false;
+		rotationState.contextRebuildAttempted = true;
+		setSharedSession({ ...sharedSession, needsRebuild: true });
+		retryRequested = true;
+		retryFailure = failure;
+		attemptBuffer?.discard();
+		abortCtx.currentPiStream = null;
+		debug(`provider: rebuilding stale Claude session after context rejection, session=${sharedSession.sessionId.slice(0, 8)}`);
+		return true;
+	};
+
 	const requestRotation = (failure: ClaudeAttemptFailure): boolean => {
 		recordAttemptFailure(failure);
 		const eligible = Boolean(account && router && failure.kind && !abortCtx.committedOutput && !wasAborted && !options?.signal?.aborted && rotationState.attempts < 16);
@@ -1300,6 +1328,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			}
 
 			if (failure) {
+				if (requestContextRebuild(failure)) return;
 				if (requestRotation(failure)) return;
 				surfaceFailure(failure);
 				return;
@@ -1385,6 +1414,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				kind: classifyClaudeFailure(error),
 				message: error instanceof Error ? error.message : String(error),
 			};
+			if (requestContextRebuild(failure)) return;
 			if (requestRotation(failure)) return;
 			if (!wasAborted && !options?.signal?.aborted) setSharedSession(null);
 			surfaceFailure(failure, Boolean(options?.signal?.aborted));

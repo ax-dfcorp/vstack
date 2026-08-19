@@ -400,6 +400,75 @@ describe("managed account stream rotation", () => {
 		assert.equal(events.find((event) => event.type === "error")?.reason, "aborted");
 	});
 
+	it("rebuilds one stale Claude session after a pre-output context rejection", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		__testSetBridgeIntegrityState({
+			sharedSession: {
+				sessionId: "stale-session",
+				cursor: 0,
+				cwd: process.cwd(),
+				accountProfileId: "a",
+				claudeConfigDir: "/profiles/a",
+			},
+			ui: null,
+		});
+		const resumes = [];
+		let calls = 0;
+		__testSetSdkQueryFactory((input) => {
+			resumes.push(input.options.resume);
+			calls += 1;
+			return calls === 1
+				? fakeSdkQuery([
+					{ type: "system", subtype: "init", session_id: "stale-session" },
+					{ type: "result", subtype: "error_during_execution", errors: ["Prompt is too long"] },
+				], "a", observed)
+				: fakeSdkQuery([
+					{ type: "system", subtype: "init", session_id: "rebuilt-session" },
+					{ type: "result", subtype: "success", result: "recovered-after-rebuild" },
+				], "a", observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "context-rebuild-session" }));
+
+		assert.equal(calls, 2);
+		assert.deepEqual(resumes, ["stale-session", undefined]);
+		assert.equal(observed.acquires.length, 2);
+		assert.deepEqual(observed.acquires.map((input) => input.excludedProfileIds), [[], []]);
+		assert.deepEqual(observed.failures, []);
+		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "recovered-after-rebuild"));
+		assert.equal(events.some((event) => event.type === "error"), false);
+	});
+
+	it("surfaces a canonical context rejection after exactly one rebuild", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		__testSetBridgeIntegrityState({
+			sharedSession: {
+				sessionId: "stale-session",
+				cursor: 0,
+				cwd: process.cwd(),
+				accountProfileId: "a",
+				claudeConfigDir: "/profiles/a",
+			},
+			ui: null,
+		});
+		let calls = 0;
+		__testSetSdkQueryFactory(() => {
+			calls += 1;
+			return fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: `session-${calls}` },
+				{ type: "result", subtype: "error_during_execution", errors: ["Prompt is too long"] },
+			], "a", observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "canonical-overflow-session" }));
+
+		assert.equal(calls, 2);
+		assert.equal(events.filter((event) => event.type === "error").length, 1);
+		assert.match(events.find((event) => event.type === "error")?.error.errorMessage ?? "", /Prompt is too long/);
+	});
+
 	it("does not rotate an unclassified invalid request", async () => {
 		const observed = observedState();
 		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);

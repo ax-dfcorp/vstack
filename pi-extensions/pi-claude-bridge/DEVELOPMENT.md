@@ -13,6 +13,7 @@ Implementation details for contributors. End-user setup, settings, and troublesh
 - Integrity events (mismatch, synthetic-result repair, stale-result reap, unmatched handler) are also appended to the pi session as `claude-bridge-integrity` custom entries — compact metadata only — so a post-mortem works from the session file alone.
 - Unpaired tool_uses in a session rebuild are paired with an explicit `is_error` result telling the model the output was lost and to re-run the tool if needed, instead of cc-session-io's bare `[no tool result recorded]` placeholder that models read as real output.
 - Session rebuilds and deferred steer/follow-up continuations preserve mixed text/image user content as real Anthropic image blocks. An output-less aborted assistant turn is labeled as interrupted rather than with the generic incompatible-content marker, so a later `continue` cannot mistake the interruption placeholder for a rejected image.
+- A pre-output Claude `Prompt is too long` rejection may come from a stale or independently bloated child transcript even while Pi's canonical context is valid. The bridge marks that child session for rebuild, discards the rejected attempt, and retries the same logical request once from Pi history. A second rejection is surfaced so Pi can compact canonical context instead of looping or replaying side effects.
 
 ## Child-executed tools (claude.ai connectors)
 

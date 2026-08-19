@@ -45647,6 +45647,9 @@ function resolveConfiguredEffort(modelId, reasoningEffort, providerConfig) {
   }
   return normalizeEffortLevel(providerConfig?.forceEffort) ?? reasoningEffort;
 }
+function isClaudeContextLengthFailure(message) {
+  return /\bprompt is too long\b|\binput (?:is |was )?too long\b|\bcontext(?: window)? (?:is |was )?(?:too long|exceeded|overflow)|\bexceeds? (?:the )?context window\b/i.test(message);
+}
 async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router) {
   let capturedSessionId;
   let failure;
@@ -45989,17 +45992,19 @@ function streamClaudeAgentSdk(model, context, options) {
   const rotationOptions = options;
   const rotationState = rotationOptions?.[ROTATION_STATE_KEY] ?? {
     excludedProfileIds: /* @__PURE__ */ new Set(),
-    attempts: 0
+    attempts: 0,
+    contextRebuildAttempted: false
   };
   let account;
   if (router) {
     try {
+      const accountFailover = rotationState.excludedProfileIds.size > 0;
       account = router.acquire({
         modelId: model.id,
         sessionId: options?.sessionId,
         excludedProfileIds: [...rotationState.excludedProfileIds],
-        forceRerank: rotationState.attempts > 0,
-        reason: rotationState.attempts > 0 ? "automatic-failover" : void 0
+        forceRerank: accountFailover,
+        reason: accountFailover ? "automatic-failover" : void 0
       });
       rotationState.attempts += 1;
     } catch (error51) {
@@ -46222,6 +46227,20 @@ function streamClaudeAgentSdk(model, context, options) {
     if (options.signal.aborted) onAbort();
     else options.signal.addEventListener("abort", onAbort, { once: true });
   }
+  const requestContextRebuild = (failure) => {
+    const eligible = Boolean(
+      isClaudeContextLengthFailure(failure.message) && !rotationState.contextRebuildAttempted && sharedSession && attemptBuffer && !abortCtx.committedOutput && !wasAborted && !options?.signal?.aborted
+    );
+    if (!eligible || !sharedSession) return false;
+    rotationState.contextRebuildAttempted = true;
+    setSharedSession({ ...sharedSession, needsRebuild: true });
+    retryRequested = true;
+    retryFailure = failure;
+    attemptBuffer?.discard();
+    abortCtx.currentPiStream = null;
+    debug(`provider: rebuilding stale Claude session after context rejection, session=${sharedSession.sessionId.slice(0, 8)}`);
+    return true;
+  };
   const requestRotation = (failure) => {
     recordAttemptFailure(failure);
     const eligible = Boolean(account && router && failure.kind && !abortCtx.committedOutput && !wasAborted && !options?.signal?.aborted && rotationState.attempts < 16);
@@ -46284,6 +46303,7 @@ function streamClaudeAgentSdk(model, context, options) {
       return;
     }
     if (failure) {
+      if (requestContextRebuild(failure)) return;
       if (requestRotation(failure)) return;
       surfaceFailure(failure);
       return;
@@ -46361,6 +46381,7 @@ function streamClaudeAgentSdk(model, context, options) {
       kind: classifyClaudeFailure(error51),
       message: error51 instanceof Error ? error51.message : String(error51)
     };
+    if (requestContextRebuild(failure)) return;
     if (requestRotation(failure)) return;
     if (!wasAborted && !options?.signal?.aborted) setSharedSession(null);
     surfaceFailure(failure, Boolean(options?.signal?.aborted));
