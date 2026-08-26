@@ -35,7 +35,7 @@ describe("account-scoped Claude sessions", () => {
 			messages,
 			cwd,
 			undefined,
-			"claude-opus-5",
+			"claude-opus-4-8",
 			{ accountProfileId: "a", claudeConfigDir: accountA },
 		);
 		assert.ok(first.sessionId);
@@ -50,7 +50,7 @@ describe("account-scoped Claude sessions", () => {
 			messages,
 			cwd,
 			undefined,
-			"claude-opus-5",
+			"claude-opus-4-8",
 			{ accountProfileId: "b", claudeConfigDir: accountB },
 		);
 		assert.ok(second.sessionId);
@@ -64,7 +64,7 @@ describe("account-scoped Claude sessions", () => {
 			messages,
 			cwd,
 			undefined,
-			"claude-opus-5",
+			"claude-opus-4-8",
 			{ accountProfileId: "b", claudeConfigDir: accountB },
 		);
 		assert.equal(reused.sessionId, second.sessionId);

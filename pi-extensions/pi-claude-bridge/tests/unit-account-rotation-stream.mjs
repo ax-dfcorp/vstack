@@ -309,7 +309,7 @@ describe("managed account stream rotation", () => {
 		assert.equal(events.filter((event) => event.type === "error").length, 1);
 	});
 
-	it("uses Opus only after the account router reports every Fable allowance spent", async () => {
+	it("uses Opus 4.8 only after the account router reports every Fable allowance spent", async () => {
 		const observed = observedState();
 		const fableModel = { ...model, id: "claude-fable-5", name: "Claude Fable 5" };
 		const router = makeRouter(observed);
@@ -319,7 +319,7 @@ describe("managed account stream rotation", () => {
 				profileId: "b",
 				label: "account-b",
 				configDir: "/profiles/b",
-				modelId: "claude-opus-5",
+				modelId: "claude-opus-4-8",
 				fallbackReason: "fable-quota",
 			};
 		};
@@ -334,8 +334,8 @@ describe("managed account stream rotation", () => {
 		});
 
 		const events = await collect(streamClaudeAgentSdk(fableModel, context, { sessionId: "fable-spent" }));
-		assert.equal(queryOptions.model, "claude-opus-5");
-		assert.equal(queryOptions.fallbackModel, "claude-opus-4-8");
+		assert.equal(queryOptions.model, "claude-opus-4-8");
+		assert.equal(queryOptions.fallbackModel, undefined);
 		assert.equal(queryOptions.env.CLAUDE_CONFIG_DIR, "/profiles/b");
 		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "opus-after-fable"));
 	});
