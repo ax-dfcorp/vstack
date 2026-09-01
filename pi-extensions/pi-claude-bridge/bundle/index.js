@@ -27901,6 +27901,7 @@ function deferredUserPromptToSdkInput(prompt) {
 // src/models.ts
 var FABLE_MODEL_ID = "claude-fable-5";
 var FABLE_FALLBACK_MODEL_ID = "claude-opus-4-8";
+var OPUS_5_MODEL_ID = "claude-opus-5";
 var SONNET_5_MODEL_ID = "claude-sonnet-5";
 function fallbackModelForPrimaryModel(modelId) {
   return modelId === FABLE_MODEL_ID ? FABLE_FALLBACK_MODEL_ID : void 0;
@@ -27908,6 +27909,7 @@ function fallbackModelForPrimaryModel(modelId) {
 var MODEL_IDS_IN_ORDER = [
   FABLE_MODEL_ID,
   FABLE_FALLBACK_MODEL_ID,
+  OPUS_5_MODEL_ID,
   "claude-opus-4-7",
   "claude-opus-4-6",
   SONNET_5_MODEL_ID,
@@ -27929,6 +27931,15 @@ var FALLBACK_MODELS = {
     name: "Claude Opus 4.8",
     reasoning: true,
     thinkingLevelMap: { xhigh: "xhigh" },
+    input: ["text", "image"],
+    contextWindow: 1e6,
+    maxTokens: 128e3
+  },
+  [OPUS_5_MODEL_ID]: {
+    id: OPUS_5_MODEL_ID,
+    name: "Claude Opus 5",
+    reasoning: true,
+    thinkingLevelMap: { xhigh: "xhigh", max: "max" },
     input: ["text", "image"],
     contextWindow: 1e6,
     maxTokens: 128e3
