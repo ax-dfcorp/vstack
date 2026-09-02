@@ -27863,7 +27863,7 @@ var D6 = P("$ZodObjectJIT", (e, t) => {
             })));
           }
         }
-
+        
         if (${v}.value === undefined) {
           if (${w} in input) {
             newResult[${w}] = undefined;
@@ -27871,7 +27871,7 @@ var D6 = P("$ZodObjectJIT", (e, t) => {
         } else {
           newResult[${w}] = ${v}.value;
         }
-
+        
       `);
       else if (!L) m.write(`
         const ${v}_present = ${w} in input;
@@ -27906,7 +27906,7 @@ var D6 = P("$ZodObjectJIT", (e, t) => {
             path: iss.path ? [${w}, ...iss.path] : [${w}]
           })));
         }
-
+        
         if (${v}.value === undefined) {
           if (${w} in input) {
             newResult[${w}] = undefined;
@@ -27914,7 +27914,7 @@ var D6 = P("$ZodObjectJIT", (e, t) => {
         } else {
           newResult[${w}] = ${v}.value;
         }
-
+        
       `);
     }
     m.write("payload.value = newResult;"), m.write("return payload;");
@@ -36493,6 +36493,27 @@ function drainPendingToolCalls(queryCtx, cause) {
   queryCtx.pendingToolCalls.clear();
   return drained;
 }
+function undeliveredToolCallResult(toolName) {
+  return {
+    content: [{ type: "text", text: `Claude bridge: the ${toolName} call was not delivered to Pi because the Pi turn carrying it had already ended (a parallel tool call arrived after the turn boundary). The call did not run and produced no output. Re-issue it as a new call if the result is still needed.` }],
+    isError: true
+  };
+}
+function isUndeliverableToolCall(queryCtx, id) {
+  if (!id) return false;
+  if (queryCtx.wasToolCallDeliveredToPi(id)) return false;
+  return queryCtx.undeliverableToolCallIds.has(id) || queryCtx.currentPiStream === null;
+}
+function failUndeliveredPendingToolCalls(queryCtx) {
+  const failed = [];
+  for (const [id, pending] of [...queryCtx.pendingToolCalls.entries()]) {
+    if (queryCtx.wasToolCallDeliveredToPi(id)) continue;
+    queryCtx.pendingToolCalls.delete(id);
+    failed.push({ id, toolName: pending.toolName });
+    pending.resolve(undeliveredToolCallResult(pending.toolName));
+  }
+  return failed;
+}
 function normalizeForCompare(value) {
   if (Array.isArray(value)) return value.map(normalizeForCompare);
   if (value && typeof value === "object") {
@@ -36544,6 +36565,19 @@ var QueryContext = class {
    */
   queryToolNames = /* @__PURE__ */ new Map();
   claimedToolCallIds = /* @__PURE__ */ new Set();
+  /**
+   * Tool-call ids Pi has actually been handed for execution — every toolCall
+   * block of a `done` message pushed to a Pi stream. Query-scoped and never
+   * cleared per message: a handler can be invoked for a call from the previous
+   * child message after the next one's boundary already reset per-message
+   * tracking, and the question "will Pi ever run this?" must still be answerable.
+   * Distinct from `deliveredToolResultIds`, which tracks results coming BACK.
+   */
+  deliveredToPiToolCallIds = /* @__PURE__ */ new Set();
+  /** Tool-call ids recorded from an assistant message AFTER the pi turn for that
+   *  message had already ended — pi never received them. Query-scoped like
+   *  `deliveredToPiToolCallIds`, for the same reason. */
+  undeliverableToolCallIds = /* @__PURE__ */ new Set();
   deliveredToolResultIds = /* @__PURE__ */ new Set();
   resolvedToolResultIds = /* @__PURE__ */ new Set();
   unmatchedToolResultIds = /* @__PURE__ */ new Set();
@@ -36557,8 +36591,15 @@ var QueryContext = class {
    *  (message_delta/message_stop) never arrive. The normal path ends the turn at
    *  message_stop, AFTER message_delta delivered the real output-token count;
    *  this is the deadlock backstop for streams that go silent instead. Managed
-   *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. */
+   *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. The timer only
+   *  fires after a full grace period WITHOUT stream activity (`seenActivitySeq`
+   *  vs `toolUseActivitySeq`) and defers while a tool block is still streaming
+   *  (`openBlockDeferrals`), so a parallel tool call mid-flight is never cut. */
   scheduledToolUseEnd = null;
+  /** Bumped on every content/usage stream event of the current message. Read by
+   *  the grace timer to tell "silent for a full grace period" from "still
+   *  streaming" without depending on wall-clock time. */
+  toolUseActivitySeq = 0;
   // Tool calls the CHILD executes itself (claude.ai connectors — see
   // isChildExecutedTool). Deliberately NOT in turnToolCalls/turnToolCallIds:
   // those track calls Pi owes a result for, and Pi owes nothing here. Kept only
@@ -36712,6 +36753,15 @@ var QueryContext = class {
   }
   hasRecordedToolCall(id) {
     return Boolean(id && (this.turnToolCallIds.includes(id) || this.turnToolCalls.some((call) => call.id === id)));
+  }
+  markToolCallDeliveredToPi(id) {
+    if (id) this.deliveredToPiToolCallIds.add(id);
+  }
+  wasToolCallDeliveredToPi(id) {
+    return Boolean(id && this.deliveredToPiToolCallIds.has(id));
+  }
+  markToolCallUndeliverable(id) {
+    if (id) this.undeliverableToolCallIds.add(id);
   }
   markOutputCommitted() {
     this.committedOutput = true;
@@ -40577,7 +40627,7 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
             })));
           }
         }
-
+        
         if (${id}.value === undefined) {
           if (${k2} in input) {
             newResult[${k2}] = undefined;
@@ -40585,7 +40635,7 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
         } else {
           newResult[${k2}] = ${id}.value;
         }
-
+        
       `);
       } else if (!isOptionalIn) {
         doc.write(`
@@ -40622,7 +40672,7 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
             path: iss.path ? [${k2}, ...iss.path] : [${k2}]
           })));
         }
-
+        
         if (${id}.value === undefined) {
           if (${k2} in input) {
             newResult[${k2}] = undefined;
@@ -40630,7 +40680,7 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
         } else {
           newResult[${k2}] = ${id}.value;
         }
-
+        
       `);
       }
     }
@@ -53444,9 +53494,34 @@ function finalizeCurrentStream(stopReason, c = ctx()) {
   c.currentPiStream = null;
 }
 var TOOL_USE_END_GRACE_MS = 1500;
+var TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS = 6;
+function openToolBlocks(c) {
+  if (!c.turnOutput) return [];
+  return c.turnBlocks.filter((b2) => b2.type === "toolCall" && "partialJson" in b2);
+}
+function settleOpenToolBlocks(c) {
+  const open3 = openToolBlocks(c);
+  if (open3.length === 0) return;
+  for (const block of open3) {
+    const index = c.turnBlocks.indexOf(block);
+    block.arguments = mapToolArgs(block.name, parsePartialJson(block.partialJson, block.arguments));
+    c.updateToolCallArgs(block.id, block.arguments);
+    delete block.partialJson;
+    delete block.index;
+    c.currentPiStream?.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+  }
+  const names = open3.map((b2) => b2.name);
+  debug(`settleOpenToolBlocks: forced turn end sealed ${open3.length} still-streaming tool block(s): ${names.join(", ")}`);
+  diagDump("tool_use_turn_forced_with_open_blocks", { count: open3.length, blocks: open3.map((b2) => ({ id: b2.id, toolName: b2.name, argKeys: Object.keys(b2.arguments ?? {}) })) });
+  appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: open3.length, toolNames: names });
+}
 function endToolUseTurn(c) {
   if (!c.currentPiStream || !c.turnOutput) return;
   cancelScheduledToolUseEnd(c);
+  settleOpenToolBlocks(c);
+  for (const block of c.turnBlocks) {
+    if (block?.type === "toolCall") c.markToolCallDeliveredToPi(block.id);
+  }
   c.turnOutput.stopReason = "toolUse";
   c.currentPiStream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
   c.currentPiStream.end();
@@ -53457,19 +53532,52 @@ function cancelScheduledToolUseEnd(c) {
   clearTimeout(c.scheduledToolUseEnd.timer);
   c.scheduledToolUseEnd = null;
 }
+function noteToolUseTurnActivity(c) {
+  c.toolUseActivitySeq++;
+}
+function armToolUseEndTimer(c) {
+  const armed = c.scheduledToolUseEnd;
+  if (!armed) return;
+  const timer = setTimeout(() => fireToolUseEndTimer(c), TOOL_USE_END_GRACE_MS);
+  timer.unref?.();
+  armed.timer = timer;
+}
+function fireToolUseEndTimer(c) {
+  const armed = c.scheduledToolUseEnd;
+  if (!armed) return;
+  if (c.currentPiStream !== armed.stream) {
+    c.scheduledToolUseEnd = null;
+    return;
+  }
+  if (c.toolUseActivitySeq !== armed.seenActivitySeq) {
+    armed.seenActivitySeq = c.toolUseActivitySeq;
+    armToolUseEndTimer(c);
+    return;
+  }
+  const open3 = openToolBlocks(c);
+  if (open3.length > 0 && armed.openBlockDeferrals < TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS) {
+    armed.openBlockDeferrals++;
+    debug(`scheduleToolUseTurnEnd: stream quiet but ${open3.length} tool block(s) still open (${armed.source}) \u2014 deferring turn end (${armed.openBlockDeferrals}/${TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS})`);
+    armToolUseEndTimer(c);
+    return;
+  }
+  debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${open3.length > 0 ? `, ${open3.length} open block(s) past deferral cap` : ""}) \u2014 force-ending tool_use turn`);
+  c.scheduledToolUseEnd = null;
+  armed.action();
+}
 function scheduleToolUseTurnEnd(c, action, source) {
   if (!c.currentPiStream || !c.turnOutput) return;
   if (c.scheduledToolUseEnd?.stream === c.currentPiStream) return;
   cancelScheduledToolUseEnd(c);
-  const stream = c.currentPiStream;
-  const timer = setTimeout(() => {
-    if (c.currentPiStream !== stream) return;
-    debug(`scheduleToolUseTurnEnd: no terminal stream event within ${TOOL_USE_END_GRACE_MS}ms (${source}) \u2014 force-ending tool_use turn`);
-    c.scheduledToolUseEnd = null;
-    action();
-  }, TOOL_USE_END_GRACE_MS);
-  timer.unref?.();
-  c.scheduledToolUseEnd = { stream, timer };
+  c.scheduledToolUseEnd = {
+    stream: c.currentPiStream,
+    timer: void 0,
+    action,
+    source,
+    seenActivitySeq: c.toolUseActivitySeq,
+    openBlockDeferrals: 0
+  };
+  armToolUseEndTimer(c);
 }
 function reapStaleQueuedResults(c) {
   const stale = c.takeStaleQueuedResults();
@@ -53518,6 +53626,7 @@ function processStreamEvent(message, customToolNameToPi, model) {
   if (!c.currentPiStream || !c.turnOutput) return;
   const event = message.event;
   if (event?.type === "ping") return;
+  noteToolUseTurnActivity(c);
   if (event?.type === "message_stop" && !c.turnSawToolCall) {
     debug("processStreamEvent: ignoring bare message_stop with no streamed content/tool call");
     return;
@@ -53638,6 +53747,7 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
   const c = ctx();
   if (!assistantMsg?.content) return false;
   let sawToolUse = false;
+  const lateToolUses = [];
   for (const block of assistantMsg.content) {
     if (block.type !== "tool_use") continue;
     if (isChildExecutedTool(block.name)) {
@@ -53650,6 +53760,10 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
     const name = mapToolName(block.name, customToolNameToPi);
     const mappedArgs = mapToolArgs(name, block.input);
     c.recordToolCall(block.id, name, mappedArgs);
+    if (existingIdx < 0 && !c.currentPiStream) {
+      c.markToolCallUndeliverable(block.id);
+      lateToolUses.push({ id: block.id, toolName: name });
+    }
     if (existingIdx >= 0) {
       const existing = c.turnBlocks[existingIdx];
       existing.name = name;
@@ -53673,6 +53787,12 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
     const toolBlock = c.turnBlocks[idx];
     c.currentPiStream?.push({ type: "toolcall_start", contentIndex: idx, partial: c.turnOutput });
     c.currentPiStream?.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock, partial: c.turnOutput });
+  }
+  if (lateToolUses.length > 0) {
+    const names = lateToolUses.map((call) => call.toolName);
+    debug(`assistant message: ${lateToolUses.length} tool_use block(s) arrived after the pi turn ended \u2014 pi cannot execute them: ${names.join(", ")}`);
+    diagDump("tool_use_after_pi_turn_end", { count: lateToolUses.length, calls: lateToolUses });
+    appendIntegrityEntry("tool_use_after_pi_turn_end", { count: lateToolUses.length, toolNames: names });
   }
   if (assistantMsg.usage && c.turnOutput && c.currentPiStream) updateUsage(c.turnOutput, assistantMsg.usage, model);
   return sawToolUse;
@@ -54072,6 +54192,13 @@ function buildMcpServers(tools, queryCtx) {
         debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 resolved from queue (${queryCtx.pendingResults.size} remaining)`);
         return result;
       }
+      if (isUndeliverableToolCall(queryCtx, toolCallId)) {
+        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 undeliverable: pi turn ended without this call; failing fast`);
+        diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
+        appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
+        queryCtx.markToolResultResolved(toolCallId);
+        return undeliveredToolCallResult(tool.name);
+      }
       debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 waiting`);
       scheduleToolUseTurnEnd(
         queryCtx,
@@ -54388,6 +54515,17 @@ function streamClaudeAgentSdk(model, context, options) {
       for (const pending of queryCtx.pendingToolCalls.values()) pending.resolve(errorResult);
       queryCtx.pendingToolCalls.clear();
       reportToolResultMismatch(queryCtx, "unmatched tool result", cwd);
+    }
+    if (queryCtx.pendingToolCalls.size > 0) {
+      const failed = failUndeliveredPendingToolCalls(queryCtx);
+      if (failed.length > 0) {
+        const names = failed.map((call) => call.toolName);
+        for (const call of failed) queryCtx.markToolResultResolved(call.id);
+        debug(`provider: failed ${failed.length} handler(s) whose call never reached pi: ${names.join(", ")}`);
+        diagDump("undelivered_tool_call_failed_fast", { count: failed.length, calls: failed, site: "delivery" });
+        appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: failed.length, toolNames: names, site: "delivery" });
+        piUI?.notify(`Claude bridge: ${failed.length} tool call(s) arrived after the pi turn ended (${names.slice(0, 6).join(", ")}) and were returned to Claude as errors instead of waiting; the model may re-issue them.`, "warning");
+      }
     }
     if (queryCtx.pendingToolCalls.size > 0) {
       debug(`WARNING: ${queryCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);

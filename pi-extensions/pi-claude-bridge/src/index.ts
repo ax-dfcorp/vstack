@@ -22,7 +22,7 @@ import {
 import { buildModels, fallbackModelForPrimaryModel, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, drainPendingToolCalls, popContext, stackDepth, pushContext, toolCallDrainCause } from "./query-state.js";
+import { QueryContext, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, registerExternalConfigResolver, type Config } from "./config.js";
 import { hasClaudeCredentials } from "./auth-presence.js";
@@ -391,6 +391,16 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 				queryCtx.markToolResultResolved(toolCallId);
 				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
 				return result;
+			}
+			if (isUndeliverableToolCall(queryCtx, toolCallId)) {
+				// The pi turn this call belonged to already ended without it (a later
+				// parallel block cut off by a forced turn end). Pi will never execute
+				// it, so waiting here would block the child until a manual abort.
+				debug(`mcp handler: ${tool.name} [${toolCallId}] → undeliverable: pi turn ended without this call; failing fast`);
+				diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
+				appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
+				queryCtx.markToolResultResolved(toolCallId);
+				return undeliveredToolCallResult(tool.name);
 			}
 			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
 			// Don't end the pi turn here — message_delta (real output tokens) and
@@ -834,6 +844,21 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			for (const pending of queryCtx.pendingToolCalls.values()) pending.resolve(errorResult);
 			queryCtx.pendingToolCalls.clear();
 			reportToolResultMismatch(queryCtx, "unmatched tool result", cwd);
+		}
+		if (queryCtx.pendingToolCalls.size > 0) {
+			// Pi hands back every result of a turn in this one call. A handler still
+			// waiting for a call pi was never given (its turn ended before the block
+			// finished streaming) is waiting for a result that cannot exist — fail it
+			// now so the child continues and the model re-issues the call.
+			const failed = failUndeliveredPendingToolCalls(queryCtx);
+			if (failed.length > 0) {
+				const names = failed.map((call) => call.toolName);
+				for (const call of failed) queryCtx.markToolResultResolved(call.id);
+				debug(`provider: failed ${failed.length} handler(s) whose call never reached pi: ${names.join(", ")}`);
+				diagDump("undelivered_tool_call_failed_fast", { count: failed.length, calls: failed, site: "delivery" });
+				appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: failed.length, toolNames: names, site: "delivery" });
+				piUI?.notify(`Claude bridge: ${failed.length} tool call(s) arrived after the pi turn ended (${names.slice(0, 6).join(", ")}) and were returned to Claude as errors instead of waiting; the model may re-issue them.`, "warning");
+			}
 		}
 		if (queryCtx.pendingToolCalls.size > 0) {
 			debug(`WARNING: ${queryCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);

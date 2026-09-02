@@ -84,14 +84,62 @@ export function finalizeCurrentStream(stopReason?: string, c: QueryContext = ctx
 // (pi 0.80 steer draining): pi cannot execute tools before the stream ends, and
 // the MCP handler cannot resolve before pi executes, so a stream that has gone
 // silent must be ended by force — just 1.5s later instead of immediately.
+//
+// "Gone silent" is the operative condition. Both early signals fire as soon as
+// the FIRST tool_use block of a message completes — the SDK yields a per-block
+// partial copy of the assistant message, and Claude Code can invoke the MCP
+// handler — while a model that issued several calls in one message is still
+// streaming the later blocks. A fixed 1.5s timer armed at that point cut those
+// blocks off: the pi turn ended carrying the later calls with `{}` arguments
+// (pi rejected them) or not at all (the child then waited forever for a result
+// pi could never produce; measured 2026-09-02 on Fable 5.1, which parallelizes
+// ~30% of its tool turns: 47 minutes of silence until a manual abort). So the
+// timer now measures silence: it fires only after a full grace period with no
+// stream activity, and while a tool block is still open it defers up to a hard
+// cap, then settles the partial arguments it has instead of shipping `{}`.
 
 const TOOL_USE_END_GRACE_MS = 1500;
+/** How many extra grace periods a silent stream may hold an OPEN tool block
+ *  before the turn is force-ended anyway (the true-deadlock backstop). */
+const TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS = 6; // ~9s of silence on top of the first grace
+
+function openToolBlocks(c: QueryContext): any[] {
+	if (!c.turnOutput) return [];
+	return c.turnBlocks.filter((b: any) => b.type === "toolCall" && "partialJson" in b);
+}
+
+/** Seal every tool block still mid-stream with the best arguments known so far
+ *  (what content_block_stop would have done) and hand it to pi as a complete
+ *  call. Only reached on a forced turn end; a normal message_stop leaves no open
+ *  blocks. Shipping the block unsealed made pi dispatch the tool with `{}`. */
+function settleOpenToolBlocks(c: QueryContext): void {
+	const open = openToolBlocks(c);
+	if (open.length === 0) return;
+	for (const block of open) {
+		const index = c.turnBlocks.indexOf(block);
+		block.arguments = mapToolArgs(block.name, parsePartialJson(block.partialJson, block.arguments));
+		c.updateToolCallArgs(block.id, block.arguments);
+		delete block.partialJson;
+		delete block.index;
+		c.currentPiStream?.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+	}
+	const names = open.map((b: any) => b.name);
+	debug(`settleOpenToolBlocks: forced turn end sealed ${open.length} still-streaming tool block(s): ${names.join(", ")}`);
+	diagDump("tool_use_turn_forced_with_open_blocks", { count: open.length, blocks: open.map((b: any) => ({ id: b.id, toolName: b.name, argKeys: Object.keys(b.arguments ?? {}) })) });
+	appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: open.length, toolNames: names });
+}
 
 /** End the current pi stream as a tool_use turn boundary. Safe to call when the
- *  turn already ended (no-op). */
+ *  turn already ended (no-op). Every toolCall block in the delivered message is
+ *  recorded as handed to pi — the one fact a later MCP handler needs to know
+ *  whether waiting for pi's result can ever succeed. */
 export function endToolUseTurn(c: QueryContext): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
 	cancelScheduledToolUseEnd(c);
+	settleOpenToolBlocks(c);
+	for (const block of c.turnBlocks) {
+		if (block?.type === "toolCall") c.markToolCallDeliveredToPi(block.id);
+	}
 	c.turnOutput.stopReason = "toolUse";
 	c.currentPiStream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 	c.currentPiStream.end();
@@ -104,25 +152,69 @@ export function cancelScheduledToolUseEnd(c: QueryContext): void {
 	c.scheduledToolUseEnd = null;
 }
 
+/** Record that the current message is still producing stream events. Cheap on
+ *  purpose (a counter bump per delta); the armed grace timer reads it when it
+ *  fires and re-arms instead of ending a turn that is demonstrably alive. */
+export function noteToolUseTurnActivity(c: QueryContext): void {
+	c.toolUseActivitySeq++;
+}
+
+function armToolUseEndTimer(c: QueryContext): void {
+	const armed = c.scheduledToolUseEnd;
+	if (!armed) return;
+	const timer = setTimeout(() => fireToolUseEndTimer(c), TOOL_USE_END_GRACE_MS);
+	timer.unref?.();
+	armed.timer = timer;
+}
+
+function fireToolUseEndTimer(c: QueryContext): void {
+	const armed = c.scheduledToolUseEnd;
+	if (!armed) return;
+	if (c.currentPiStream !== armed.stream) {
+		c.scheduledToolUseEnd = null;
+		return;
+	}
+	if (c.toolUseActivitySeq !== armed.seenActivitySeq) {
+		// Stream events arrived during the grace period: the message is still being
+		// produced (typically a later parallel tool block). Wait for a full quiet
+		// period before judging it dead.
+		armed.seenActivitySeq = c.toolUseActivitySeq;
+		armToolUseEndTimer(c);
+		return;
+	}
+	const open = openToolBlocks(c);
+	if (open.length > 0 && armed.openBlockDeferrals < TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS) {
+		armed.openBlockDeferrals++;
+		debug(`scheduleToolUseTurnEnd: stream quiet but ${open.length} tool block(s) still open (${armed.source}) — deferring turn end (${armed.openBlockDeferrals}/${TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS})`);
+		armToolUseEndTimer(c);
+		return;
+	}
+	debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${open.length > 0 ? `, ${open.length} open block(s) past deferral cap` : ""}) — force-ending tool_use turn`);
+	c.scheduledToolUseEnd = null;
+	armed.action();
+}
+
 /**
  * Arm the grace timer that force-ends the current tool_use turn if the stream's
  * terminal events never arrive. First arming per stream wins; message_stop (or
  * resetTurnState) disarms it. `action` runs only if the SAME stream is still
- * current when the grace elapses — a turn that ended normally makes it a no-op.
+ * current when the grace elapses — a turn that ended normally makes it a no-op —
+ * and only after a full grace period with no stream activity (see
+ * fireToolUseEndTimer for the open-block deferral).
  */
 export function scheduleToolUseTurnEnd(c: QueryContext, action: () => void, source: string): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
 	if (c.scheduledToolUseEnd?.stream === c.currentPiStream) return;
 	cancelScheduledToolUseEnd(c);
-	const stream = c.currentPiStream;
-	const timer = setTimeout(() => {
-		if (c.currentPiStream !== stream) return;
-		debug(`scheduleToolUseTurnEnd: no terminal stream event within ${TOOL_USE_END_GRACE_MS}ms (${source}) — force-ending tool_use turn`);
-		c.scheduledToolUseEnd = null;
-		action();
-	}, TOOL_USE_END_GRACE_MS);
-	timer.unref?.();
-	c.scheduledToolUseEnd = { stream, timer };
+	c.scheduledToolUseEnd = {
+		stream: c.currentPiStream,
+		timer: undefined as unknown as ReturnType<typeof setTimeout>,
+		action,
+		source,
+		seenActivitySeq: c.toolUseActivitySeq,
+		openBlockDeferrals: 0,
+	};
+	armToolUseEndTimer(c);
 }
 
 /**
@@ -214,6 +306,9 @@ export function processStreamEvent(
 	if (!c.currentPiStream || !c.turnOutput) return;
 	const event = (message as SDKMessage & { event: any }).event;
 	if (event?.type === "ping") return;
+	// Any non-ping event proves the message is still being produced; the armed
+	// grace timer must not treat this stream as silent.
+	noteToolUseTurnActivity(c);
 	if (event?.type === "message_stop" && !c.turnSawToolCall) {
 		debug("processStreamEvent: ignoring bare message_stop with no streamed content/tool call");
 		return;
@@ -375,6 +470,7 @@ function appendMissingToolUsesFromAssistant(
 	const c = ctx();
 	if (!assistantMsg?.content) return false;
 	let sawToolUse = false;
+	const lateToolUses: Array<{ id: string; toolName: string }> = [];
 	for (const block of assistantMsg.content) {
 		if (block.type !== "tool_use") continue;
 		if (isChildExecutedTool(block.name)) {
@@ -390,6 +486,15 @@ function appendMissingToolUsesFromAssistant(
 		const name = mapToolName(block.name, customToolNameToPi);
 		const mappedArgs = mapToolArgs(name, block.input);
 		c.recordToolCall(block.id, name, mappedArgs);
+		if (existingIdx < 0 && !c.currentPiStream) {
+			// The pi turn already ended without this call: pi will never execute it.
+			// Record it so the handler's claim resolves to an explicit undeliverable
+			// error (see isUndeliverableToolCall) rather than an unknown-id error or,
+			// worse, an indefinite wait. Loud on purpose — this is the signature of
+			// a turn cut short under a still-streaming parallel call.
+			c.markToolCallUndeliverable(block.id);
+			lateToolUses.push({ id: block.id, toolName: name });
+		}
 		if (existingIdx >= 0) {
 			const existing = c.turnBlocks[existingIdx] as any;
 			existing.name = name;
@@ -413,6 +518,12 @@ function appendMissingToolUsesFromAssistant(
 		const toolBlock = c.turnBlocks[idx];
 		c.currentPiStream?.push({ type: "toolcall_start", contentIndex: idx, partial: c.turnOutput });
 		c.currentPiStream?.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: c.turnOutput });
+	}
+	if (lateToolUses.length > 0) {
+		const names = lateToolUses.map((call) => call.toolName);
+		debug(`assistant message: ${lateToolUses.length} tool_use block(s) arrived after the pi turn ended — pi cannot execute them: ${names.join(", ")}`);
+		diagDump("tool_use_after_pi_turn_end", { count: lateToolUses.length, calls: lateToolUses });
+		appendIntegrityEntry("tool_use_after_pi_turn_end", { count: lateToolUses.length, toolNames: names });
 	}
 	// Only while the stream is still live: the SDK's assistant yields carry the
 	// message_start placeholder usage (output ≈ 1–7), and once the done event has

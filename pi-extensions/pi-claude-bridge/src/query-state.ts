@@ -57,6 +57,56 @@ export function drainPendingToolCalls(queryCtx: QueryContext, cause: ToolCallDra
 	return drained;
 }
 
+/**
+ * The result an MCP handler receives for a tool call Pi will never execute.
+ *
+ * A tool_use that reaches the bridge AFTER the Pi turn carrying its siblings
+ * already ended (the model issued several calls in one message and the turn was
+ * force-ended before the later blocks finished streaming) is recorded, claimable,
+ * and yet never delivered to Pi — so no result can ever come back for it. Left
+ * waiting, the handler blocks the child indefinitely with no error anywhere
+ * (measured 2026-09-02: 47 minutes of silence until a manual abort). Failing it
+ * with an explicit error lets the child continue and the model re-issue the
+ * call on its next turn.
+ */
+export function undeliveredToolCallResult(toolName: string): McpResult {
+	return {
+		content: [{ type: "text", text: `Claude bridge: the ${toolName} call was not delivered to Pi because the Pi turn carrying it had already ended (a parallel tool call arrived after the turn boundary). The call did not run and produced no output. Re-issue it as a new call if the result is still needed.` }],
+		isError: true,
+	};
+}
+
+/**
+ * True when `id` names a recorded tool call Pi cannot execute anymore: its Pi
+ * turn is over (no live stream) and the call was never part of a `done` message
+ * Pi received. A handler for such a call must fail fast instead of waiting.
+ */
+export function isUndeliverableToolCall(queryCtx: QueryContext, id: string | undefined): boolean {
+	if (!id) return false;
+	if (queryCtx.wasToolCallDeliveredToPi(id)) return false;
+	// Flagged at record time (the tool_use arrived after its pi turn ended), or
+	// no pi turn is live at all: either way pi has nothing to execute it in.
+	return queryCtx.undeliverableToolCallIds.has(id) || queryCtx.currentPiStream === null;
+}
+
+/**
+ * Resolve every waiting handler whose call Pi never received with an explicit
+ * error. Runs after Pi delivered a turn's results: Pi hands back every result of
+ * a turn in one provider call, so a handler still waiting for a call that was
+ * not in Pi's `done` message is waiting for nothing. Returns the failed calls so
+ * the caller can report them; never touches handlers whose call Pi did receive.
+ */
+export function failUndeliveredPendingToolCalls(queryCtx: QueryContext): Array<{ id: string; toolName: string }> {
+	const failed: Array<{ id: string; toolName: string }> = [];
+	for (const [id, pending] of [...queryCtx.pendingToolCalls.entries()]) {
+		if (queryCtx.wasToolCallDeliveredToPi(id)) continue;
+		queryCtx.pendingToolCalls.delete(id);
+		failed.push({ id, toolName: pending.toolName });
+		pending.resolve(undeliveredToolCallResult(pending.toolName));
+	}
+	return failed;
+}
+
 /** One connector call's audit state for the life of a query. `recorded` means an
  *  entry for it has already been appended (or attempted), so neither a re-yielded
  *  result nor the teardown flush can record it twice. */
@@ -162,6 +212,19 @@ export class QueryContext {
 	 */
 	queryToolNames = new Map<string, string>();
 	claimedToolCallIds = new Set<string>();
+	/**
+	 * Tool-call ids Pi has actually been handed for execution — every toolCall
+	 * block of a `done` message pushed to a Pi stream. Query-scoped and never
+	 * cleared per message: a handler can be invoked for a call from the previous
+	 * child message after the next one's boundary already reset per-message
+	 * tracking, and the question "will Pi ever run this?" must still be answerable.
+	 * Distinct from `deliveredToolResultIds`, which tracks results coming BACK.
+	 */
+	deliveredToPiToolCallIds = new Set<string>();
+	/** Tool-call ids recorded from an assistant message AFTER the pi turn for that
+	 *  message had already ended — pi never received them. Query-scoped like
+	 *  `deliveredToPiToolCallIds`, for the same reason. */
+	undeliverableToolCallIds = new Set<string>();
 	deliveredToolResultIds = new Set<string>();
 	resolvedToolResultIds = new Set<string>();
 	unmatchedToolResultIds = new Set<string>();
@@ -175,8 +238,22 @@ export class QueryContext {
 	 *  (message_delta/message_stop) never arrive. The normal path ends the turn at
 	 *  message_stop, AFTER message_delta delivered the real output-token count;
 	 *  this is the deadlock backstop for streams that go silent instead. Managed
-	 *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. */
-	scheduledToolUseEnd: { stream: unknown; timer: ReturnType<typeof setTimeout> } | null = null;
+	 *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. The timer only
+	 *  fires after a full grace period WITHOUT stream activity (`seenActivitySeq`
+	 *  vs `toolUseActivitySeq`) and defers while a tool block is still streaming
+	 *  (`openBlockDeferrals`), so a parallel tool call mid-flight is never cut. */
+	scheduledToolUseEnd: {
+		stream: unknown;
+		timer: ReturnType<typeof setTimeout>;
+		action: () => void;
+		source: string;
+		seenActivitySeq: number;
+		openBlockDeferrals: number;
+	} | null = null;
+	/** Bumped on every content/usage stream event of the current message. Read by
+	 *  the grace timer to tell "silent for a full grace period" from "still
+	 *  streaming" without depending on wall-clock time. */
+	toolUseActivitySeq = 0;
 
 	// Tool calls the CHILD executes itself (claude.ai connectors — see
 	// isChildExecutedTool). Deliberately NOT in turnToolCalls/turnToolCallIds:
@@ -344,6 +421,18 @@ export class QueryContext {
 
 	hasRecordedToolCall(id: string | undefined): boolean {
 		return Boolean(id && (this.turnToolCallIds.includes(id) || this.turnToolCalls.some((call) => call.id === id)));
+	}
+
+	markToolCallDeliveredToPi(id: string | undefined): void {
+		if (id) this.deliveredToPiToolCallIds.add(id);
+	}
+
+	wasToolCallDeliveredToPi(id: string | undefined): boolean {
+		return Boolean(id && this.deliveredToPiToolCallIds.has(id));
+	}
+
+	markToolCallUndeliverable(id: string | undefined): void {
+		if (id) this.undeliverableToolCallIds.add(id);
 	}
 
 	markOutputCommitted(): void {
