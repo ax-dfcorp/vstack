@@ -9,6 +9,7 @@ import {
 	buildStreamIdleTimeoutErrorMessage,
 	createStreamIdleWatchdog,
 	formatAllowedRateLimitWarning,
+	isSdkProgressMessage,
 	formatResetTimestamp,
 	normalizeRateLimitUtilization,
 	resetTimestampMs,
@@ -75,6 +76,12 @@ describe("rate_limit_event allowed_warning", () => {
 });
 
 describe("stream-idle timeout", () => {
+	it("does not count transport keepalive pings as model progress", () => {
+		assert.equal(isSdkProgressMessage({ type: "stream_event", event: { type: "ping" } }), false);
+		assert.equal(isSdkProgressMessage({ type: "stream_event", event: { type: "content_block_delta" } }), true);
+		assert.equal(isSdkProgressMessage({ type: "assistant", message: { content: [] } }), true);
+	});
+
 	it("parses env timeout with seconds default and disable value", () => {
 		assert.equal(streamIdleTimeoutMsFromEnv({}), DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 		assert.equal(streamIdleTimeoutMsFromEnv({ CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT: "45" }), 45_000);

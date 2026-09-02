@@ -47,6 +47,22 @@ export function parsePartialJson(input: string, fallback: Record<string, unknown
 	try { return JSON.parse(input); } catch { return fallback; }
 }
 
+/** Return an object only when the streamed input is syntactically complete.
+ *  Never use parsePartialJson's fallback to decide that a tool is executable:
+ *  a half-written required field otherwise degrades to `{}` (or mapper defaults)
+ *  and can dispatch the wrong operation. */
+export function parseCompleteToolJson(input: string): Record<string, unknown> | undefined {
+	if (!input) return undefined;
+	try {
+		const parsed = JSON.parse(input);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? parsed as Record<string, unknown>
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 // Both take the query context explicitly (defaulting to the live one) so the
 // completion/teardown closures in index.ts can finalize the stream of the query
 // they were created for — under reentrancy the live ctx() is the subagent's.
@@ -96,37 +112,79 @@ export function finalizeCurrentStream(stopReason?: string, c: QueryContext = ctx
 // ~30% of its tool turns: 47 minutes of silence until a manual abort). So the
 // timer now measures silence: it fires only after a full grace period with no
 // stream activity, and while a tool block is still open it defers up to a hard
-// cap, then settles the partial arguments it has instead of shipping `{}`.
+// cap. An open block is force-ended only when its JSON is syntactically complete
+// or its MCP handler supplied schema-validated arguments. Otherwise the grace
+// timer keeps waiting and the progress-aware stream-idle watchdog owns the hard
+// 90s dead-stream cutoff; incomplete arguments are never dispatched.
 
 const TOOL_USE_END_GRACE_MS = 1500;
-/** How many extra grace periods a silent stream may hold an OPEN tool block
- *  before the turn is force-ended anyway (the true-deadlock backstop). */
-const TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS = 6; // ~9s of silence on top of the first grace
+/** Independent safety cutoff for an incomplete block. The normal stream-idle
+ * watchdog usually fires at the same 90s boundary, but this backstop still
+ * drops (never executes) the block when that watchdog was configured off. */
+const TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS = 60;
 
 function openToolBlocks(c: QueryContext): any[] {
 	if (!c.turnOutput) return [];
 	return c.turnBlocks.filter((b: any) => b.type === "toolCall" && "partialJson" in b);
 }
 
-/** Seal every tool block still mid-stream with the best arguments known so far
- *  (what content_block_stop would have done) and hand it to pi as a complete
- *  call. Only reached on a forced turn end; a normal message_stop leaves no open
- *  blocks. Shipping the block unsealed made pi dispatch the tool with `{}`. */
+/** Resolve an open block only from input known to be complete. The handler copy
+ *  wins because createSdkMcpServer invokes it only after schema validation. */
+function executableArgsForOpenBlock(c: QueryContext, block: any): Record<string, unknown> | undefined {
+	const authoritative = c.authoritativeArgsForToolCall(block.id);
+	if (authoritative) return authoritative;
+	const complete = parseCompleteToolJson(block.partialJson);
+	return complete ? mapToolArgs(block.name, complete) : undefined;
+}
+
+function unsafeOpenToolBlocks(c: QueryContext): any[] {
+	return openToolBlocks(c).filter((block) => !executableArgsForOpenBlock(c, block));
+}
+
+/** Seal safe open blocks and remove unsafe ones from the final Pi message.
+ *
+ * A normal stream sends content_block_stop first. This recovery path exists for
+ * missing terminal events. A block with complete JSON (or validated handler
+ * args) can be finalized safely. A syntactically incomplete block cannot: it is
+ * removed, marked undeliverable, and later returns an explicit error to Claude.
+ * Pi may have seen transient toolcall_start/delta events, but its authoritative
+ * done message never contains the dropped call, so it cannot execute it. */
 function settleOpenToolBlocks(c: QueryContext): void {
 	const open = openToolBlocks(c);
 	if (open.length === 0) return;
-	for (const block of open) {
+	const sealed: any[] = [];
+	const dropped: any[] = [];
+	// Work backwards so removing an unsafe block cannot shift indexes of blocks
+	// still to be examined.
+	for (const block of [...open].reverse()) {
 		const index = c.turnBlocks.indexOf(block);
-		block.arguments = mapToolArgs(block.name, parsePartialJson(block.partialJson, block.arguments));
-		c.updateToolCallArgs(block.id, block.arguments);
+		const args = executableArgsForOpenBlock(c, block);
+		if (!args) {
+			c.markToolCallUndeliverable(block.id);
+			c.turnBlocks.splice(index, 1);
+			dropped.push(block);
+			continue;
+		}
+		block.arguments = args;
+		c.updateToolCallArgs(block.id, args);
 		delete block.partialJson;
 		delete block.index;
 		c.currentPiStream?.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+		sealed.push(block);
 	}
-	const names = open.map((b: any) => b.name);
-	debug(`settleOpenToolBlocks: forced turn end sealed ${open.length} still-streaming tool block(s): ${names.join(", ")}`);
-	diagDump("tool_use_turn_forced_with_open_blocks", { count: open.length, blocks: open.map((b: any) => ({ id: b.id, toolName: b.name, argKeys: Object.keys(b.arguments ?? {}) })) });
-	appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: open.length, toolNames: names });
+	if (sealed.length > 0) {
+		const names = sealed.map((b: any) => b.name);
+		debug(`settleOpenToolBlocks: forced turn end safely sealed ${sealed.length} still-streaming tool block(s): ${names.join(", ")}`);
+		diagDump("tool_use_turn_forced_with_open_blocks", { count: sealed.length, blocks: sealed.map((b: any) => ({ id: b.id, toolName: b.name, argKeys: Object.keys(b.arguments ?? {}) })) });
+		appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: sealed.length, toolNames: names });
+	}
+	if (dropped.length > 0) {
+		const names = dropped.map((b: any) => b.name);
+		debug(`settleOpenToolBlocks: dropped ${dropped.length} incomplete tool block(s) instead of executing partial arguments: ${names.join(", ")}`);
+		diagDump("incomplete_tool_calls_dropped", { count: dropped.length, blocks: dropped.map((b: any) => ({ id: b.id, toolName: b.name })) });
+		appendIntegrityEntry("incomplete_tool_calls_dropped", { count: dropped.length, toolNames: names });
+		safeNotify(`Claude bridge: dropped ${dropped.length} incomplete tool call(s) instead of executing partial arguments (${names.slice(0, 6).join(", ")}). Claude will receive an error and may retry.`, "warning");
+	}
 }
 
 /** End the current pi stream as a tool_use turn boundary. Safe to call when the
@@ -179,17 +237,31 @@ function fireToolUseEndTimer(c: QueryContext): void {
 		// produced (typically a later parallel tool block). Wait for a full quiet
 		// period before judging it dead.
 		armed.seenActivitySeq = c.toolUseActivitySeq;
+		armed.incompleteBlockWaits = 0;
 		armToolUseEndTimer(c);
 		return;
 	}
 	const open = openToolBlocks(c);
-	if (open.length > 0 && armed.openBlockDeferrals < TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS) {
-		armed.openBlockDeferrals++;
-		debug(`scheduleToolUseTurnEnd: stream quiet but ${open.length} tool block(s) still open (${armed.source}) — deferring turn end (${armed.openBlockDeferrals}/${TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS})`);
-		armToolUseEndTimer(c);
-		return;
+	const unsafe = unsafeOpenToolBlocks(c);
+	if (unsafe.length > 0) {
+		// Do not turn a half-written JSON object into mapper defaults and dispatch it.
+		// Keep checking cheaply; non-ping stream progress re-arms both this timer and
+		// the 90s idle watchdog. The independent 90s cap below still drops the block
+		// safely if the watchdog was explicitly disabled.
+		armed.incompleteBlockWaits++;
+		if (armed.incompleteBlockWaits < TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS) {
+			debug(`scheduleToolUseTurnEnd: stream quiet with ${unsafe.length}/${open.length} incomplete tool block(s) (${armed.source}) — waiting for complete JSON or validated handler args (${armed.incompleteBlockWaits}/${TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS})`);
+			armToolUseEndTimer(c);
+			return;
+		}
+		debug(`scheduleToolUseTurnEnd: incomplete tool block remained silent for ${TOOL_USE_END_GRACE_MS * TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS}ms (${armed.source}) — ending turn and dropping unsafe calls`);
 	}
-	debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${open.length > 0 ? `, ${open.length} open block(s) past deferral cap` : ""}) — force-ending tool_use turn`);
+	const openSummary = unsafe.length > 0
+		? `, ${unsafe.length} incomplete block(s) will be dropped`
+		: open.length > 0
+			? `, ${open.length} safely recoverable open block(s)`
+			: "";
+	debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${openSummary}) — force-ending tool_use turn`);
 	c.scheduledToolUseEnd = null;
 	armed.action();
 }
@@ -212,7 +284,7 @@ export function scheduleToolUseTurnEnd(c: QueryContext, action: () => void, sour
 		action,
 		source,
 		seenActivitySeq: c.toolUseActivitySeq,
-		openBlockDeferrals: 0,
+		incompleteBlockWaits: 0,
 	};
 	armToolUseEndTimer(c);
 }

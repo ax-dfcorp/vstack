@@ -36548,6 +36548,12 @@ function unique(values) {
 var QueryContext = class {
   // Query-scoped (fully isolated per query)
   activeQuery = null;
+  /** True from abort receipt until this query's teardown completes. A new user
+   *  prompt arriving in that narrow window must wait and retry, not be mistaken
+   *  for tool-result delivery to the dying query. */
+  abortRequested = false;
+  querySettledPromise = Promise.resolve();
+  resolveQuerySettled = null;
   currentPiStream = null;
   latestCursor = 0;
   pendingToolCalls = /* @__PURE__ */ new Map();
@@ -36574,6 +36580,11 @@ var QueryContext = class {
    * Distinct from `deliveredToolResultIds`, which tracks results coming BACK.
    */
   deliveredToPiToolCallIds = /* @__PURE__ */ new Set();
+  /** Schema-validated MCP handler arguments keyed by tool_call id. These are the
+   *  only authoritative fallback for a streamed block whose input_json_delta is
+   *  still syntactically incomplete: unlike partial JSON, reaching the handler
+   *  proves the SDK accepted the full input against the tool schema. */
+  authoritativeToolCallArgs = /* @__PURE__ */ new Map();
   /** Tool-call ids recorded from an assistant message AFTER the pi turn for that
    *  message had already ended — pi never received them. Query-scoped like
    *  `deliveredToPiToolCallIds`, for the same reason. */
@@ -36593,8 +36604,9 @@ var QueryContext = class {
    *  this is the deadlock backstop for streams that go silent instead. Managed
    *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. The timer only
    *  fires after a full grace period WITHOUT stream activity (`seenActivitySeq`
-   *  vs `toolUseActivitySeq`) and defers while a tool block is still streaming
-   *  (`openBlockDeferrals`), so a parallel tool call mid-flight is never cut. */
+   *  vs `toolUseActivitySeq`) and keeps waiting while an open tool block lacks
+   *  either complete JSON or schema-validated handler arguments. The progress-
+   *  aware stream watchdog and an independent safe-drop cap bound dead streams. */
   scheduledToolUseEnd = null;
   /** Bumped on every content/usage stream event of the current message. Read by
    *  the grace timer to tell "silent for a full grace period" from "still
@@ -36707,6 +36719,16 @@ var QueryContext = class {
     this.currentMessageUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     this.currentMessageId = void 0;
   }
+  /** Reset state that lasts for one top-level SDK query. Tool ids are unique in
+   *  practice, but retaining these maps across queries leaked memory and could
+   *  let an accidentally reused id inherit a previous turn's delivery status. */
+  resetQueryToolTracking() {
+    this.queryToolNames.clear();
+    this.deliveredToPiToolCallIds.clear();
+    this.authoritativeToolCallArgs.clear();
+    this.undeliverableToolCallIds.clear();
+    this.resetToolTracking();
+  }
   resetToolTracking() {
     this.turnToolCallIds = [];
     this.turnToolCalls = [];
@@ -36760,11 +36782,32 @@ var QueryContext = class {
   wasToolCallDeliveredToPi(id) {
     return Boolean(id && this.deliveredToPiToolCallIds.has(id));
   }
+  recordAuthoritativeToolCallArgs(id, args) {
+    if (!id) return;
+    this.authoritativeToolCallArgs.set(id, args);
+    this.updateToolCallArgs(id, args);
+  }
+  authoritativeArgsForToolCall(id) {
+    return id ? this.authoritativeToolCallArgs.get(id) : void 0;
+  }
   markToolCallUndeliverable(id) {
     if (id) this.undeliverableToolCallIds.add(id);
   }
   markOutputCommitted() {
     this.committedOutput = true;
+  }
+  beginQuerySettlement() {
+    this.abortRequested = false;
+    this.querySettledPromise = new Promise((resolve8) => {
+      this.resolveQuerySettled = resolve8;
+    });
+  }
+  markQuerySettled() {
+    this.resolveQuerySettled?.();
+    this.resolveQuerySettled = null;
+  }
+  waitForQuerySettlement() {
+    return this.querySettledPromise;
   }
   claimToolCall(toolName, args = {}) {
     const unclaimed = this.turnToolCalls.filter((call) => !this.claimedToolCallIds.has(call.id));
@@ -53478,6 +53521,15 @@ function parsePartialJson(input, fallback) {
     return fallback;
   }
 }
+function parseCompleteToolJson(input) {
+  if (!input) return void 0;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : void 0;
+  } catch {
+    return void 0;
+  }
+}
 function ensureTurnStarted(c = ctx()) {
   if (!c.turnStarted && c.currentPiStream && c.turnOutput) {
     c.currentPiStream.push({ type: "start", partial: c.turnOutput });
@@ -53494,26 +53546,54 @@ function finalizeCurrentStream(stopReason, c = ctx()) {
   c.currentPiStream = null;
 }
 var TOOL_USE_END_GRACE_MS = 1500;
-var TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS = 6;
+var TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS = 60;
 function openToolBlocks(c) {
   if (!c.turnOutput) return [];
   return c.turnBlocks.filter((b2) => b2.type === "toolCall" && "partialJson" in b2);
 }
+function executableArgsForOpenBlock(c, block) {
+  const authoritative = c.authoritativeArgsForToolCall(block.id);
+  if (authoritative) return authoritative;
+  const complete = parseCompleteToolJson(block.partialJson);
+  return complete ? mapToolArgs(block.name, complete) : void 0;
+}
+function unsafeOpenToolBlocks(c) {
+  return openToolBlocks(c).filter((block) => !executableArgsForOpenBlock(c, block));
+}
 function settleOpenToolBlocks(c) {
   const open3 = openToolBlocks(c);
   if (open3.length === 0) return;
-  for (const block of open3) {
+  const sealed = [];
+  const dropped = [];
+  for (const block of [...open3].reverse()) {
     const index = c.turnBlocks.indexOf(block);
-    block.arguments = mapToolArgs(block.name, parsePartialJson(block.partialJson, block.arguments));
-    c.updateToolCallArgs(block.id, block.arguments);
+    const args = executableArgsForOpenBlock(c, block);
+    if (!args) {
+      c.markToolCallUndeliverable(block.id);
+      c.turnBlocks.splice(index, 1);
+      dropped.push(block);
+      continue;
+    }
+    block.arguments = args;
+    c.updateToolCallArgs(block.id, args);
     delete block.partialJson;
     delete block.index;
     c.currentPiStream?.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+    sealed.push(block);
   }
-  const names = open3.map((b2) => b2.name);
-  debug(`settleOpenToolBlocks: forced turn end sealed ${open3.length} still-streaming tool block(s): ${names.join(", ")}`);
-  diagDump("tool_use_turn_forced_with_open_blocks", { count: open3.length, blocks: open3.map((b2) => ({ id: b2.id, toolName: b2.name, argKeys: Object.keys(b2.arguments ?? {}) })) });
-  appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: open3.length, toolNames: names });
+  if (sealed.length > 0) {
+    const names = sealed.map((b2) => b2.name);
+    debug(`settleOpenToolBlocks: forced turn end safely sealed ${sealed.length} still-streaming tool block(s): ${names.join(", ")}`);
+    diagDump("tool_use_turn_forced_with_open_blocks", { count: sealed.length, blocks: sealed.map((b2) => ({ id: b2.id, toolName: b2.name, argKeys: Object.keys(b2.arguments ?? {}) })) });
+    appendIntegrityEntry("tool_use_turn_forced_with_open_blocks", { count: sealed.length, toolNames: names });
+  }
+  if (dropped.length > 0) {
+    const names = dropped.map((b2) => b2.name);
+    debug(`settleOpenToolBlocks: dropped ${dropped.length} incomplete tool block(s) instead of executing partial arguments: ${names.join(", ")}`);
+    diagDump("incomplete_tool_calls_dropped", { count: dropped.length, blocks: dropped.map((b2) => ({ id: b2.id, toolName: b2.name })) });
+    appendIntegrityEntry("incomplete_tool_calls_dropped", { count: dropped.length, toolNames: names });
+    safeNotify(`Claude bridge: dropped ${dropped.length} incomplete tool call(s) instead of executing partial arguments (${names.slice(0, 6).join(", ")}). Claude will receive an error and may retry.`, "warning");
+  }
 }
 function endToolUseTurn(c) {
   if (!c.currentPiStream || !c.turnOutput) return;
@@ -53551,17 +53631,23 @@ function fireToolUseEndTimer(c) {
   }
   if (c.toolUseActivitySeq !== armed.seenActivitySeq) {
     armed.seenActivitySeq = c.toolUseActivitySeq;
+    armed.incompleteBlockWaits = 0;
     armToolUseEndTimer(c);
     return;
   }
   const open3 = openToolBlocks(c);
-  if (open3.length > 0 && armed.openBlockDeferrals < TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS) {
-    armed.openBlockDeferrals++;
-    debug(`scheduleToolUseTurnEnd: stream quiet but ${open3.length} tool block(s) still open (${armed.source}) \u2014 deferring turn end (${armed.openBlockDeferrals}/${TOOL_USE_END_MAX_OPEN_BLOCK_DEFERRALS})`);
-    armToolUseEndTimer(c);
-    return;
+  const unsafe = unsafeOpenToolBlocks(c);
+  if (unsafe.length > 0) {
+    armed.incompleteBlockWaits++;
+    if (armed.incompleteBlockWaits < TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS) {
+      debug(`scheduleToolUseTurnEnd: stream quiet with ${unsafe.length}/${open3.length} incomplete tool block(s) (${armed.source}) \u2014 waiting for complete JSON or validated handler args (${armed.incompleteBlockWaits}/${TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS})`);
+      armToolUseEndTimer(c);
+      return;
+    }
+    debug(`scheduleToolUseTurnEnd: incomplete tool block remained silent for ${TOOL_USE_END_GRACE_MS * TOOL_USE_INCOMPLETE_BLOCK_MAX_WAITS}ms (${armed.source}) \u2014 ending turn and dropping unsafe calls`);
   }
-  debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${open3.length > 0 ? `, ${open3.length} open block(s) past deferral cap` : ""}) \u2014 force-ending tool_use turn`);
+  const openSummary = unsafe.length > 0 ? `, ${unsafe.length} incomplete block(s) will be dropped` : open3.length > 0 ? `, ${open3.length} safely recoverable open block(s)` : "";
+  debug(`scheduleToolUseTurnEnd: no terminal stream event after ${TOOL_USE_END_GRACE_MS}ms of silence (${armed.source}${openSummary}) \u2014 force-ending tool_use turn`);
   c.scheduledToolUseEnd = null;
   armed.action();
 }
@@ -53575,7 +53661,7 @@ function scheduleToolUseTurnEnd(c, action, source) {
     action,
     source,
     seenActivitySeq: c.toolUseActivitySeq,
-    openBlockDeferrals: 0
+    incompleteBlockWaits: 0
   };
   armToolUseEndTimer(c);
 }
@@ -54174,6 +54260,7 @@ function buildMcpServers(tools, queryCtx) {
         });
         return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true };
       }
+      queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
       if (claim.argsMismatch) {
         debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
         diagDump("tool_claim_args_mismatch", {
@@ -54249,6 +54336,9 @@ function resolveConfiguredEffort(modelId, reasoningEffort, providerConfig) {
 function isClaudeContextLengthFailure(message) {
   return /\bprompt is too long\b|\binput (?:is |was )?too long\b|\bcontext(?: window)? (?:is |was )?(?:too long|exceeded|overflow)|\bexceeds? (?:the )?context window\b/i.test(message);
 }
+function isSdkProgressMessage(message) {
+  return !(message.type === "stream_event" && message.event?.type === "ping");
+}
 async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router) {
   let capturedSessionId;
   let failure;
@@ -54256,7 +54346,7 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
   for await (const message of sdkQuery) {
     if (wasAborted()) break;
     const queryCtx = ctx();
-    activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
+    if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
     if (account) {
       debug("consumeQuery: managed message", JSON.stringify({
         type: message.type,
@@ -54475,6 +54565,33 @@ function streamClaudeAgentSdk(model, context, options) {
   const lastMsgRole = context.messages[context.messages.length - 1]?.role;
   const cwd = options?.cwd ?? process.cwd();
   debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
+  if (ctx().activeQuery && ctx().abortRequested && lastMsgRole === "user") {
+    const settlingCtx = ctx();
+    debug("provider: user prompt arrived during abort teardown \u2014 deferring until query settlement");
+    void (async () => {
+      try {
+        await settlingCtx.waitForQuerySettlement();
+        const resumed = streamClaudeAgentSdk(model, context, options);
+        for await (const event of resumed) stream.push(event);
+        stream.end();
+      } catch (error51) {
+        const output = {
+          role: "assistant",
+          content: [],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "error",
+          timestamp: Date.now(),
+          errorMessage: error51 instanceof Error ? error51.message : String(error51)
+        };
+        stream.push({ type: "error", reason: "error", error: output });
+        stream.end();
+      }
+    })();
+    return stream;
+  }
   if (ctx().activeQuery) {
     const queryCtx = ctx();
     queryCtx.currentPiStream = stream;
@@ -54595,7 +54712,7 @@ function streamClaudeAgentSdk(model, context, options) {
   ctx().pendingResults.clear();
   ctx().deferredUserMessages = [];
   ctx().resetTurnState(model);
-  ctx().resetToolTracking();
+  ctx().resetQueryToolTracking();
   ctx().latestCursor = 0;
   ctx().committedOutput = false;
   const router = resolveClaudeAccountRouter();
@@ -54746,6 +54863,7 @@ function streamClaudeAgentSdk(model, context, options) {
   let retryRequested = false;
   let retryFailure;
   const sdkQuery = sdkQueryFactory({ prompt, options: queryOptions });
+  ctx().beginQuerySettlement();
   ctx().activeQuery = sdkQuery;
   const abortCtx = ctx();
   let accountFailureRecorded = false;
@@ -54823,6 +54941,7 @@ function streamClaudeAgentSdk(model, context, options) {
   }
   const onAbort = () => {
     wasAborted = true;
+    abortCtx.abortRequested = true;
     abortCtx.deferredUserMessages = [];
     reportToolResultMismatch(abortCtx, "abort", cwd, {
       expectedInterruption: true,
@@ -55000,8 +55119,12 @@ function streamClaudeAgentSdk(model, context, options) {
     activeStreamIdleWatchdogs.delete(abortCtx);
     if (options?.signal) options.signal.removeEventListener("abort", onAbort);
     const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, streamIdleTimedOut });
-    teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
-    sdkQuery.close();
+    try {
+      teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
+    } finally {
+      abortCtx.markQuerySettled();
+      sdkQuery.close();
+    }
   }).then(async () => {
     if (!retryRequested || wasAborted || options?.signal?.aborted) return;
     debug(`provider: starting account retry after ${retryFailure?.kind ?? "failure"}; excluded=${[...rotationState.excludedProfileIds].join(",")}`);
@@ -55255,6 +55378,7 @@ export {
   formatResetTimestamp,
   isChildExecutedTool,
   isConnectorWriteTool,
+  isSdkProgressMessage,
   isUsageLimitMessage,
   listAccountConnectors,
   mapToolName,

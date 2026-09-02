@@ -195,6 +195,12 @@ function unique(values: Iterable<string | undefined>): string[] {
 export class QueryContext {
 	// Query-scoped (fully isolated per query)
 	activeQuery: unknown | null = null;
+	/** True from abort receipt until this query's teardown completes. A new user
+	 *  prompt arriving in that narrow window must wait and retry, not be mistaken
+	 *  for tool-result delivery to the dying query. */
+	abortRequested = false;
+	private querySettledPromise: Promise<void> = Promise.resolve();
+	private resolveQuerySettled: (() => void) | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
 	pendingToolCalls = new Map<string, PendingToolCall>();
@@ -221,6 +227,11 @@ export class QueryContext {
 	 * Distinct from `deliveredToolResultIds`, which tracks results coming BACK.
 	 */
 	deliveredToPiToolCallIds = new Set<string>();
+	/** Schema-validated MCP handler arguments keyed by tool_call id. These are the
+	 *  only authoritative fallback for a streamed block whose input_json_delta is
+	 *  still syntactically incomplete: unlike partial JSON, reaching the handler
+	 *  proves the SDK accepted the full input against the tool schema. */
+	authoritativeToolCallArgs = new Map<string, Record<string, unknown>>();
 	/** Tool-call ids recorded from an assistant message AFTER the pi turn for that
 	 *  message had already ended — pi never received them. Query-scoped like
 	 *  `deliveredToPiToolCallIds`, for the same reason. */
@@ -240,15 +251,16 @@ export class QueryContext {
 	 *  this is the deadlock backstop for streams that go silent instead. Managed
 	 *  by schedule/cancelToolUseTurnEnd in assistant-stream.ts. The timer only
 	 *  fires after a full grace period WITHOUT stream activity (`seenActivitySeq`
-	 *  vs `toolUseActivitySeq`) and defers while a tool block is still streaming
-	 *  (`openBlockDeferrals`), so a parallel tool call mid-flight is never cut. */
+	 *  vs `toolUseActivitySeq`) and keeps waiting while an open tool block lacks
+	 *  either complete JSON or schema-validated handler arguments. The progress-
+	 *  aware stream watchdog and an independent safe-drop cap bound dead streams. */
 	scheduledToolUseEnd: {
 		stream: unknown;
 		timer: ReturnType<typeof setTimeout>;
 		action: () => void;
 		source: string;
 		seenActivitySeq: number;
-		openBlockDeferrals: number;
+		incompleteBlockWaits: number;
 	} | null = null;
 	/** Bumped on every content/usage stream event of the current message. Read by
 	 *  the grace timer to tell "silent for a full grace period" from "still
@@ -365,6 +377,17 @@ export class QueryContext {
 		// assistant messages call resetToolTracking() explicitly.
 	}
 
+	/** Reset state that lasts for one top-level SDK query. Tool ids are unique in
+	 *  practice, but retaining these maps across queries leaked memory and could
+	 *  let an accidentally reused id inherit a previous turn's delivery status. */
+	resetQueryToolTracking(): void {
+		this.queryToolNames.clear();
+		this.deliveredToPiToolCallIds.clear();
+		this.authoritativeToolCallArgs.clear();
+		this.undeliverableToolCallIds.clear();
+		this.resetToolTracking();
+	}
+
 	resetToolTracking(): void {
 		this.turnToolCallIds = [];
 		this.turnToolCalls = [];
@@ -431,12 +454,38 @@ export class QueryContext {
 		return Boolean(id && this.deliveredToPiToolCallIds.has(id));
 	}
 
+	recordAuthoritativeToolCallArgs(id: string | undefined, args: Record<string, unknown>): void {
+		if (!id) return;
+		this.authoritativeToolCallArgs.set(id, args);
+		this.updateToolCallArgs(id, args);
+	}
+
+	authoritativeArgsForToolCall(id: string | undefined): Record<string, unknown> | undefined {
+		return id ? this.authoritativeToolCallArgs.get(id) : undefined;
+	}
+
 	markToolCallUndeliverable(id: string | undefined): void {
 		if (id) this.undeliverableToolCallIds.add(id);
 	}
 
 	markOutputCommitted(): void {
 		this.committedOutput = true;
+	}
+
+	beginQuerySettlement(): void {
+		this.abortRequested = false;
+		this.querySettledPromise = new Promise<void>((resolve) => {
+			this.resolveQuerySettled = resolve;
+		});
+	}
+
+	markQuerySettled(): void {
+		this.resolveQuerySettled?.();
+		this.resolveQuerySettled = null;
+	}
+
+	waitForQuerySettlement(): Promise<void> {
+		return this.querySettledPromise;
 	}
 
 	claimToolCall(toolName: string, args: Record<string, unknown> = {}): ClaimedToolCall {

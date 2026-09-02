@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { processAssistantMessage, processStreamEvent, endToolUseTurn } from "../src/index.ts";
 import { ctx, resetStack, failUndeliveredPendingToolCalls, isUndeliverableToolCall } from "../src/query-state.ts";
 
+process.env.CLAUDE_BRIDGE_DIAG_PATH ??= `${process.cwd()}/.test-output/unit-parallel-diag.log`;
+
 // A model that issues several tool calls in one message streams them as
 // consecutive tool_use blocks. The SDK yields a per-block partial copy of the
 // assistant message (and Claude Code may invoke the MCP handler) as soon as the
@@ -85,7 +87,7 @@ describe("parallel tool calls: grace timer never cuts a block that is still stre
 		assert.equal(events.at(-2).message.usage.output, 42, "message_delta usage still lands");
 	});
 
-	it("defers a silent stream with an open block up to the cap, then seals the partial arguments instead of shipping {}", (t) => {
+	it("force-seals an open block only when its streamed JSON is syntactically complete", (t) => {
 		t.mock.timers.enable({ apis: ["setTimeout"] });
 		const c = ctx();
 		c.resetTurnState(model);
@@ -94,24 +96,100 @@ describe("parallel tool calls: grace timer never cuts a block that is still stre
 		streamFirstBlock("toolu_1", "echo one");
 		streamEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "mcp__custom-tools__bash", input: {} } });
 		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"command\":\"echo two\"}" } });
-		// Then the stream dies: no content_block_stop, no terminal events.
-
+		// Then the stream dies: no content_block_stop, no terminal events. The raw
+		// JSON is complete, so it is safe to recover after one quiet period.
 		t.mock.timers.tick(1500); // activity since arming → re-arm
-		assert.ok(c.currentPiStream);
-		for (let i = 0; i < 6; i++) {
-			t.mock.timers.tick(1500); // quiet, block open → deferral
-			assert.ok(c.currentPiStream, `deferral ${i + 1} keeps the turn open`);
-		}
-		t.mock.timers.tick(1500); // deferral cap reached → forced end
+		t.mock.timers.tick(1500); // quiet + complete JSON → forced end
 
-		assert.equal(c.currentPiStream, null, "true deadlock backstop still ends the turn");
+		assert.equal(c.currentPiStream, null);
 		const calls = c.turnBlocks.filter((b) => b.type === "toolCall");
-		assert.deepEqual(calls.map((b) => b.arguments.command), ["echo one", "echo two"], "open block sealed from its partial JSON");
+		assert.deepEqual(calls.map((b) => b.arguments.command), ["echo one", "echo two"]);
 		assert.ok(calls.every((b) => !("partialJson" in b)));
-		assert.equal(events.filter((e) => e.type === "toolcall_end").length, 2, "sealed block gets its toolcall_end");
+		assert.equal(events.filter((e) => e.type === "toolcall_end").length, 2);
 		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), true);
-		assert.equal(events.at(-2).type, "done");
 		assert.equal(events.at(-2).reason, "toolUse");
+	});
+
+	it("waits past the former 10.5s cap while incomplete JSON is still recoverable", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const c = ctx();
+		c.resetTurnState(model);
+		installFakeStream();
+
+		streamFirstBlock("toolu_1", "echo one");
+		streamEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "mcp__custom-tools__bash", input: {} } });
+		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"command\":\"echo unfinished" } });
+		t.mock.timers.tick(1500); // observed activity → re-arm
+		for (let i = 0; i < 20; i++) t.mock.timers.tick(1500);
+
+		assert.ok(c.currentPiStream, "the old short cap must not dispatch incomplete input");
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), false);
+		assert.equal(c.turnBlocks.find((b) => b.id === "toolu_2").partialJson, "{\"command\":\"echo unfinished");
+
+		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: " two\"}" } });
+		t.mock.timers.tick(1500); // observed completion → re-arm
+		t.mock.timers.tick(1500); // quiet + now-complete input → safe force end
+		assert.equal(c.currentPiStream, null);
+		assert.equal(c.turnBlocks.find((b) => b.id === "toolu_2").arguments.command, "echo unfinished two");
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), true);
+	});
+
+	it("drops a persistently incomplete block after 90s instead of waiting forever", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const c = ctx();
+		c.resetTurnState(model);
+		const events = installFakeStream();
+
+		streamFirstBlock("toolu_1", "echo one");
+		streamEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "mcp__custom-tools__bash", input: {} } });
+		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"command\":\"never finished" } });
+		t.mock.timers.tick(1500); // observed activity → re-arm
+		for (let i = 0; i < 59; i++) t.mock.timers.tick(1500);
+		assert.ok(c.currentPiStream);
+		t.mock.timers.tick(1500); // independent 90s cap → end and drop
+
+		assert.equal(c.currentPiStream, null);
+		assert.deepEqual(c.turnBlocks.filter((b) => b.type === "toolCall").map((b) => b.id), ["toolu_1"]);
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), false);
+		assert.equal(c.undeliverableToolCallIds.has("toolu_2"), true);
+		assert.deepEqual(events.at(-2).message.content.filter((b) => b.type === "toolCall").map((b) => b.id), ["toolu_1"]);
+	});
+
+	it("uses schema-validated MCP handler arguments to recover an open block", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const c = ctx();
+		c.resetTurnState(model);
+		installFakeStream();
+
+		streamFirstBlock("toolu_1", "echo one");
+		streamEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "mcp__custom-tools__bash", input: {} } });
+		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"command\":\"half" } });
+		c.recordAuthoritativeToolCallArgs("toolu_2", { command: "echo authoritative", timeout: 120 });
+		t.mock.timers.tick(1500);
+		t.mock.timers.tick(1500);
+
+		assert.equal(c.currentPiStream, null);
+		assert.deepEqual(c.turnBlocks.find((b) => b.id === "toolu_2").arguments, { command: "echo authoritative", timeout: 120 });
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), true);
+	});
+
+	it("drops an incomplete open block at a terminal boundary instead of executing mapper defaults", () => {
+		const c = ctx();
+		c.resetTurnState(model);
+		const events = installFakeStream();
+
+		streamFirstBlock("toolu_1", "echo one");
+		streamEvent({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "mcp__custom-tools__bash", input: {} } });
+		streamEvent({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"command\":\"half" } });
+		streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 12 } });
+		streamEvent({ type: "message_stop" });
+
+		assert.equal(c.currentPiStream, null);
+		assert.deepEqual(c.turnBlocks.filter((b) => b.type === "toolCall").map((b) => b.id), ["toolu_1"]);
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_1"), true);
+		assert.equal(c.wasToolCallDeliveredToPi("toolu_2"), false);
+		assert.equal(c.undeliverableToolCallIds.has("toolu_2"), true);
+		assert.deepEqual(events.at(-2).message.content.filter((b) => b.type === "toolCall").map((b) => b.id), ["toolu_1"]);
 	});
 
 	it("still force-ends a quiet stream with no open blocks after one grace period", (t) => {

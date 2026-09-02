@@ -145,6 +145,21 @@ describe("QueryContext class", () => {
 		assert.deepEqual(ctx().takeStaleQueuedResults(), [], "second drain is empty");
 	});
 
+	it("resetQueryToolTracking clears query-scoped delivery and authoritative-argument state", () => {
+		ctx().recordToolCall("old", "bash", { command: "old" });
+		ctx().markToolCallDeliveredToPi("old");
+		ctx().markToolCallUndeliverable("late");
+		ctx().recordAuthoritativeToolCallArgs("old", { command: "validated" });
+
+		ctx().resetQueryToolTracking();
+
+		assert.equal(ctx().queryToolNames.size, 0);
+		assert.equal(ctx().deliveredToPiToolCallIds.size, 0);
+		assert.equal(ctx().undeliverableToolCallIds.size, 0);
+		assert.equal(ctx().authoritativeToolCallArgs.size, 0);
+		assert.equal(ctx().turnToolCalls.length, 0);
+	});
+
 	it("toolResultProgress reports teardown mismatch counts", () => {
 		ctx().recordToolCall("t0", "read", { path: "a" });
 		ctx().recordToolCall("t1", "grep", { pattern: "x" });

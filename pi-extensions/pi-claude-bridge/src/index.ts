@@ -5,7 +5,7 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { createSdkMcpServer, query, type EffortLevel, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import {
 	LEGACY_PROVIDER_ID,
 	PROVIDER_ID,
@@ -372,6 +372,10 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 				});
 				return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true } satisfies McpResult;
 			}
+			// Reaching this handler proves the SDK accepted the complete input against
+			// the tool schema. Preserve it as the authoritative recovery copy before
+			// any timer can finalize a still-open streamed block.
+			queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
 			if (claim.argsMismatch) {
 				// Claimed anyway (sole same-name candidate) — record the divergence so
 				// a schema/validator drift stays visible without stranding the call.
@@ -493,6 +497,12 @@ interface ConsumeQueryResult {
 	failure?: ClaudeAttemptFailure;
 }
 
+/** Transport keepalive pings prove the socket is alive, not that the model is
+ * making progress. They must not postpone the content-progress watchdog. */
+export function isSdkProgressMessage(message: SDKMessage): boolean {
+	return !(message.type === "stream_event" && (message as any).event?.type === "ping");
+}
+
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
@@ -509,7 +519,11 @@ async function consumeQuery(
 	for await (const message of sdkQuery) {
 		if (wasAborted()) break;
 		const queryCtx = ctx();
-		activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
+		// Claude's transport can keep emitting ping frames while model output is
+		// completely stalled. Counting those as progress disabled the 90s watchdog
+		// and let a half-written parallel tool call wait for 47 minutes. Only actual
+		// SDK/message progress refreshes the watchdog.
+		if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
 		if (account) {
 			debug("consumeQuery: managed message", JSON.stringify({
 				type: message.type,
@@ -800,6 +814,34 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
+	// Pi can acknowledge an abort a few milliseconds before this provider's SDK
+	// consumer finishes teardown. A prompt sent in that window used to enter the
+	// active-query tool-result path, emit an empty aborted turn, and disappear.
+	// Keep its provider stream open, wait for the dying query to release the
+	// context, then run the prompt normally through a fresh query.
+	if (ctx().activeQuery && ctx().abortRequested && lastMsgRole === "user") {
+		const settlingCtx = ctx();
+		debug("provider: user prompt arrived during abort teardown — deferring until query settlement");
+		void (async () => {
+			try {
+				await settlingCtx.waitForQuerySettlement();
+				const resumed = streamClaudeAgentSdk(model, context, options);
+				for await (const event of resumed) stream.push(event);
+				stream.end();
+			} catch (error) {
+				const output: AssistantMessage = {
+					role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					stopReason: "error", timestamp: Date.now(),
+					errorMessage: error instanceof Error ? error.message : String(error),
+				};
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+			}
+		})();
+		return stream;
+	}
+
 	// --- Tool result delivery ---
 	// Pi appends tool results to context and calls back. Extract this turn's results
 	// (everything after the last assistant message) and match against waiting MCP
@@ -943,7 +985,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	ctx().pendingResults.clear();
 	ctx().deferredUserMessages = [];
 	ctx().resetTurnState(model);
-	ctx().resetToolTracking();
+	ctx().resetQueryToolTracking();
 	ctx().latestCursor = 0;
 	ctx().committedOutput = false;
 
@@ -1165,6 +1207,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	let retryRequested = false;
 	let retryFailure: ClaudeAttemptFailure | undefined;
 	const sdkQuery = sdkQueryFactory({ prompt, options: queryOptions });
+	ctx().beginQuerySettlement();
 	ctx().activeQuery = sdkQuery;
 
 	// 4. Capture context for abort handling (must be AFTER pushContext)
@@ -1248,6 +1291,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	}
 	const onAbort = () => {
 		wasAborted = true;
+		abortCtx.abortRequested = true;
 		// Prevent stale deferred messages from being replayed by parent on pop
 		abortCtx.deferredUserMessages = [];
 		reportToolResultMismatch(abortCtx, "abort", cwd, {
@@ -1449,8 +1493,12 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			activeStreamIdleWatchdogs.delete(abortCtx);
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, streamIdleTimedOut });
-			teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
-			sdkQuery.close();
+			try {
+				teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
+			} finally {
+				abortCtx.markQuerySettled();
+				sdkQuery.close();
+			}
 		})
 		.then(async () => {
 			if (!retryRequested || wasAborted || options?.signal?.aborted) return;
