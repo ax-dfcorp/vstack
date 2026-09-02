@@ -1,7 +1,12 @@
 import { type AssistantMessage, type AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { type QueryContext } from "./query-state.js";
 
-export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 90_000;
+// Must exceed the Claude Code CLI's own ~180s stream idle deadline: the CLI
+// attempts its own reconnect/recovery first, and any outcome (resume or error)
+// reaches us as SDK activity. Cutting earlier converts recoverable pauses —
+// e.g. the long server-side silences seen while huge write tool args stream —
+// into failed turns that retry into the same stall (observed 2026-09-02).
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 240_000;
 export const STREAM_IDLE_BACKOFF_HINT_MS = 60_000;
 export const STREAM_IDLE_TIMEOUT_ENV = "CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT";
 
