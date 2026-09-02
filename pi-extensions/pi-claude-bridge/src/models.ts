@@ -2,7 +2,8 @@
 // `resolveModelId` returns the first partial match, so `opus` resolves to the first-listed opus entry.
 // Extracted from index.ts so tests can import without activating the extension.
 
-export const FABLE_MODEL_ID = "claude-fable-5";
+export const FABLE_MODEL_ID = "claude-fable-5-1";
+export const FABLE_5_MODEL_ID = "claude-fable-5";
 // Opus 4.8 remains the preferred implementation model and Fable's availability fallback.
 // Opus 5 is independently selectable; it does not replace the stable fallback pairing.
 export const FABLE_FALLBACK_MODEL_ID = "claude-opus-4-8";
@@ -10,11 +11,14 @@ export const OPUS_5_MODEL_ID = "claude-opus-5";
 export const SONNET_5_MODEL_ID = "claude-sonnet-5";
 
 export function fallbackModelForPrimaryModel(modelId: string): string | undefined {
-	return modelId === FABLE_MODEL_ID ? FABLE_FALLBACK_MODEL_ID : undefined;
+	return modelId === FABLE_MODEL_ID || modelId === FABLE_5_MODEL_ID
+		? FABLE_FALLBACK_MODEL_ID
+		: undefined;
 }
 
 export const MODEL_IDS_IN_ORDER = [
 	FABLE_MODEL_ID,
+	FABLE_5_MODEL_ID,
 	FABLE_FALLBACK_MODEL_ID,
 	OPUS_5_MODEL_ID,
 	"claude-opus-4-7",
@@ -37,6 +41,15 @@ type BridgeModelMetadata = {
 const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 	[FABLE_MODEL_ID]: {
 		id: FABLE_MODEL_ID,
+		name: "Claude Fable 5.1",
+		reasoning: true,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		input: ["text", "image"],
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	[FABLE_5_MODEL_ID]: {
+		id: FABLE_5_MODEL_ID,
 		name: "Claude Fable 5",
 		reasoning: true,
 		thinkingLevelMap: { xhigh: "xhigh", max: "max" },

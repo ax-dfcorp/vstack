@@ -1079,7 +1079,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	// With a managed Fable pool, let every account's model-scoped allowance run
 	// out before changing models. Once the router explicitly selects Opus, its
 	// normal Opus→4.8 safety fallback remains enabled.
-	const fallbackModel = account && model.id === "claude-fable-5" && queryModel.id === model.id
+	const fallbackModel = account && fallbackModelForPrimaryModel(model.id) && queryModel.id === model.id
 		? undefined
 		: fallbackModelForPrimaryModel(queryModel.id);
 
