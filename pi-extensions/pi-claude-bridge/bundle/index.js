@@ -53287,7 +53287,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account)
 }
 
 // src/stream-idle-watchdog.ts
-var DEFAULT_STREAM_IDLE_TIMEOUT_MS = 9e4;
+var DEFAULT_STREAM_IDLE_TIMEOUT_MS = 24e4;
 var STREAM_IDLE_BACKOFF_HINT_MS = 6e4;
 var STREAM_IDLE_TIMEOUT_ENV = "CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT";
 var activeStreamIdleWatchdogs = /* @__PURE__ */ new WeakMap();
