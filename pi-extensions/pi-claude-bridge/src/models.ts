@@ -38,12 +38,28 @@ type BridgeModelMetadata = {
 	maxTokens: number;
 };
 
+const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
+	off: null,
+	minimal: null,
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
+	FABLE_MODEL_ID,
+	FABLE_5_MODEL_ID,
+	FABLE_FALLBACK_MODEL_ID,
+	OPUS_5_MODEL_ID,
+]);
+
 const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 	[FABLE_MODEL_ID]: {
 		id: FABLE_MODEL_ID,
 		name: "Claude Fable 5.1",
 		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
@@ -52,7 +68,7 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		id: FABLE_5_MODEL_ID,
 		name: "Claude Fable 5",
 		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
@@ -61,7 +77,7 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		id: FABLE_FALLBACK_MODEL_ID,
 		name: "Claude Opus 4.8",
 		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh" },
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
@@ -70,7 +86,7 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		id: OPUS_5_MODEL_ID,
 		name: "Claude Opus 5",
 		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
@@ -103,7 +119,15 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 		// Forward thinkingLevelMap so per-model overrides (e.g. opus-4-7 mapping
 		// xhigh→xhigh instead of xhigh→max) are visible to the effort lookup.
 		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
-			id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap,
+			id,
+			name,
+			reasoning,
+			input,
+			contextWindow,
+			maxTokens,
+			thinkingLevelMap: CLAUDE_FIVE_LEVEL_MODEL_IDS.has(id)
+				? CLAUDE_FIVE_LEVEL_EFFORT_MAP
+				: thinkingLevelMap,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		}));
 }

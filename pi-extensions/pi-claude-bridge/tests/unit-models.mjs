@@ -9,6 +9,16 @@ import { FABLE_5_MODEL_ID, FABLE_FALLBACK_MODEL_ID, FABLE_MODEL_ID, MODEL_IDS_IN
 
 // Simulated pi-ai registry entry — extra fields mimic the ones pi-ai exposes
 // that must not leak into the provider-registered MODELS array.
+const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
+	off: null,
+	minimal: null,
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
 const mockPiAiModel = (id) => ({
 	id, name: id, reasoning: true, input: ["text"], cost: { input: 1, output: 1 },
 	contextWindow: 200000, maxTokens: 8000,
@@ -51,12 +61,12 @@ describe("MODELS projection", () => {
 		assert.equal(models.find((m) => m.id === "claude-opus-5")?.name, "Claude Opus 5");
 		assert.equal(models.find((m) => m.id === "claude-sonnet-5")?.name, "Claude Sonnet 5");
 		assert.equal(models.find((m) => m.id === "claude-sonnet-5")?.contextWindow, 1000000);
-		assert.deepEqual(models.find((m) => m.id === "claude-fable-5")?.thinkingLevelMap, { xhigh: "xhigh", max: "max" });
-		assert.deepEqual(models.find((m) => m.id === "claude-opus-5")?.thinkingLevelMap, { xhigh: "xhigh", max: "max" });
+		assert.deepEqual(models.find((m) => m.id === "claude-fable-5")?.thinkingLevelMap, CLAUDE_FIVE_LEVEL_EFFORT_MAP);
+		assert.deepEqual(models.find((m) => m.id === "claude-opus-5")?.thinkingLevelMap, CLAUDE_FIVE_LEVEL_EFFORT_MAP);
 		assert.deepEqual(models.find((m) => m.id === "claude-sonnet-5")?.thinkingLevelMap, { xhigh: "xhigh", max: "max" });
 	});
 
-	it("prefers pi-ai metadata over bridge fallback metadata", () => {
+	it("enforces native Claude effort levels over stale pi-ai aliases", () => {
 		const models = buildModels([{
 			...mockPiAiModel("claude-fable-5"),
 			name: "Registry Fable",
@@ -68,7 +78,7 @@ describe("MODELS projection", () => {
 		assert.equal(fable?.name, "Registry Fable");
 		assert.equal(fable?.contextWindow, 123);
 		assert.equal(fable?.maxTokens, 456);
-		assert.deepEqual(fable?.thinkingLevelMap, { xhigh: "max" });
+		assert.deepEqual(fable?.thinkingLevelMap, CLAUDE_FIVE_LEVEL_EFFORT_MAP);
 	});
 
 	it("zeros out cost regardless of pi-ai pricing", () => {
@@ -78,9 +88,11 @@ describe("MODELS projection", () => {
 		}
 	});
 
-	it("preserves pi-ai thinkingLevelMap for per-model effort mapping", () => {
+	it("publishes only low through max for Fable and Opus models", () => {
 		const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
-		assert.deepEqual(models.find((m) => m.id === "claude-opus-4-8")?.thinkingLevelMap, { xhigh: "xhigh" });
+		for (const id of [FABLE_MODEL_ID, FABLE_5_MODEL_ID, FABLE_FALLBACK_MODEL_ID, OPUS_5_MODEL_ID]) {
+			assert.deepEqual(models.find((m) => m.id === id)?.thinkingLevelMap, CLAUDE_FIVE_LEVEL_EFFORT_MAP);
+		}
 	});
 });
 

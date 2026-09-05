@@ -93,7 +93,7 @@ The bridge also reads `claude-bridge.json` (`~/.pi/agent/claude-bridge.json`, an
 | Model effort overrides | JSON object mapping model IDs to Claude Code efforts, e.g. `{"claude-opus-4-8":"max"}`. Per-model entries beat the global force setting. |
 | Claude executable path | Explicit `claude` binary path; empty auto-detects. |
 
-Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, and Sonnet 5 bridge metadata forward both `xhigh` and `max`; Opus 4.8 keeps its native effort mapping. **Force Claude effort** and **Model effort overrides** remain available when one bridge model needs a different fixed effort. For example, to force only Opus 4.8 to `max`:
+Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, Opus 4.8, and Opus 5 expose Claude's five native effort levels: `low`, `medium`, `high`, `xhigh`, and `max`. Generic Pi aliases such as `off` and `minimal` are excluded for these models. **Force Claude effort** and **Model effort overrides** remain available when one bridge model needs a different fixed effort. For example, to force only Opus 4.8 to `max`:
 
 ```json
 {"claude-opus-4-8":"max"}

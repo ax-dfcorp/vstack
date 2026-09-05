@@ -36379,12 +36379,27 @@ var MODEL_IDS_IN_ORDER = [
   "claude-sonnet-4-6",
   "claude-haiku-4-5"
 ];
+var CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
+  off: null,
+  minimal: null,
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max"
+};
+var CLAUDE_FIVE_LEVEL_MODEL_IDS = /* @__PURE__ */ new Set([
+  FABLE_MODEL_ID,
+  FABLE_5_MODEL_ID,
+  FABLE_FALLBACK_MODEL_ID,
+  OPUS_5_MODEL_ID
+]);
 var FALLBACK_MODELS = {
   [FABLE_MODEL_ID]: {
     id: FABLE_MODEL_ID,
     name: "Claude Fable 5.1",
     reasoning: true,
-    thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
     input: ["text", "image"],
     contextWindow: 1e6,
     maxTokens: 128e3
@@ -36393,7 +36408,7 @@ var FALLBACK_MODELS = {
     id: FABLE_5_MODEL_ID,
     name: "Claude Fable 5",
     reasoning: true,
-    thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
     input: ["text", "image"],
     contextWindow: 1e6,
     maxTokens: 128e3
@@ -36402,7 +36417,7 @@ var FALLBACK_MODELS = {
     id: FABLE_FALLBACK_MODEL_ID,
     name: "Claude Opus 4.8",
     reasoning: true,
-    thinkingLevelMap: { xhigh: "xhigh" },
+    thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
     input: ["text", "image"],
     contextWindow: 1e6,
     maxTokens: 128e3
@@ -36411,7 +36426,7 @@ var FALLBACK_MODELS = {
     id: OPUS_5_MODEL_ID,
     name: "Claude Opus 5",
     reasoning: true,
-    thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
     input: ["text", "image"],
     contextWindow: 1e6,
     maxTokens: 128e3
@@ -36437,7 +36452,7 @@ function buildModels(piAiModels) {
     input,
     contextWindow,
     maxTokens,
-    thinkingLevelMap,
+    thinkingLevelMap: CLAUDE_FIVE_LEVEL_MODEL_IDS.has(id) ? CLAUDE_FIVE_LEVEL_EFFORT_MAP : thinkingLevelMap,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   }));
 }
