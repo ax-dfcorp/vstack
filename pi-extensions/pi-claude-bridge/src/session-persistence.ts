@@ -307,8 +307,15 @@ export function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 	account?: { accountProfileId?: string; claudeConfigDir?: string },
+	/** How many trailing messages the caller sends as the prompt instead of
+	 *  importing. 1 for a normal turn (the new user message). 0 for a
+	 *  continuation after auto-compaction/auto-retry, where the tail is a tool
+	 *  result that MUST stay in the imported history: dropping it would leave
+	 *  its tool_use unpaired and the repair layer would replace a real result
+	 *  with a synthetic error. */
+	dropTrailing = 1,
 ): SyncResult {
-	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
+	const priorMessages = messages.slice(0, messages.length - dropTrailing);
 	const accountProfileId = account?.accountProfileId;
 	const claudeConfigDir = account?.claudeConfigDir;
 	const sameAccount = Boolean(

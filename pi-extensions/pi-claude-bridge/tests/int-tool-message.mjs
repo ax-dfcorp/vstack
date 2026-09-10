@@ -5,6 +5,7 @@
 
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const TEST_TIMEOUT = 30_000;
@@ -150,6 +151,35 @@ describe("tool-message integration", () => {
 		await waitForEvent("agent_end");
 		const text = collector.stop();
 		assert.match(text.toLowerCase(), /mango/, `Steer content not visible to assistant: ${text.slice(0, 300)}`);
+	});
+
+	it("steer during tool execution reaches Claude inside the same run, not as a replay afterwards", { timeout: 20_000 }, async () => {
+		// The previous behaviour: the bridge could not forward a steer into a query
+		// already in progress, so it parked the message and replayed it as a
+		// separate continuation query once the whole run had finished — the model
+		// only "heard" the user after doing everything it had planned. With the
+		// input stream held open, the message is written while a tool handler is
+		// still waiting and the CLI folds it into the next model turn, which is the
+		// boundary pi's native providers deliver at.
+		const before = readFileSync(DEBUG_LOG, "utf-8").length;
+		await send({
+			type: "prompt",
+			message: "Call SlowTool with seconds=3, then summarize what it returned.",
+		});
+		await waitForEvent("tool_execution_start");
+		await send({
+			type: "prompt",
+			message: "Also mention the word 'KIWI' once you are done.",
+			streamingBehavior: "steer",
+		});
+		await waitForEvent("agent_end");
+		const log = readFileSync(DEBUG_LOG, "utf-8").slice(before);
+		assert.match(log, /steer written to live query/, "steer was not delivered into the running query");
+		assert.doesNotMatch(
+			log,
+			/deferred user message for replay/,
+			"steer fell back to the after-the-run replay even though a tool handler was waiting",
+		);
 	});
 
 	it("abort during tool execution recovers cleanly", { timeout: TEST_TIMEOUT }, async () => {

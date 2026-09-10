@@ -36354,9 +36354,62 @@ async function* wrapPromptStream(blocks) {
 function deferredUserPromptText(prompt) {
   return typeof prompt === "string" ? prompt : prompt.text;
 }
+function deferredUserPromptToBlocks(prompt) {
+  if (typeof prompt === "string") return [{ type: "text", text: prompt }];
+  if (prompt.blocks) return prompt.blocks;
+  return [{ type: "text", text: prompt.text }];
+}
 function deferredUserPromptToSdkInput(prompt) {
   if (typeof prompt === "string" || !prompt.blocks) return deferredUserPromptText(prompt);
   return wrapPromptStream(prompt.blocks);
+}
+
+// src/input-channel.ts
+function toSdkUserMessage(content) {
+  return {
+    type: "user",
+    session_id: "",
+    parent_tool_use_id: null,
+    message: { role: "user", content }
+  };
+}
+function createQueryInputChannel(initial) {
+  const queue = [toSdkUserMessage(initial)];
+  let wake = null;
+  let closed = false;
+  let injectedCount = 0;
+  const stream = (async function* () {
+    for (; ; ) {
+      while (queue.length > 0) yield queue.shift();
+      if (closed) return;
+      await new Promise((resolve8) => {
+        wake = resolve8;
+      });
+    }
+  })();
+  return {
+    stream,
+    get injectedCount() {
+      return injectedCount;
+    },
+    get closed() {
+      return closed;
+    },
+    push(blocks) {
+      if (closed) return false;
+      queue.push(toSdkUserMessage(blocks));
+      injectedCount += 1;
+      wake?.();
+      wake = null;
+      return true;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      wake?.();
+      wake = null;
+    }
+  };
 }
 
 // src/models.ts
@@ -36495,6 +36548,14 @@ function interruptedToolCallResult(cause) {
     isError: true
   };
 }
+function isTurnContinuation(queryCtx, lastMsgRole) {
+  if (lastMsgRole !== "toolResult") return false;
+  if (queryCtx.abortRequested) return false;
+  return queryCtx.lastQueryEndCause !== "abort";
+}
+function canInjectSteer(queryCtx, lastMsgRole) {
+  return lastMsgRole === "user" && queryCtx.inputChannel !== null && !queryCtx.inputChannel.closed && queryCtx.pendingToolCalls.size > 0 && !queryCtx.abortRequested;
+}
 function toolCallDrainCause(flags) {
   if (flags.wasAborted || flags.signalAborted) return "abort";
   if (flags.streamIdleTimedOut) return "stream-idle-timeout";
@@ -36567,6 +36628,21 @@ var QueryContext = class {
    *  prompt arriving in that narrow window must wait and retry, not be mistaken
    *  for tool-result delivery to the dying query. */
   abortRequested = false;
+  /** Why the last query on this context ended, recorded at teardown and read by
+   *  the next provider call that arrives with a tool-result tail and no active
+   *  query. Pi re-enters the provider that way for two very different reasons:
+   *  it aborted the turn (the result is a genuine orphan — stay quiet), or it
+   *  wants the turn CONTINUED after auto-compaction / auto-retry, both of which
+   *  strip the failed assistant message and call agent.continue(). Deciding
+   *  from a recorded cause rather than from "activeQuery is null" is what
+   *  keeps a continuation from being answered with an empty end_turn.
+   *  Codex (MidTurn inline compaction) and opencode (interrupted tool parts
+   *  marked in history) both carry this distinction explicitly too. */
+  lastQueryEndCause = null;
+  /** This query's open user-input stream, when it has one. Live steers are
+   *  written here; consumeQuery closes it at `result`, which is also what ends
+   *  the query. Null for continuation queries, which use a one-shot prompt. */
+  inputChannel = null;
   querySettledPromise = Promise.resolve();
   resolveQuerySettled = null;
   currentPiStream = null;
@@ -36813,6 +36889,7 @@ var QueryContext = class {
   }
   beginQuerySettlement() {
     this.abortRequested = false;
+    this.lastQueryEndCause = null;
     this.querySettledPromise = new Promise((resolve8) => {
       this.resolveQuerySettled = resolve8;
     });
@@ -37313,6 +37390,9 @@ function flushConnectorCallAudit(queryCtx, reason) {
 // src/query-teardown.ts
 function teardownQuery(queryCtx, sdkQuery, cause, cwd, isReentrant) {
   if (queryCtx.activeQuery !== sdkQuery) return false;
+  queryCtx.lastQueryEndCause = cause;
+  queryCtx.inputChannel?.close();
+  queryCtx.inputChannel = null;
   reportToolResultMismatch(queryCtx, "query teardown", cwd, { forceRotate: cause !== "query-end" });
   const drained = drainPendingToolCalls(queryCtx, cause);
   if (drained > 0) debug(`provider: query teardown drained ${drained} waiting MCP handler(s) as errors (cause=${cause})`);
@@ -53239,8 +53319,8 @@ function debugSessionPaths(label, cwd, jsonlPath, claudeConfigDir) {
   debug(`${label}: fileExists=${fileExists}${fileSize != null ? ` size=${fileSize}` : ""}`);
   debug(`${label}: selected.CLAUDE_CONFIG_DIR=${claudeConfigDir ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
 }
-function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account) {
-  const priorMessages = messages.slice(0, -1);
+function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account, dropTrailing = 1) {
+  const priorMessages = messages.slice(0, messages.length - dropTrailing);
   const accountProfileId = account?.accountProfileId;
   const claudeConfigDir = account?.claudeConfigDir;
   const sameAccount = Boolean(
@@ -54125,6 +54205,7 @@ var PRIMARY_INSTANCE_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:primaryInst
 var ACTIVE_STREAM_SIMPLE_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:activeStreamSimple");
 var COMMANDS_REGISTERED_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:commandsRegistered");
 var ROTATION_STATE_KEY = /* @__PURE__ */ Symbol("claude-bridge:rotationState");
+var CONTINUATION_PROMPT = "Continue the task from where it was interrupted, using the tool results above. Do not restart work that is already complete.";
 var MODELS = buildModels(getModels("anthropic"));
 var sdkQueryFactory = MZt;
 function __testSetSdkQueryFactory(factory) {
@@ -54354,7 +54435,7 @@ function isClaudeContextLengthFailure(message) {
 function isSdkProgressMessage(message) {
   return !(message.type === "stream_event" && message.event?.type === "ping");
 }
-async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router) {
+async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, inputChannel) {
   let capturedSessionId;
   let failure;
   let accountProbe;
@@ -54388,6 +54469,7 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
         break;
       }
       case "result":
+        inputChannel?.close();
         if (account && failure) break;
         if (!ctx().turnSawStreamEvent && message.subtype === "success") {
           const text = message.result || "";
@@ -54612,6 +54694,22 @@ function streamClaudeAgentSdk(model, context, options) {
     queryCtx.currentPiStream = stream;
     queryCtx.resetTurnState(model);
     activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
+    let steerInjected = false;
+    if (canInjectSteer(queryCtx, lastMsgRole)) {
+      const steer = extractDeferredUserPrompt(context.messages);
+      if (steer) {
+        steerInjected = queryCtx.inputChannel.push(deferredUserPromptToBlocks(steer));
+        if (steerInjected) {
+          debug(`provider: steer written to live query: ${steer.text.slice(0, 60)}${steer.blocks ? " [+images]" : ""}`);
+          diagDump("steer_injected_live", {
+            textLength: steer.text.length,
+            hasImages: steer.blocks !== null,
+            waitingToolCalls: queryCtx.pendingToolCalls.size,
+            injectedThisQuery: queryCtx.inputChannel?.injectedCount ?? 0
+          });
+        }
+      }
+    }
     const allResults = extractAllToolResults2(context);
     debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
     const unmatchedResultIds = [];
@@ -54663,7 +54761,7 @@ function streamClaudeAgentSdk(model, context, options) {
       debug(`WARNING: ${queryCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
       piUI?.notify(`Claude bridge: ${queryCtx.pendingToolCalls.size} tool handler(s) still waiting \u2014 provider may be stuck`, "warning");
     }
-    if (lastMsgRole === "user") {
+    if (lastMsgRole === "user" && !steerInjected) {
       const userPrompt = extractDeferredUserPrompt(context.messages);
       if (userPrompt) {
         ctx().deferredUserMessages.push(userPrompt);
@@ -54677,7 +54775,8 @@ function streamClaudeAgentSdk(model, context, options) {
     return stream;
   }
   const lastMsg = context.messages[context.messages.length - 1];
-  if (lastMsg?.role === "toolResult") {
+  const isContinuation = isTurnContinuation(ctx(), lastMsg?.role);
+  if (lastMsg?.role === "toolResult" && !isContinuation) {
     debug(`provider: orphaned tool result after abort, emitting end_turn`);
     if (sharedSession) sharedSession.cursor = context.messages.length;
     const c = ctx();
@@ -54794,6 +54893,10 @@ function streamClaudeAgentSdk(model, context, options) {
   const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
   const promptBlocks = extractUserPromptBlocks(context.messages);
   let promptText = extractUserPrompt(context.messages) ?? "";
+  if (isContinuation && !promptText && !promptBlocks) {
+    debug("provider: continuation after compaction/retry, resuming from tool-result tail");
+    promptText = CONTINUATION_PROMPT;
+  }
   if (!promptText && !promptBlocks) {
     diagDump("empty_prompt", {
       contextLength: context.messages.length,
@@ -54806,7 +54909,9 @@ function streamClaudeAgentSdk(model, context, options) {
     });
     promptText = "[continue]";
   }
-  const prompt = promptBlocks ? wrapPromptStream(promptBlocks) : promptText;
+  const inputChannel = createQueryInputChannel(promptBlocks ?? [{ type: "text", text: promptText }]);
+  ctx().inputChannel = inputChannel;
+  const prompt = inputChannel.stream;
   const mcpServers = buildMcpServers(mcpTools, ctx());
   const bridgeConfig = loadConfig(cwd);
   const providerSettings = bridgeConfig.provider ?? {};
@@ -54828,7 +54933,8 @@ function streamClaudeAgentSdk(model, context, options) {
     cwd,
     customToolNameToSdk,
     queryModel.id,
-    accountSessionScope(account)
+    accountSessionScope(account),
+    isContinuation ? 0 : 1
   );
   const requestedEffort = options?.reasoning ? queryModel.thinkingLevelMap?.[options.reasoning] ?? REASONING_TO_EFFORT[options.reasoning] : void 0;
   const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);
@@ -55032,7 +55138,7 @@ function streamClaudeAgentSdk(model, context, options) {
     abortCtx.currentPiStream?.end();
     abortCtx.currentPiStream = null;
   };
-  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router).then(async ({ capturedSessionId, failure }) => {
+  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel).then(async ({ capturedSessionId, failure }) => {
     debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
     if (streamIdleTimedOut) {
       abortCtx.deferredUserMessages = [];
@@ -55349,6 +55455,7 @@ export {
   CONNECTOR_CALL_CUSTOM_TYPE,
   CONNECTOR_DISCOVERY_TOOLS,
   CONNECTOR_WRITE_TOOLS,
+  CONTINUATION_PROMPT,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   DISALLOWED_BUILTIN_TOOLS,
   INTEGRITY_CUSTOM_TYPE,

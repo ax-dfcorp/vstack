@@ -14,6 +14,8 @@ Forked from [`elidickinson/pi-claude-bridge`](https://github.com/elidickinson/pi
 - Claude Fable 5.1, Fable 5, Opus 5, Opus 4.8, older Opus/Sonnet releases, and Haiku in `/model`. `/model fable` selects Fable 5.1; `/model opus` selects Opus 4.8.
 - Pi tool calls run on Pi; Claude Code handles reasoning.
 - Tool-use turns block until Pi-delivered tool results reach Claude Code, including persistent subagent panes.
+- Steering lands inside the running turn: a message sent while Claude is working reaches it at the next tool boundary, not after the whole run finishes.
+- Auto-compaction and auto-retry resume the interrupted turn instead of ending it, so long tasks keep going after Pi compacts mid-work.
 - Session continuity across normal turns, image-bearing steering, `/compact`, tree navigation, abort recovery, and account-profile changes, including user image blocks replayed after a rebuild. A pre-output `Prompt is too long` rejection gets one automatic rebuild from canonical Pi history before it is surfaced.
 - Optional `pi-claude` companion integration for usage-aware subscription account rotation without copying the bridge engine.
 - Thinking-level forwarding with summarized Opus thinking display.

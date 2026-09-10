@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import type { McpResult } from "./extract-tool-results.js";
+import type { QueryInputChannel } from "./input-channel.js";
 import type { DeferredUserPrompt } from "./user-prompt.js";
 
 export interface PendingToolCall {
@@ -34,6 +35,44 @@ export function interruptedToolCallResult(cause: ToolCallDrainCause): McpResult 
 		content: [{ type: "text", text: `Claude bridge: ${DRAIN_CAUSE_TEXT[cause]} before this tool call's result was delivered. The call did not complete and produced no output.` }],
 		isError: true,
 	};
+}
+
+/**
+ * Whether a provider call carrying a tool-result tail, with no active query, is
+ * pi asking to CONTINUE an interrupted turn rather than handing back a result
+ * the user's abort orphaned.
+ *
+ * pi runs `for (await agent.prompt(); await handlePostAgentRun(); ) continue()`,
+ * and both overflow auto-compaction and auto-retry strip the failed assistant
+ * message before continuing — so the continuation re-enters the provider with a
+ * tool result at the tail, looking exactly like an abort orphan. Answering it
+ * with an empty end_turn stops the work dead.
+ *
+ * Only an abort makes the tail meaningless, so that is what this excludes:
+ * `abortRequested` covers the in-flight window before teardown, and the cause
+ * recorded at teardown covers everything after.
+ */
+export function isTurnContinuation(queryCtx: QueryContext, lastMsgRole: string | undefined): boolean {
+	if (lastMsgRole !== "toolResult") return false;
+	if (queryCtx.abortRequested) return false;
+	return queryCtx.lastQueryEndCause !== "abort";
+}
+
+/**
+ * Whether a steer pi handed over alongside this turn's tool results can go
+ * straight into the child's live input stream.
+ *
+ * The waiting-handler requirement is the safety property: a pending handler
+ * means the child is blocked on us, so another model turn is guaranteed to
+ * exist to consume the message. Without one there may be no further turn, and
+ * the steer belongs in the replay queue instead of in a run that is ending.
+ */
+export function canInjectSteer(queryCtx: QueryContext, lastMsgRole: string | undefined): boolean {
+	return lastMsgRole === "user"
+		&& queryCtx.inputChannel !== null
+		&& !queryCtx.inputChannel.closed
+		&& queryCtx.pendingToolCalls.size > 0
+		&& !queryCtx.abortRequested;
 }
 
 // Precedence matches the forceRotate expression at the query-teardown site: an
@@ -199,6 +238,21 @@ export class QueryContext {
 	 *  prompt arriving in that narrow window must wait and retry, not be mistaken
 	 *  for tool-result delivery to the dying query. */
 	abortRequested = false;
+	/** Why the last query on this context ended, recorded at teardown and read by
+	 *  the next provider call that arrives with a tool-result tail and no active
+	 *  query. Pi re-enters the provider that way for two very different reasons:
+	 *  it aborted the turn (the result is a genuine orphan — stay quiet), or it
+	 *  wants the turn CONTINUED after auto-compaction / auto-retry, both of which
+	 *  strip the failed assistant message and call agent.continue(). Deciding
+	 *  from a recorded cause rather than from "activeQuery is null" is what
+	 *  keeps a continuation from being answered with an empty end_turn.
+	 *  Codex (MidTurn inline compaction) and opencode (interrupted tool parts
+	 *  marked in history) both carry this distinction explicitly too. */
+	lastQueryEndCause: ToolCallDrainCause | null = null;
+	/** This query's open user-input stream, when it has one. Live steers are
+	 *  written here; consumeQuery closes it at `result`, which is also what ends
+	 *  the query. Null for continuation queries, which use a one-shot prompt. */
+	inputChannel: QueryInputChannel | null = null;
 	private querySettledPromise: Promise<void> = Promise.resolve();
 	private resolveQuerySettled: (() => void) | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
@@ -474,6 +528,7 @@ export class QueryContext {
 
 	beginQuerySettlement(): void {
 		this.abortRequested = false;
+		this.lastQueryEndCause = null;
 		this.querySettledPromise = new Promise<void>((resolve) => {
 			this.resolveQuerySettled = resolve;
 		});

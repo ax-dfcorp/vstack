@@ -13,16 +13,17 @@ import {
 } from "./convert.js";
 import {
 	deferredUserPromptText,
+	deferredUserPromptToBlocks,
 	deferredUserPromptToSdkInput,
 	extractDeferredUserPrompt,
 	extractUserPrompt,
 	extractUserPromptBlocks,
-	wrapPromptStream,
 } from "./user-prompt.js";
+import { createQueryInputChannel, type QueryInputChannel } from "./input-channel.js";
 import { buildModels, fallbackModelForPrimaryModel, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
+import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, registerExternalConfigResolver, type Config } from "./config.js";
 import { hasClaudeCredentials } from "./auth-presence.js";
@@ -141,6 +142,12 @@ const PRIMARY_INSTANCE_KEY = Symbol.for("claude-bridge:primaryInstance");
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 const COMMANDS_REGISTERED_KEY = Symbol.for("claude-bridge:commandsRegistered");
 const ROTATION_STATE_KEY = Symbol("claude-bridge:rotationState");
+
+/** Prompt that restarts sampling when pi re-enters the provider to continue an
+ *  interrupted turn (post-compaction / post-retry). The tool results it refers
+ *  to are the real ones, imported into the rebuilt session just above it. */
+export const CONTINUATION_PROMPT =
+	"Continue the task from where it was interrupted, using the tool results above. Do not restart work that is already complete.";
 
 interface RotationRequestState {
 	excludedProfileIds: Set<string>;
@@ -511,6 +518,11 @@ async function consumeQuery(
 	wasAborted: () => boolean,
 	account?: ClaudeAccountRoute,
 	router?: ClaudeAccountRouterV1,
+	/** The query's open input channel, when it has one. Closing it at `result`
+	 *  is what lets the SDK stream end: with input held open for live steering
+	 *  the CLI keeps stdin alive past the turn, so nothing else terminates the
+	 *  for-await below. Continuation queries pass nothing and end by themselves. */
+	inputChannel?: QueryInputChannel | null,
 ): Promise<ConsumeQueryResult> {
 	let capturedSessionId: string | undefined;
 	let failure: ClaudeAttemptFailure | undefined;
@@ -556,6 +568,11 @@ async function consumeQuery(
 				break;
 			}
 			case "result":
+				// The turn is over, so no further model turn can consume a steer:
+				// release the input stream. This must run before any early break
+				// below — an unclosed channel leaves the child's stdin open and the
+				// SDK stream never completes.
+				inputChannel?.close();
 				// The SDK can label the synthetic friendly rate-limit carrier as a
 				// successful result immediately before its iterator throws. Once a
 				// managed attempt has a terminal failure signal, that text is still
@@ -851,6 +868,40 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		queryCtx.currentPiStream = stream;
 		queryCtx.resetTurnState(model);
 		activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
+
+		// --- Live steering ---
+		// pi drains its steer queue at the turn boundary and hands the message over
+		// with this turn's tool results. Writing it to the child's open input
+		// stream HERE, before those results resolve below, is the whole point: once
+		// they resolve the child may already be sampling, and the message would
+		// land a turn late or not at all. Written first, the CLI coalesces it into
+		// the next model turn — the same boundary pi's native providers drain at
+		// and the same one codex uses (pending input read before each model
+		// request).
+		//
+		// Only inject while handlers are still waiting. That proves the child is
+		// blocked on us, so another model turn is guaranteed to exist to consume
+		// the message, and a steer can never be written into a run that is about to
+		// end. Everything else falls through to the after-query replay below — the
+		// same shape as codex rejecting a steer that lost the race to the turn
+		// boundary and re-queueing it.
+		let steerInjected = false;
+		if (canInjectSteer(queryCtx, lastMsgRole)) {
+			const steer = extractDeferredUserPrompt(context.messages);
+			if (steer) {
+				steerInjected = queryCtx.inputChannel.push(deferredUserPromptToBlocks(steer));
+				if (steerInjected) {
+					debug(`provider: steer written to live query: ${steer.text.slice(0, 60)}${steer.blocks ? " [+images]" : ""}`);
+					diagDump("steer_injected_live", {
+						textLength: steer.text.length,
+						hasImages: steer.blocks !== null,
+						waitingToolCalls: queryCtx.pendingToolCalls.size,
+						injectedThisQuery: queryCtx.inputChannel?.injectedCount ?? 0,
+					});
+				}
+			}
+		}
+
 		const allResults = extractAllToolResults(context);
 		debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
 		const unmatchedResultIds: string[] = [];
@@ -913,9 +964,10 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		//     queue at the turn boundary and appends it to context alongside the
 		//     tool result, then calls the provider again.
 		//   - A followUp is delivered between tool-result turns.
-		// The bridge can't forward these mid-query (the SDK query is in progress),
-		// so we save them for replay as continuation queries after consumeQuery ends.
-		if (lastMsgRole === "user") {
+		// Anything not already written into the live input channel above (no open
+		// channel, or no waiting handler to guarantee a next model turn) is saved
+		// for replay as a continuation query after consumeQuery ends.
+		if (lastMsgRole === "user" && !steerInjected) {
 			const userPrompt = extractDeferredUserPrompt(context.messages);
 			if (userPrompt) {
 				ctx().deferredUserMessages.push(userPrompt);
@@ -930,11 +982,24 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		return stream;
 	}
 
-	// --- Orphaned tool result (e.g. user aborted a tool call) ---
-	// The query is gone but pi still delivered the result. Nothing to do — just
-	// emit end_turn so pi waits for the next real user message.
+	// --- Tool-result tail with no active query ---
+	// Two very different situations land here:
+	//   * the user aborted and pi handed back the result that was already in
+	//     flight — a genuine orphan; stay quiet so pi waits for a real prompt.
+	//   * pi wants the turn CONTINUED. Overflow auto-compaction and auto-retry
+	//     both strip the failed assistant message and call agent.continue(),
+	//     which re-enters the provider with the tool result still at the tail.
+	//     Answering that with an empty end_turn is what silently killed work
+	//     after every mid-task compaction.
+	// Codex compacts inline inside its turn loop (CompactionPhase::MidTurn, then
+	// `continue`) and opencode re-derives "is there more to do" from history each
+	// iteration, marking abort-abandoned tool parts explicitly; neither can hit
+	// this because neither leaves the loop. pi does leave it, so the bridge has
+	// to tell the two apart — and "activeQuery is null" cannot. The cause
+	// recorded at teardown can.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult") {
+	const isContinuation = isTurnContinuation(ctx(), lastMsg?.role);
+	if (lastMsg?.role === "toolResult" && !isContinuation) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		const c = ctx();  // capture current context for the microtask
@@ -1061,6 +1126,14 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
+	// A continuation has no new user message to send: its tool-result tail stays
+	// in the imported history (dropTrailing=0 below) so every tool_use keeps its
+	// real result, and this instruction is what restarts sampling.
+	if (isContinuation && !promptText && !promptBlocks) {
+		debug("provider: continuation after compaction/retry, resuming from tool-result tail");
+		promptText = CONTINUATION_PROMPT;
+	}
+
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with the state stack fix — dump diagnostics if it does.
 	if (!promptText && !promptBlocks) {
@@ -1077,9 +1150,12 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		promptText = "[continue]";
 	}
 
-	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
-		? wrapPromptStream(promptBlocks)
-		: promptText;
+	// Held open for the whole query so a steer arriving mid-run can be written
+	// straight into it (see the tool-result delivery path). consumeQuery closes
+	// it at `result`, which is what ends the query.
+	const inputChannel = createQueryInputChannel(promptBlocks ?? [{ type: "text", text: promptText }]);
+	ctx().inputChannel = inputChannel;
+	const prompt: AsyncIterable<SDKUserMessage> = inputChannel.stream;
 	const mcpServers = buildMcpServers(mcpTools, ctx());
 	const bridgeConfig = loadConfig(cwd);
 	const providerSettings = bridgeConfig.provider ?? {};
@@ -1124,6 +1200,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		customToolNameToSdk,
 		queryModel.id,
 		accountSessionScope(account),
+		isContinuation ? 0 : 1,
 	);
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
@@ -1379,7 +1456,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	// profile. After output/tool use, replay is forbidden.
 	// The handlers below use the captured abortCtx, never the live ctx(): a
 	// parent query can finish while a reentrant child context is pushed.
-	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router)
+	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel)
 		.then(async ({ capturedSessionId, failure }) => {
 			debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
 			if (streamIdleTimedOut) {

@@ -21,6 +21,14 @@ export function teardownQuery(
 	isReentrant: boolean,
 ): boolean {
 	if (queryCtx.activeQuery !== sdkQuery) return false;
+	// Recorded before anything else can fail: the next provider call needs it to
+	// tell an aborted turn's orphaned tool result from pi asking to continue.
+	queryCtx.lastQueryEndCause = cause;
+	// Backstop for paths that never saw a `result` (throw, abort, child death).
+	// The normal close happens in consumeQuery, because an open input channel is
+	// what keeps the SDK stream — and therefore this teardown — from running.
+	queryCtx.inputChannel?.close();
+	queryCtx.inputChannel = null;
 	reportToolResultMismatch(queryCtx, "query teardown", cwd, { forceRotate: cause !== "query-end" });
 	// Drain pending handlers for this query as errors naming the cause —
 	// their results are never coming.

@@ -67,6 +67,14 @@ export function deferredUserPromptText(prompt: DeferredUserPrompt): string {
 	return typeof prompt === "string" ? prompt : prompt.text;
 }
 
+/** Content blocks for writing a steer straight into a live query's input
+ *  channel. Images are preserved when the prompt carried any. */
+export function deferredUserPromptToBlocks(prompt: DeferredUserPrompt): ContentBlockParam[] {
+	if (typeof prompt === "string") return [{ type: "text", text: prompt }];
+	if (prompt.blocks) return prompt.blocks;
+	return [{ type: "text", text: prompt.text }];
+}
+
 export function deferredUserPromptToSdkInput(
 	prompt: DeferredUserPrompt,
 ): string | AsyncGenerator<SDKUserMessage> {
