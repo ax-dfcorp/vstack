@@ -208,3 +208,38 @@ describe("stream-idle timeout", () => {
 		assert.deepEqual(timeouts, [{ idleMs: 1_000, timeoutMs: 1_000 }]);
 	});
 });
+
+describe("formatAutoResumeRateLimitMessage", () => {
+	it("reads as a rate limit to Pi's auto-retry and names both accounts", async () => {
+		const { formatAutoResumeRateLimitMessage } = await import("../src/rate-limit.ts");
+		const { isRetryableAssistantError } = await import("@earendil-works/pi-ai");
+		for (const detail of [
+			"Claude Code returned an error result: You've hit your session limit · resets 1:50pm (Asia/Seoul)",
+			"You've hit your weekly limit · resets Sep 15, 2:00pm",
+			"five_hour rate limit",
+		]) {
+			const message = formatAutoResumeRateLimitMessage({
+				accountLabel: "ax",
+				nextAccountLabel: "dgk",
+				rateLimitType: "five_hour",
+				resetAt: Date.now() + 60_000,
+				detail,
+			});
+			assert.match(message, /^Claude rate limit on ax \(five_hour\) — resets .+ — Pi auto-retry resumes this turn on dgk\./);
+			assert.ok(message.includes(detail), `detail is quoted: ${message}`);
+			assert.ok(isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: message }), message);
+		}
+	});
+
+	it("drops a detail Pi would treat as a terminal quota or billing failure", async () => {
+		const { formatAutoResumeRateLimitMessage } = await import("../src/rate-limit.ts");
+		const { isRetryableAssistantError } = await import("@earendil-works/pi-ai");
+		const message = formatAutoResumeRateLimitMessage({
+			accountLabel: "ax",
+			nextAccountLabel: "dgk",
+			detail: "quota exceeded for this billing period",
+		});
+		assert.equal(message, "Claude rate limit on ax — Pi auto-retry resumes this turn on dgk.");
+		assert.ok(isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: message }));
+	});
+});

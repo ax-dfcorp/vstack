@@ -8,6 +8,7 @@ import {
 } from "../src/index.ts";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL } from "../src/account-router.ts";
 import { resetStack } from "../src/query-state.ts";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 
 const model = {
 	id: "claude-haiku-4-5",
@@ -46,7 +47,7 @@ function fakeSdkQuery(messages, accountLabel, observed) {
 }
 
 function makeRouter(observed, options = {}) {
-	const accounts = [
+	const accounts = options.accounts ?? [
 		{ profileId: "a", label: "account-a", configDir: "/profiles/a" },
 		{ profileId: "b", label: "account-b", configDir: "/profiles/b" },
 	];
@@ -254,9 +255,95 @@ describe("managed account stream rotation", () => {
 
 		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "pi-session" }));
 		assert.equal(calls, 1);
-		assert.equal(observed.acquires.length, 1);
+		// The only second acquire is the auto-resume reservation for Pi's retry;
+		// the bridge itself never starts another Claude Code attempt here.
+		assert.equal(observed.acquires.length, 2);
+		assert.equal(observed.acquires[1].reason, "auto-resume");
 		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "already-visible"));
 		assert.equal(events.filter((event) => event.type === "error").length, 1);
+	});
+
+	it("surfaces a post-output rate limit in Pi's retryable form after reserving the next account", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		let calls = 0;
+		__testSetSdkQueryFactory(((input) => {
+			calls += 1;
+			return fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: "session-a" },
+				{
+					type: "stream_event",
+					event: { type: "message_start", message: { model: model.id, usage: { input_tokens: 1 } } },
+				},
+				{
+					type: "stream_event",
+					event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				},
+				{
+					type: "stream_event",
+					event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "already-visible" } },
+				},
+				// The SDK iterator's own wrapper for a terminal usage-limit result. Its
+				// copy carries none of Pi's retryable words, so surfaced verbatim it
+				// used to stop the run until the user typed `continue`.
+				new Error("Claude Code returned an error result: You've hit your session limit · resets 1:50pm (Asia/Seoul)"),
+			], "a", observed);
+		}));
+
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "pi-session" }));
+		assert.equal(calls, 1, "no bridge-side replay after committed output");
+		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "already-visible"));
+		const errors = events.filter((event) => event.type === "error");
+		assert.equal(errors.length, 1);
+		const errorMessage = errors[0].error.errorMessage;
+		assert.match(errorMessage, /rate limit/i);
+		assert.match(errorMessage, /account-b/);
+		assert.match(errorMessage, /session limit/, "original SDK copy is kept for diagnosis");
+		assert.ok(
+			isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage }),
+			`Pi must classify the surfaced error as retryable: ${errorMessage}`,
+		);
+		assert.equal(observed.acquires.length, 2);
+		assert.deepEqual(observed.acquires[1].excludedProfileIds, ["a"]);
+		assert.equal(observed.acquires[1].reason, "auto-resume");
+		assert.equal(observed.acquires[1].forceRerank, true);
+		assert.deepEqual(observed.failures, [{ profileId: "a", kind: "rate-limit" }]);
+	});
+
+	it("keeps a post-output rate limit terminal when no other account can take the turn", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed, {
+			accounts: [{ profileId: "a", label: "account-a", configDir: "/profiles/a" }],
+		});
+		const original = "Claude Code returned an error result: You've hit your session limit · resets 1:50pm (Asia/Seoul)";
+		__testSetSdkQueryFactory((() => fakeSdkQuery([
+			{ type: "system", subtype: "init", session_id: "session-a" },
+			{
+				type: "stream_event",
+				event: { type: "message_start", message: { model: model.id, usage: { input_tokens: 1 } } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "already-visible" } },
+			},
+			new Error(original),
+		], "a", observed)));
+
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "pi-session" }));
+		const errors = events.filter((event) => event.type === "error");
+		assert.equal(errors.length, 1);
+		assert.equal(errors[0].error.errorMessage, original);
+		assert.equal(
+			isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: original }),
+			false,
+			"Pi must not retry into the same exhausted pool",
+		);
+		assert.equal(observed.acquires.length, 2, "the reservation attempt is made and fails");
+		assert.deepEqual(observed.acquires[1].excludedProfileIds, ["a"]);
 	});
 
 	it("records a post-output transport failure without replaying the request", async () => {

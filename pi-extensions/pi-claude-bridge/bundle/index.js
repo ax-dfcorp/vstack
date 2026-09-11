@@ -53514,6 +53514,19 @@ function formatResetTimestamp(value) {
     year: "numeric"
   });
 }
+var PI_NON_RETRYABLE_DETAIL_PATTERN = /billing|quota|budget|balance|insufficient/i;
+function formatAutoResumeRateLimitMessage(input) {
+  const type = input.rateLimitType?.trim();
+  const resetMs = resetTimestampMs(input.resetAt);
+  const parts = [
+    `Claude rate limit on ${input.accountLabel}${type ? ` (${type})` : ""}`,
+    resetMs !== void 0 ? `resets ${formatResetTimestamp(resetMs)}` : void 0,
+    `Pi auto-retry resumes this turn on ${input.nextAccountLabel}`
+  ].filter((part) => Boolean(part));
+  const detail = input.detail?.trim();
+  const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail) ? detail.replace(/\s+/g, " ").slice(0, 200) : void 0;
+  return `${parts.join(" \u2014 ")}.${quotable ? ` (${quotable})` : ""}`;
+}
 var ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
 function normalizeRateLimitUtilization(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
@@ -54206,6 +54219,22 @@ var ACTIVE_STREAM_SIMPLE_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:activeS
 var COMMANDS_REGISTERED_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:commandsRegistered");
 var ROTATION_STATE_KEY = /* @__PURE__ */ Symbol("claude-bridge:rotationState");
 var CONTINUATION_PROMPT = "Continue the task from where it was interrupted, using the tool results above. Do not restart work that is already complete.";
+function reserveAutoResumeAccount(router, account, modelId, sessionId) {
+  try {
+    const next = router.acquire({
+      modelId,
+      sessionId,
+      excludedProfileIds: [account.profileId],
+      forceRerank: true,
+      reason: "auto-resume"
+    });
+    if (next.profileId === account.profileId) return void 0;
+    return next;
+  } catch (error51) {
+    debug(`provider: no account available for auto-resume after ${account.label}:`, error51 instanceof Error ? error51.message : String(error51));
+    return void 0;
+  }
+}
 var MODELS = buildModels(getModels("anthropic"));
 var sdkQueryFactory = MZt;
 function __testSetSdkQueryFactory(factory) {
@@ -55114,10 +55143,11 @@ function streamClaudeAgentSdk(model, context, options) {
   };
   const surfaceFailure = (failure, aborted2 = false) => {
     attemptBuffer?.commit();
-    if (failure.rateLimitInfo) {
-      const info = failure.rateLimitInfo;
-      const resetAt = rateLimitResetFromInfo(info);
-      const resetAtMs = rateLimitResetMs(info);
+    let surfacedMessage = failure.message;
+    const info = failure.rateLimitInfo;
+    const resetAt = info ? rateLimitResetFromInfo(info) : void 0;
+    const resetAtMs = info ? rateLimitResetMs(info) : void 0;
+    if (info) {
       emitRateLimitEvent({
         model: queryModel.id,
         provider: queryModel.provider,
@@ -55130,9 +55160,28 @@ function streamClaudeAgentSdk(model, context, options) {
       });
       piUI?.notify(`${RATE_LIMIT_TOKEN} Claude ${failure.message} \u2014 resets ${formatResetTimestamp(resetAtMs ?? resetAt)}`, "warning");
     }
+    const resumable = failure.kind === "rate-limit" && !aborted2 && !wasAborted && !options?.signal?.aborted && Boolean(account && router) && abortCtx.committedOutput;
+    if (resumable && account && router) {
+      const next = reserveAutoResumeAccount(router, account, queryModel.id, options?.sessionId);
+      if (next) {
+        const limitType = info ? rateLimitTypeFromInfo(info) : void 0;
+        surfacedMessage = formatAutoResumeRateLimitMessage({
+          accountLabel: account.label,
+          nextAccountLabel: next.label,
+          rateLimitType: typeof limitType === "string" ? limitType : void 0,
+          resetAt: resetAtMs ?? resetAt,
+          detail: failure.message
+        });
+        debug(`provider: post-output rate limit on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
+        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn; Pi auto-retry resumes on ${next.label}.`, "info");
+      } else {
+        debug(`provider: post-output rate limit on ${account.label} with no other account; surfaced as terminal`);
+        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
+      }
+    }
     if (abortCtx.turnOutput) {
       abortCtx.turnOutput.stopReason = aborted2 ? "aborted" : "error";
-      abortCtx.turnOutput.errorMessage = failure.message;
+      abortCtx.turnOutput.errorMessage = surfacedMessage;
     }
     abortCtx.currentPiStream?.push({ type: "error", reason: aborted2 ? "aborted" : "error", error: abortCtx.turnOutput });
     abortCtx.currentPiStream?.end();

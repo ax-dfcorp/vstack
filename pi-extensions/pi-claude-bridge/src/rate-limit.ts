@@ -64,6 +64,42 @@ export function formatResetTimestamp(value: unknown): string {
 	});
 }
 
+/** Words Pi's agent loop treats as a terminal quota/billing failure. A detail
+ *  string carrying one of them would cancel the retry the message exists to
+ *  trigger, so it is dropped rather than quoted. */
+const PI_NON_RETRYABLE_DETAIL_PATTERN = /billing|quota|budget|balance|insufficient/i;
+
+/** Pi's agent loop auto-retries an assistant error whose message matches its
+ *  own retryable pattern ("rate limit", "overloaded", 5xx…) by stripping the
+ *  failed assistant message and calling `agent.continue()`; anything else stops
+ *  the run until the user types a prompt. A managed-account rejection that
+ *  arrives after visible output (a later model turn inside one child query,
+ *  typically) can never be replayed by the bridge, but it CAN be continued on
+ *  another subscription account exactly the way a manual `continue` does. This
+ *  message is surfaced only after that next account has been reserved, so Pi's
+ *  retry lands on it. The SDK's own copy ("You've hit your session limit …")
+ *  contains none of Pi's retryable words, which is why the run used to stop. */
+export function formatAutoResumeRateLimitMessage(input: {
+	accountLabel: string;
+	nextAccountLabel: string;
+	rateLimitType?: string;
+	resetAt?: unknown;
+	detail?: string;
+}): string {
+	const type = input.rateLimitType?.trim();
+	const resetMs = resetTimestampMs(input.resetAt);
+	const parts = [
+		`Claude rate limit on ${input.accountLabel}${type ? ` (${type})` : ""}`,
+		resetMs !== undefined ? `resets ${formatResetTimestamp(resetMs)}` : undefined,
+		`Pi auto-retry resumes this turn on ${input.nextAccountLabel}`,
+	].filter((part): part is string => Boolean(part));
+	const detail = input.detail?.trim();
+	const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail)
+		? detail.replace(/\s+/g, " ").slice(0, 200)
+		: undefined;
+	return `${parts.join(" — ")}.${quotable ? ` (${quotable})` : ""}`;
+}
+
 export const ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
 
 export function normalizeRateLimitUtilization(value: unknown): number | undefined {

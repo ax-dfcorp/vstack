@@ -62,7 +62,7 @@ import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, conn
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
-import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, formatAllowedRateLimitWarning, formatResetTimestamp, isUsageLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
+import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
 import { ensureTurnStarted, finalizeCurrentStream, finalizeToolUseTurnFromMcpInvocation, noteChildExecutedToolResults, processAssistantMessage, processStreamEvent, scheduleToolUseTurnEnd, updateTurnOutputModel } from "./assistant-stream.js";
 import {
@@ -153,6 +153,33 @@ interface RotationRequestState {
 	excludedProfileIds: Set<string>;
 	attempts: number;
 	contextRebuildAttempted: boolean;
+}
+
+/** Bind the session to the next available managed account before a
+ *  post-output rate limit is surfaced, so the Pi auto-retry that the surfaced
+ *  message triggers re-enters the provider already pointed at that account.
+ *  Returns undefined when no other account can take the turn, in which case the
+ *  failure must stay terminal so Pi does not retry into the same wall. */
+function reserveAutoResumeAccount(
+	router: ClaudeAccountRouterV1,
+	account: ClaudeAccountRoute,
+	modelId: string,
+	sessionId: string | undefined,
+): ClaudeAccountRoute | undefined {
+	try {
+		const next = router.acquire({
+			modelId,
+			sessionId,
+			excludedProfileIds: [account.profileId],
+			forceRerank: true,
+			reason: "auto-resume",
+		});
+		if (next.profileId === account.profileId) return undefined;
+		return next;
+	} catch (error) {
+		debug(`provider: no account available for auto-resume after ${account.label}:`, error instanceof Error ? error.message : String(error));
+		return undefined;
+	}
 }
 
 type BridgeStreamOptions = SimpleStreamOptions & {
@@ -1430,10 +1457,11 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 
 	const surfaceFailure = (failure: ClaudeAttemptFailure, aborted = false): void => {
 		attemptBuffer?.commit();
-		if (failure.rateLimitInfo) {
-			const info = failure.rateLimitInfo;
-			const resetAt = rateLimitResetFromInfo(info);
-			const resetAtMs = rateLimitResetMs(info);
+		let surfacedMessage = failure.message;
+		const info = failure.rateLimitInfo;
+		const resetAt = info ? rateLimitResetFromInfo(info) : undefined;
+		const resetAtMs = info ? rateLimitResetMs(info) : undefined;
+		if (info) {
 			emitRateLimitEvent({
 				model: queryModel.id, provider: queryModel.provider, rateLimitType: rateLimitTypeFromInfo(info),
 				reason: failure.message, resetAt,
@@ -1442,9 +1470,34 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			});
 			piUI?.notify(`${RATE_LIMIT_TOKEN} Claude ${failure.message} — resets ${formatResetTimestamp(resetAtMs ?? resetAt)}`, "warning");
 		}
+		// A managed-account limit hit after the replay boundary cannot be replayed
+		// here, but Pi's own auto-retry can continue the turn (strip the failed
+		// assistant message, agent.continue()) if the error reads as a rate limit.
+		// Reserve the next account first so that retry lands on it; with no other
+		// account the message stays terminal and Pi waits for the user.
+		const resumable = failure.kind === "rate-limit" && !aborted && !wasAborted && !options?.signal?.aborted
+			&& Boolean(account && router) && abortCtx.committedOutput;
+		if (resumable && account && router) {
+			const next = reserveAutoResumeAccount(router, account, queryModel.id, options?.sessionId);
+			if (next) {
+				const limitType = info ? rateLimitTypeFromInfo(info) : undefined;
+				surfacedMessage = formatAutoResumeRateLimitMessage({
+					accountLabel: account.label,
+					nextAccountLabel: next.label,
+					rateLimitType: typeof limitType === "string" ? limitType : undefined,
+					resetAt: resetAtMs ?? resetAt,
+					detail: failure.message,
+				});
+				debug(`provider: post-output rate limit on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
+				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn; Pi auto-retry resumes on ${next.label}.`, "info");
+			} else {
+				debug(`provider: post-output rate limit on ${account.label} with no other account; surfaced as terminal`);
+				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
+			}
+		}
 		if (abortCtx.turnOutput) {
 			abortCtx.turnOutput.stopReason = aborted ? "aborted" : "error";
-			abortCtx.turnOutput.errorMessage = failure.message;
+			abortCtx.turnOutput.errorMessage = surfacedMessage;
 		}
 		abortCtx.currentPiStream?.push({ type: "error", reason: aborted ? "aborted" : "error", error: abortCtx.turnOutput! });
 		abortCtx.currentPiStream?.end();
