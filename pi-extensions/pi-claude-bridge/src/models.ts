@@ -4,22 +4,18 @@
 
 export const FABLE_MODEL_ID = "claude-fable-5-1";
 export const FABLE_5_MODEL_ID = "claude-fable-5";
-// Opus 4.8 remains the preferred implementation model and Fable's availability fallback.
-// Opus 5 is independently selectable; it does not replace the stable fallback pairing.
-export const FABLE_FALLBACK_MODEL_ID = "claude-opus-4-8";
+// Opus 4.8 remains the preferred implementation model. It is NOT a Fable
+// fallback: a Fable request never changes model, on any path (no SDK
+// `fallbackModel`, no router substitution). Fable is the reason for the
+// subscription; when its allowance is spent the session waits for the reset.
+export const OPUS_4_8_MODEL_ID = "claude-opus-4-8";
 export const OPUS_5_MODEL_ID = "claude-opus-5";
 export const SONNET_5_MODEL_ID = "claude-sonnet-5";
-
-export function fallbackModelForPrimaryModel(modelId: string): string | undefined {
-	return modelId === FABLE_MODEL_ID || modelId === FABLE_5_MODEL_ID
-		? FABLE_FALLBACK_MODEL_ID
-		: undefined;
-}
 
 export const MODEL_IDS_IN_ORDER = [
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
-	FABLE_FALLBACK_MODEL_ID,
+	OPUS_4_8_MODEL_ID,
 	OPUS_5_MODEL_ID,
 	"claude-opus-4-7",
 	"claude-opus-4-6",
@@ -50,7 +46,7 @@ const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
 const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
-	FABLE_FALLBACK_MODEL_ID,
+	OPUS_4_8_MODEL_ID,
 	OPUS_5_MODEL_ID,
 ]);
 
@@ -73,8 +69,8 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		contextWindow: 1000000,
 		maxTokens: 128000,
 	},
-	[FABLE_FALLBACK_MODEL_ID]: {
-		id: FABLE_FALLBACK_MODEL_ID,
+	[OPUS_4_8_MODEL_ID]: {
+		id: OPUS_4_8_MODEL_ID,
 		name: "Claude Opus 4.8",
 		reasoning: true,
 		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
@@ -102,9 +98,8 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 	},
 };
 
-// Human label for the safety-fallback notice. Every id that participates in a
-// fallbackModelForPrimaryModel pairing has an entry above; the raw id is the
-// last-resort label so an unmapped pairing still reads sensibly.
+// Human label for model-change notices (Claude Code's own model_refusal_fallback
+// event); the raw id is the last-resort label so an unmapped id still reads.
 export function modelDisplayName(modelId: string): string {
 	return FALLBACK_MODELS[modelId]?.name ?? modelId;
 }

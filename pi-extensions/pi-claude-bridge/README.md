@@ -176,7 +176,7 @@ Bridge settings come only from the authoritative `<PI_CODING_AGENT_DIR>/claude-b
 
 ### Fable caveat
 
-The bridge registers `pi-claude/claude-fable-5-1`, `pi-claude/claude-fable-5`, and the other curated Claude models even when Pi's Anthropic registry has not shipped those entries yet. Fable models run classifiers that can reroute a turn, so the bridge preserves Claude Code's fallback events and labels the model that actually answered. Fable 5.1 requires Claude Code or Claude Agent SDK 2.1.255/0.3.255 or newer; set `ANTHROPIC_DEFAULT_FABLE_MODEL` when routing provider-specific model IDs through Bedrock, Vertex, or Foundry.
+The bridge registers `pi-claude/claude-fable-5-1`, `pi-claude/claude-fable-5`, and the other curated Claude models even when Pi's Anthropic registry has not shipped those entries yet. The bridge never passes Claude Code a `fallbackModel` and an account route never substitutes a model: a Fable turn runs on Fable or fails with the reset time, so Fable's allowance is never silently traded for Opus. If Claude Code reroutes a turn on its own, the bridge labels the model that actually answered and warns. Fable 5.1 requires Claude Code or Claude Agent SDK 2.1.255/0.3.255 or newer; set `ANTHROPIC_DEFAULT_FABLE_MODEL` when routing provider-specific model IDs through Bedrock, Vertex, or Foundry.
 
 ## Connector inventory
 

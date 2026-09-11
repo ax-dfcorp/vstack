@@ -36415,16 +36415,13 @@ function createQueryInputChannel(initial) {
 // src/models.ts
 var FABLE_MODEL_ID = "claude-fable-5-1";
 var FABLE_5_MODEL_ID = "claude-fable-5";
-var FABLE_FALLBACK_MODEL_ID = "claude-opus-4-8";
+var OPUS_4_8_MODEL_ID = "claude-opus-4-8";
 var OPUS_5_MODEL_ID = "claude-opus-5";
 var SONNET_5_MODEL_ID = "claude-sonnet-5";
-function fallbackModelForPrimaryModel(modelId) {
-  return modelId === FABLE_MODEL_ID || modelId === FABLE_5_MODEL_ID ? FABLE_FALLBACK_MODEL_ID : void 0;
-}
 var MODEL_IDS_IN_ORDER = [
   FABLE_MODEL_ID,
   FABLE_5_MODEL_ID,
-  FABLE_FALLBACK_MODEL_ID,
+  OPUS_4_8_MODEL_ID,
   OPUS_5_MODEL_ID,
   "claude-opus-4-7",
   "claude-opus-4-6",
@@ -36444,7 +36441,7 @@ var CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
 var CLAUDE_FIVE_LEVEL_MODEL_IDS = /* @__PURE__ */ new Set([
   FABLE_MODEL_ID,
   FABLE_5_MODEL_ID,
-  FABLE_FALLBACK_MODEL_ID,
+  OPUS_4_8_MODEL_ID,
   OPUS_5_MODEL_ID
 ]);
 var FALLBACK_MODELS = {
@@ -36466,8 +36463,8 @@ var FALLBACK_MODELS = {
     contextWindow: 1e6,
     maxTokens: 128e3
   },
-  [FABLE_FALLBACK_MODEL_ID]: {
-    id: FABLE_FALLBACK_MODEL_ID,
+  [OPUS_4_8_MODEL_ID]: {
+    id: OPUS_4_8_MODEL_ID,
     name: "Claude Opus 4.8",
     reasoning: true,
     thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
@@ -54574,10 +54571,10 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
           const fallbackModel = message.fallback_model;
           updateTurnOutputModel(fallbackModel);
           debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel }));
-          if (typeof fallbackModel === "string" && typeof originalModel === "string" && fallbackModelForPrimaryModel(originalModel) === fallbackModel) {
+          if (typeof fallbackModel === "string" && typeof originalModel === "string") {
             safeNotify(
-              `Pi Claude switched ${modelDisplayName(originalModel)} to ${modelDisplayName(fallbackModel)} after Claude Code safety fallback.`,
-              "info"
+              `Pi Claude: Claude Code answered with ${modelDisplayName(fallbackModel)} instead of ${modelDisplayName(originalModel)}.`,
+              "warning"
             );
           }
         }
@@ -54933,14 +54930,7 @@ function streamClaudeAgentSdk(model, context, options) {
       return stream;
     }
   }
-  const queryModel = account?.modelId && account.modelId !== model.id ? { ...model, id: account.modelId, name: modelDisplayName(account.modelId) } : model;
-  if (queryModel.id !== model.id) {
-    updateTurnOutputModel(queryModel.id);
-    safeNotify(
-      account?.fallbackReason === "fable-quota" ? `Every ready account rejected Claude Fable; using ${modelDisplayName(queryModel.id)}.` : `Pi Claude switched to ${modelDisplayName(queryModel.id)}.`,
-      "info"
-    );
-  }
+  const queryModel = model;
   const attemptBuffer = account ? new RetryEventBuffer(stream, () => ctx().markOutputCommitted()) : void 0;
   if (attemptBuffer) ctx().currentPiStream = attemptBuffer;
   const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
@@ -54993,7 +54983,6 @@ function streamClaudeAgentSdk(model, context, options) {
   const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);
   const extraArgs = {};
   if (effort) extraArgs["thinking-display"] = "summarized";
-  const fallbackModel = account && fallbackModelForPrimaryModel(model.id) && queryModel.id === model.id ? void 0 : fallbackModelForPrimaryModel(queryModel.id);
   const childEnv = {
     ...account ? subscriberProfileEnv(account) : process.env,
     ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
@@ -55006,7 +54995,6 @@ function streamClaudeAgentSdk(model, context, options) {
     ...connectorQueryOptions(enableCloudMcp, connectorWriteMode),
     permissionMode: "bypassPermissions",
     includePartialMessages: true,
-    ...fallbackModel ? { fallbackModel } : {},
     ...providerSettings.fastMode ? { settings: { fastMode: true } } : {},
     systemPrompt: {
       type: "preset",
@@ -55027,7 +55015,6 @@ function streamClaudeAgentSdk(model, context, options) {
     "provider: fresh query",
     `model=${queryModel.id} requested=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
     `resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"} account=${account?.label ?? "legacy"}`,
-    `fallback=${fallbackModel ?? "none"}`,
     `appendSys=${appendSystemPrompt} promptCtx=${promptContextAppend.labels.join(",") || "none"} strictMcp=${strictMcpConfigEnabled} fastMode=${providerSettings.fastMode === true} connectors=${enableCloudMcp}`,
     `claudeExec=${claudeExecutablePreflight ? `${claudeExecutablePreflight.fileType}:${claudeExecutablePreflight.path}` : "sdk-default"}`,
     `prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`

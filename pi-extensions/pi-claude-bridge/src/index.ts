@@ -20,7 +20,7 @@ import {
 	extractUserPromptBlocks,
 } from "./user-prompt.js";
 import { createQueryInputChannel, type QueryInputChannel } from "./input-channel.js";
-import { buildModels, fallbackModelForPrimaryModel, modelDisplayName } from "./models.js";
+import { buildModels, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
@@ -675,10 +675,12 @@ async function consumeQuery(
 					const fallbackModel = (message as any).fallback_model;
 					updateTurnOutputModel(fallbackModel);
 					debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel }));
-					if (typeof fallbackModel === "string" && typeof originalModel === "string" && fallbackModelForPrimaryModel(originalModel) === fallbackModel) {
+					// The bridge never passes `fallbackModel`, so this only fires if Claude
+					// Code reroutes on its own; surface it rather than hide a model change.
+					if (typeof fallbackModel === "string" && typeof originalModel === "string") {
 						safeNotify(
-							`Pi Claude switched ${modelDisplayName(originalModel)} to ${modelDisplayName(fallbackModel)} after Claude Code safety fallback.`,
-							"info",
+							`Pi Claude: Claude Code answered with ${modelDisplayName(fallbackModel)} instead of ${modelDisplayName(originalModel)}.`,
+							"warning",
 						);
 					}
 				}
@@ -1143,18 +1145,9 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			return stream;
 		}
 	}
-	const queryModel = account?.modelId && account.modelId !== model.id
-		? { ...model, id: account.modelId, name: modelDisplayName(account.modelId) }
-		: model;
-	if (queryModel.id !== model.id) {
-		updateTurnOutputModel(queryModel.id);
-		safeNotify(
-			account?.fallbackReason === "fable-quota"
-				? `Every ready account rejected Claude Fable; using ${modelDisplayName(queryModel.id)}.`
-				: `Pi Claude switched to ${modelDisplayName(queryModel.id)}.`,
-			"info",
-		);
-	}
+	// The selected model is always the requested model: an account route never
+	// substitutes one (see models.ts), so a Fable turn is Fable or an error.
+	const queryModel = model;
 	const attemptBuffer = account
 		? new RetryEventBuffer(stream, () => ctx().markOutputCommitted())
 		: undefined;
@@ -1258,13 +1251,6 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	// (verified in sdk.mjs flag mapping), so the typed form cannot set display
 	// without overriding the model's thinking mode alongside our `--effort`.
 	if (effort) extraArgs["thinking-display"] = "summarized";
-	// With a managed Fable pool, let every account's model-scoped allowance run
-	// out before changing models. Once the router explicitly selects Opus, its
-	// normal Opus→4.8 safety fallback remains enabled.
-	const fallbackModel = account && fallbackModelForPrimaryModel(model.id) && queryModel.id === model.id
-		? undefined
-		: fallbackModelForPrimaryModel(queryModel.id);
-
 	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
 	// when the user is logged into Anthropic). These are a separate code path from
 	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
@@ -1289,7 +1275,6 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		...connectorQueryOptions(enableCloudMcp, connectorWriteMode),
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		...(fallbackModel ? { fallbackModel } : {}),
 		...(providerSettings.fastMode ? { settings: { fastMode: true } } : {}),
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
@@ -1311,7 +1296,6 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	debug("provider: fresh query",
 		`model=${queryModel.id} requested=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"} account=${account?.label ?? "legacy"}`,
-		`fallback=${fallbackModel ?? "none"}`,
 		`appendSys=${appendSystemPrompt} promptCtx=${promptContextAppend.labels.join(",") || "none"} strictMcp=${strictMcpConfigEnabled} fastMode=${providerSettings.fastMode === true} connectors=${enableCloudMcp}`,
 		`claudeExec=${claudeExecutablePreflight ? `${claudeExecutablePreflight.fileType}:${claudeExecutablePreflight.path}` : "sdk-default"}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);

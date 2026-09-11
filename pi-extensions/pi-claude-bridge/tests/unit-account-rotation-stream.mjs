@@ -440,38 +440,7 @@ describe("managed account stream rotation", () => {
 		assert.equal(events.filter((event) => event.type === "error").length, 1);
 	});
 
-	it("uses Opus 4.8 only after the account router reports every Fable allowance spent", async () => {
-		const observed = observedState();
-		const fableModel = { ...model, id: "claude-fable-5", name: "Claude Fable 5" };
-		const router = makeRouter(observed);
-		router.acquire = (input) => {
-			observed.acquires.push(input);
-			return {
-				profileId: "b",
-				label: "account-b",
-				configDir: "/profiles/b",
-				modelId: "claude-opus-4-8",
-				fallbackReason: "fable-quota",
-			};
-		};
-		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = router;
-		let queryOptions;
-		__testSetSdkQueryFactory((input) => {
-			queryOptions = input.options;
-			return fakeSdkQuery([
-				{ type: "system", subtype: "init", session_id: "opus-session" },
-				{ type: "result", subtype: "success", result: "opus-after-fable" },
-			], "b", observed);
-		});
-
-		const events = await collect(streamClaudeAgentSdk(fableModel, context, { sessionId: "fable-spent" }));
-		assert.equal(queryOptions.model, "claude-opus-4-8");
-		assert.equal(queryOptions.fallbackModel, undefined);
-		assert.equal(queryOptions.env.CLAUDE_CONFIG_DIR, "/profiles/b");
-		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "opus-after-fable"));
-	});
-
-	it("does not let SDK model fallback skip another managed Fable account", async () => {
+	it("never hands the SDK a fallback model for a Fable request", async () => {
 		const observed = observedState();
 		const fableModel = { ...model, id: "claude-fable-5", name: "Claude Fable 5" };
 		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);

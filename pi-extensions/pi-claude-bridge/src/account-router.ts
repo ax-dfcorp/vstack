@@ -8,8 +8,6 @@ export interface ClaudeAccountRoute {
 	label: string;
 	configDir?: string;
 	/** Effective model selected by the companion after model-scoped quota exhaustion. */
-	modelId?: string;
-	fallbackReason?: "fable-quota";
 }
 
 export type ClaudeAccountFailureKind = "auth" | "billing" | "rate-limit" | "overloaded" | "server" | "network";
