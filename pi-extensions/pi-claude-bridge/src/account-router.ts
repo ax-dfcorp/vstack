@@ -182,7 +182,9 @@ export function classifyClaudeFailure(value: unknown): ClaudeAccountFailureKind 
 	// a billing-policy decision or globally disable the profile.
 	if (/extra usage|overage/.test(normalized)) return "rate-limit";
 	if (/billing error|payment|required.*billing|credit balance.*(?:low|insufficient|empty)|insufficient credits/.test(normalized)) return "billing";
-	if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve hit your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
+	// "You've reached your Fable limit" is the CLI's model-scoped weekly copy
+	// (2026-09-11); it names neither "session" nor "weekly".
+	if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve (?:hit|reached) your .* limit|reached your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
 	if (/overloaded|capacity/.test(normalized)) return "overloaded";
 	if (/server error|internal server|\b5\d\d\b/.test(normalized)) return "server";
 	if (/network|timeout|timed out|socket|econn|connection closed|fetch failed|unexpected end|\beof\b/.test(normalized)) return "network";

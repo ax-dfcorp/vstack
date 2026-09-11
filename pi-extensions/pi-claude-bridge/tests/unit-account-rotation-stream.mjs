@@ -166,6 +166,50 @@ describe("managed account stream rotation", () => {
 		assert.deepEqual(observed.successes, ["b"]);
 	});
 
+	it("rotates on a pre-output model-scoped limit thrown by the SDK wrapper and rescopes the block", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		let calls = 0;
+		__testSetSdkQueryFactory(((input) => {
+			observed.queryEnvs.push(input.options.env);
+			calls += 1;
+			if (calls === 1) {
+				return fakeSdkQuery([
+					{ type: "system", subtype: "init", session_id: "session-a" },
+					// The SDK enum has no Fable variant: the event is typed seven_day.
+					{
+						type: "rate_limit_event",
+						rate_limit_info: { status: "rejected", rateLimitType: "seven_day", resetsAt: Math.floor(Date.now() / 1000) + 3600 },
+					},
+					{ type: "result", subtype: "error_during_execution", errors: ["You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."] },
+					// …and then the iterator throws its friendly wrapper (2026-09-11 hym session).
+					new Error("Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."),
+				], "a", observed);
+			}
+			return fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: "session-b" },
+				{ type: "stream_event", event: { type: "message_start", message: { model: model.id, usage: { input_tokens: 1 } } } },
+				{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+				{ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "from-b" } } },
+				{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+				{ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+				{ type: "stream_event", event: { type: "message_stop" } },
+				{ type: "assistant", message: { model: model.id, content: [{ type: "text", text: "from-b" }], usage: { input_tokens: 1, output_tokens: 1 } } },
+				{ type: "result", subtype: "success", result: "from-b" },
+			], "b", observed);
+		}));
+
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "pi-session" }));
+		assert.equal(calls, 2, "pre-output limit must move to the next account");
+		assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "from-b"));
+		assert.equal(events.filter((event) => event.type === "error").length, 0);
+		assert.equal(observed.rateLimits[0].info.rateLimitType, "seven_day", "the structured event is recorded as received");
+		const rescoped = observed.rateLimits.find((entry) => entry.info.rateLimitType === "seven_day_fable");
+		assert.ok(rescoped, "the limit is re-recorded with the family the message names");
+		assert.equal(rescoped.profileId, "a");
+		assert.equal(rescoped.info.resetsAt, observed.rateLimits[0].info.resetsAt, "the authoritative reset is kept");
+	});
+
 	it("rotates on a pre-output network failure", async () => {
 		const observed = observedState();
 		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);

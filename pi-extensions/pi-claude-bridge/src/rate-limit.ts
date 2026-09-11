@@ -25,6 +25,31 @@ export function isUsageLimitMessage(value: unknown): boolean {
 	return USAGE_LIMIT_PREFIXES.some((prefix) => text.includes(prefix));
 }
 
+/** The model family a usage-limit message names ("You've reached your Fable
+ *  limit…"), or undefined for account-wide copy. The SDK's `rateLimitType`
+ *  enum has no Fable/Opus variant for these, so a model-scoped weekly limit
+ *  arrives typed as a plain `seven_day` window; the message text is the only
+ *  place the real scope is stated. */
+export function modelFamilyFromLimitMessage(value: unknown): string | undefined {
+	const text = coerceMessageText(value);
+	const match = /\byour (fable|opus|sonnet|haiku)\b[^.\n]{0,40}?\blimit\b/i.exec(text);
+	return match ? match[1].toLowerCase() : undefined;
+}
+
+/** Attach the failure consumeQuery had classified from structured SDK events
+ *  to the iterator's terminal throw, so the catch path keeps the authoritative
+ *  rate-limit info instead of re-classifying the wrapper's message text. */
+export function attachAttemptFailure<T extends { rateLimitInfo?: unknown }>(error: unknown, failure: T | undefined): unknown {
+	if (failure && error && typeof error === "object" && !("claudeAttemptFailure" in error)) {
+		try { Object.defineProperty(error, "claudeAttemptFailure", { value: failure, enumerable: false }); } catch { /* frozen */ }
+	}
+	return error;
+}
+
+export function attachedAttemptFailure<T>(error: unknown): T | undefined {
+	return error && typeof error === "object" ? (error as { claudeAttemptFailure?: T }).claudeAttemptFailure : undefined;
+}
+
 export function uniqueNonEmptyLines(values: unknown[]): string[] {
 	const seen = new Set<string>();
 	const out: string[] = [];

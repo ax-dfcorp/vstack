@@ -53484,6 +53484,23 @@ function isUsageLimitMessage(value) {
   const text = coerceMessageText(value);
   return USAGE_LIMIT_PREFIXES.some((prefix) => text.includes(prefix));
 }
+function modelFamilyFromLimitMessage(value) {
+  const text = coerceMessageText(value);
+  const match = /\byour (fable|opus|sonnet|haiku)\b[^.\n]{0,40}?\blimit\b/i.exec(text);
+  return match ? match[1].toLowerCase() : void 0;
+}
+function attachAttemptFailure(error51, failure) {
+  if (failure && error51 && typeof error51 === "object" && !("claudeAttemptFailure" in error51)) {
+    try {
+      Object.defineProperty(error51, "claudeAttemptFailure", { value: failure, enumerable: false });
+    } catch {
+    }
+  }
+  return error51;
+}
+function attachedAttemptFailure(error51) {
+  return error51 && typeof error51 === "object" ? error51.claudeAttemptFailure : void 0;
+}
 function uniqueNonEmptyLines(values) {
   const seen = /* @__PURE__ */ new Set();
   const out2 = [];
@@ -54203,7 +54220,7 @@ function classifyClaudeFailure(value) {
   if (/\b401\b|authentication (?:failed|error)|oauth org not allowed|oauth token.*expired|token.*expired|unauthorized|invalid token|login required|please run .*login|not logged in/.test(normalized)) return "auth";
   if (/extra usage|overage/.test(normalized)) return "rate-limit";
   if (/billing error|payment|required.*billing|credit balance.*(?:low|insufficient|empty)|insufficient credits/.test(normalized)) return "billing";
-  if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve hit your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
+  if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve (?:hit|reached) your .* limit|reached your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
   if (/overloaded|capacity/.test(normalized)) return "overloaded";
   if (/server error|internal server|\b5\d\d\b/.test(normalized)) return "server";
   if (/network|timeout|timed out|socket|econn|connection closed|fetch failed|unexpected end|\beof\b/.test(normalized)) return "network";
@@ -54468,7 +54485,14 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
   let capturedSessionId;
   let failure;
   let accountProbe;
-  for await (const message of sdkQuery) {
+  async function* withAttemptFailure(source) {
+    try {
+      for await (const message of source) yield message;
+    } catch (error51) {
+      throw attachAttemptFailure(error51, failure);
+    }
+  }
+  for await (const message of withAttemptFailure(sdkQuery)) {
     if (wasAborted()) break;
     const queryCtx = ctx();
     if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
@@ -55017,6 +55041,18 @@ function streamClaudeAgentSdk(model, context, options) {
   ctx().activeQuery = sdkQuery;
   const abortCtx = ctx();
   let accountFailureRecorded = false;
+  const rescopeModelFamilyLimit = (failure) => {
+    if (!account || !router || failure.kind !== "rate-limit") return;
+    const family = modelFamilyFromLimitMessage(failure.message);
+    if (!family) return;
+    const info = failure.rateLimitInfo ?? {};
+    const typed = String(info.rateLimitType ?? info.rate_limit_type ?? "").toLowerCase();
+    if (typed.includes(family)) return;
+    debug(`provider: rescoping ${typed || "untyped"} limit on ${account.label} to model:${family}`);
+    const rescoped = { ...info, rateLimitType: `seven_day_${family}`, limitMessage: failure.message };
+    router.recordRateLimit(account.profileId, rescoped, queryModel.id);
+    failure.rateLimitInfo = rescoped;
+  };
   const recordAttemptFailure = (failure) => {
     if (accountFailureRecorded || !account || !router || !failure.kind || failure.rateLimitInfo || wasAborted || options?.signal?.aborted) return;
     router.recordFailure(account.profileId, failure.kind, queryModel.id);
@@ -55202,6 +55238,7 @@ function streamClaudeAgentSdk(model, context, options) {
       return;
     }
     if (failure) {
+      rescopeModelFamilyLimit(failure);
       if (requestContextRebuild(failure)) return;
       if (requestRotation(failure)) return;
       surfaceFailure(failure);
@@ -55276,10 +55313,14 @@ function streamClaudeAgentSdk(model, context, options) {
       debug("provider: suppressing duplicate query error after terminal handling");
       return;
     }
+    const captured = attachedAttemptFailure(error51);
+    const message = error51 instanceof Error ? error51.message : String(error51);
     const failure = {
-      kind: classifyClaudeFailure(error51),
-      message: error51 instanceof Error ? error51.message : String(error51)
+      kind: captured?.kind ?? (isUsageLimitMessage(message) ? "rate-limit" : classifyClaudeFailure(error51)),
+      message,
+      ...captured?.rateLimitInfo ? { rateLimitInfo: captured.rateLimitInfo } : {}
     };
+    rescopeModelFamilyLimit(failure);
     if (requestContextRebuild(failure)) return;
     if (requestRotation(failure)) return;
     if (!wasAborted && !options?.signal?.aborted) setSharedSession(null);

@@ -106,6 +106,9 @@ describe("account routing helpers", () => {
 	it("classifies retryable Claude failures", () => {
 		assert.equal(classifyClaudeFailure("rate_limit"), "rate-limit");
 		assert.equal(classifyClaudeFailure("You've hit your session limit · resets 7:10pm"), "rate-limit");
+		// CLI copy for a model-scoped weekly limit (2026-09-11, Fable on a Max account).
+		assert.equal(classifyClaudeFailure("Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."), "rate-limit");
+		assert.equal(classifyClaudeFailure("You've reached your Opus limit · resets 2pm"), "rate-limit");
 		assert.equal(classifyClaudeFailure("authentication_failed"), "auth");
 		assert.equal(classifyClaudeFailure("401 authentication_error"), "auth");
 		assert.equal(classifyClaudeFailure("OAuth token has expired; please run /login"), "auth");

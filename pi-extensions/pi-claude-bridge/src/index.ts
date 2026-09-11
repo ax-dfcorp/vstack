@@ -62,7 +62,7 @@ import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, conn
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
-import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
+import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
 import { ensureTurnStarted, finalizeCurrentStream, finalizeToolUseTurnFromMcpInvocation, noteChildExecutedToolResults, processAssistantMessage, processStreamEvent, scheduleToolUseTurnEnd, updateTurnOutputModel } from "./assistant-stream.js";
 import {
@@ -555,7 +555,18 @@ async function consumeQuery(
 	let failure: ClaudeAttemptFailure | undefined;
 	let accountProbe: Promise<void> | undefined;
 
-	for await (const message of sdkQuery) {
+	// The SDK yields a structured rate_limit_event and then THROWS its friendly
+	// wrapper ("Claude Code returned an error result: …") from the iterator, which
+	// would discard the classified failure below. Carry it on the error instead.
+	async function* withAttemptFailure(source: AsyncIterable<SDKMessage>): AsyncGenerator<SDKMessage> {
+		try {
+			for await (const message of source) yield message;
+		} catch (error) {
+			throw attachAttemptFailure(error, failure);
+		}
+	}
+
+	for await (const message of withAttemptFailure(sdkQuery)) {
 		if (wasAborted()) break;
 		const queryCtx = ctx();
 		// Claude's transport can keep emitting ping frames while model output is
@@ -1317,6 +1328,22 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	// 4. Capture context for abort handling (must be AFTER pushContext)
 	const abortCtx = ctx();
 	let accountFailureRecorded = false;
+	// The SDK types a model-scoped weekly limit ("You've reached your Fable
+	// limit") as a plain `seven_day` window, so the router installed an
+	// account-wide block from the event. Re-record it model-scoped once the
+	// message text names the family; the router drops the mis-scoped twin.
+	const rescopeModelFamilyLimit = (failure: ClaudeAttemptFailure): void => {
+		if (!account || !router || failure.kind !== "rate-limit") return;
+		const family = modelFamilyFromLimitMessage(failure.message);
+		if (!family) return;
+		const info = failure.rateLimitInfo ?? {};
+		const typed = String(info.rateLimitType ?? info.rate_limit_type ?? "").toLowerCase();
+		if (typed.includes(family)) return;
+		debug(`provider: rescoping ${typed || "untyped"} limit on ${account.label} to model:${family}`);
+		const rescoped = { ...info, rateLimitType: `seven_day_${family}`, limitMessage: failure.message };
+		router.recordRateLimit(account.profileId, rescoped, queryModel.id);
+		failure.rateLimitInfo = rescoped;
+	};
 	const recordAttemptFailure = (failure: ClaudeAttemptFailure): void => {
 		if (
 			accountFailureRecorded || !account || !router || !failure.kind ||
@@ -1527,6 +1554,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			}
 
 			if (failure) {
+				rescopeModelFamilyLimit(failure);
 				if (requestContextRebuild(failure)) return;
 				if (requestRotation(failure)) return;
 				surfaceFailure(failure);
@@ -1609,10 +1637,14 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				debug("provider: suppressing duplicate query error after terminal handling");
 				return;
 			}
+			const captured = attachedAttemptFailure<ClaudeAttemptFailure>(error);
+			const message = error instanceof Error ? error.message : String(error);
 			const failure: ClaudeAttemptFailure = {
-				kind: classifyClaudeFailure(error),
-				message: error instanceof Error ? error.message : String(error),
+				kind: captured?.kind ?? (isUsageLimitMessage(message) ? "rate-limit" : classifyClaudeFailure(error)),
+				message,
+				...(captured?.rateLimitInfo ? { rateLimitInfo: captured.rateLimitInfo } : {}),
 			};
+			rescopeModelFamilyLimit(failure);
 			if (requestContextRebuild(failure)) return;
 			if (requestRotation(failure)) return;
 			if (!wasAborted && !options?.signal?.aborted) setSharedSession(null);

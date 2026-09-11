@@ -243,3 +243,14 @@ describe("formatAutoResumeRateLimitMessage", () => {
 		assert.ok(isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: message }));
 	});
 });
+
+describe("modelFamilyFromLimitMessage", () => {
+	it("names the family from the CLI's model-scoped limit copy only", async () => {
+		const { modelFamilyFromLimitMessage } = await import("../src/rate-limit.ts");
+		assert.equal(modelFamilyFromLimitMessage("Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."), "fable");
+		assert.equal(modelFamilyFromLimitMessage("You've reached your Opus weekly limit · resets 2pm"), "opus");
+		assert.equal(modelFamilyFromLimitMessage("You've hit your session limit · resets 1:50pm"), undefined);
+		assert.equal(modelFamilyFromLimitMessage("You've hit your weekly limit"), undefined);
+		assert.equal(modelFamilyFromLimitMessage(new Error("Fable 5 requires usage credits")), undefined);
+	});
+});
