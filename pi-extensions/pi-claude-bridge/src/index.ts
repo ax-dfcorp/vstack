@@ -1275,7 +1275,17 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		...connectorQueryOptions(enableCloudMcp, connectorWriteMode),
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		...(providerSettings.fastMode ? { settings: { fastMode: true } } : {}),
+		// Auto-memory is disabled on purpose. The SDK writes it to
+		// <CLAUDE_CONFIG_DIR>/projects/<cwd>/memory/, and this bridge rotates
+		// CLAUDE_CONFIG_DIR across subscription accounts -- so the same repo
+		// accumulated a different, non-overlapping memory set per account, and
+		// none of it was visible to Pi's non-Claude providers. Project memory is
+		// owned by the model-agnostic unified-memory Pi extension instead, which
+		// injects one shared directory for every model.
+		settings: {
+			...(providerSettings.fastMode ? { fastMode: true } : {}),
+			autoMemoryEnabled: false,
+		},
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
