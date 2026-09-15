@@ -24,7 +24,7 @@ run_json() {
   local slug=$(echo "$name" | tr ' :,' '-' | tr -cd '[:alnum:]-')
   local logfile="$LOGDIR/$slug.ndjson"
   printf "%-50s " "$name"
-  if timeout "$TIMEOUT" "$@" > "$logfile" 2>"$logfile.err"; then
+  if run_with_timeout "$TIMEOUT" "$@" > "$logfile" 2>"$logfile.err"; then
     if [ ! -s "$logfile" ]; then
       echo "FAIL (empty output)"
       ((FAIL+=1))

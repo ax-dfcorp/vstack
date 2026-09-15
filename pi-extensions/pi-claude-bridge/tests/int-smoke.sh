@@ -22,7 +22,7 @@ run() {
   local slug=$(echo "$name" | tr ' :,' '-' | tr -cd '[:alnum:]-')
   local logfile="$LOGDIR/$slug.log"
   printf "%-50s " "$name"
-  if output=$(timeout "$TIMEOUT" "$@" 2>&1); then
+  if output=$(run_with_timeout "$TIMEOUT" "$@" 2>&1); then
     echo "$output" > "$logfile"
     if [ -n "$output" ]; then
       echo "PASS"

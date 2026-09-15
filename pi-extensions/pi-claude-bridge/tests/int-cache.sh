@@ -24,7 +24,7 @@ TMPFILE="$LOGDIR/cache-test-scratch.txt"
 rm -f "$TMPFILE" "$CLAUDE_BRIDGE_DEBUG_PATH"
 
 echo "Running 5-turn conversation (text + tool use)..."
-timeout 180 pi --no-session -ne -e "$DIR" \
+run_with_timeout 180 pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
   -p "The secret number is 42. Acknowledge briefly." \

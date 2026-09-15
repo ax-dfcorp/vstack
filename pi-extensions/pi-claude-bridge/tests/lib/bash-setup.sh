@@ -18,6 +18,31 @@ load_test_env() {
 	(( restore_allexport )) && set +a
 }
 
+# Run a command under a wall-clock limit.
+# macOS ships neither GNU `timeout` nor `gtimeout` by default, which used to make
+# every timed integration test exit 127 before it ran anything.
+# Usage: run_with_timeout <seconds> <command> [args...]
+run_with_timeout() {
+	local seconds="$1"; shift
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$seconds" "$@"
+	elif command -v gtimeout >/dev/null 2>&1; then
+		gtimeout "$seconds" "$@"
+	else
+		perl -e '
+			my $limit = shift;
+			my $pid = fork();
+			die "fork failed: $!" unless defined $pid;
+			if ($pid == 0) { exec { $ARGV[0] } @ARGV or exit 127; }
+			$SIG{ALRM} = sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 };
+			alarm $limit;
+			waitpid $pid, 0;
+			alarm 0;
+			exit($? >> 8);
+		' "$seconds" "$@"
+	fi
+}
+
 # Strip node_modules/.bin from PATH so we use the system pi, not the vendored one.
 __clean_path() {
 	echo "$PATH" | tr ':' '\n' | grep -v node_modules | tr '\n' ':'
