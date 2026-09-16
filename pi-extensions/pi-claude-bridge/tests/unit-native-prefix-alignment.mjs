@@ -1,0 +1,101 @@
+// alignNativePrefix: how much of the CLI's own transcript a rebuild may reuse
+// verbatim. Cuts only right before a pi user message; stops at the first
+// record that is not provably the same conversation.
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { alignNativePrefix } from "../src/session-persistence.js";
+
+const user = (text) => ({ type: "user", uuid: `u-${text}`, message: { role: "user", content: text } });
+const attachment = (type) => ({ type: "attachment", uuid: `a-${type}`, attachment: { type, text: "<total_tokens>1 tokens left</total_tokens>" } });
+const assistantText = (id, text) => ({ type: "assistant", uuid: `as-${id}-t`, message: { id, role: "assistant", content: [{ type: "text", text }] } });
+const assistantToolUse = (id, toolId, name = "mcp__custom-tools__bash") => ({ type: "assistant", uuid: `as-${id}-${toolId}`, message: { id, role: "assistant", content: [{ type: "tool_use", id: toolId, name, input: { command: "x" } }] } });
+const toolResult = (toolId, text) => ({ type: "user", uuid: `tr-${toolId}`, message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: [{ type: "text", text }] }] } });
+const meta = (type) => ({ type, sessionId: "s" });
+
+const piUser = (text) => ({ role: "user", content: text });
+const piAssistant = (text, toolIds = []) => ({ role: "assistant", content: [{ type: "text", text }, ...toolIds.map((id) => ({ type: "toolCall", id, name: "bash", arguments: { command: "x" } }))] });
+const piToolResult = (id, text) => ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text }], isError: false });
+
+describe("alignNativePrefix", () => {
+	it("carries complete turns, including the CLI's attachments and bookkeeping records, up to the last turn boundary", () => {
+		const records = [
+			meta("queue-operation"),
+			user("first"), attachment("total_tokens_reminder"),
+			assistantText("m1", "working"), assistantToolUse("m1", "toolu_1"),
+			toolResult("toolu_1", "out"), attachment("total_tokens_reminder"),
+			assistantText("m2", "done"),
+			meta("last-prompt"),
+			user("second"), attachment("total_tokens_reminder"),
+			assistantText("m3", "partial"), assistantToolUse("m3", "toolu_2"),
+		];
+		const messages = [
+			piUser("first"),
+			piAssistant("working", ["toolu_1"]),
+			piToolResult("toolu_1", "out"),
+			piAssistant("done"),
+			piUser("second"),
+			{ role: "assistant", content: [{ type: "text", text: "partial" }, { type: "toolCall", id: "toolu_2", name: "bash", arguments: {} }], stopReason: "aborted" },
+		];
+		// Everything through "done" is native and complete: 8 records, 4 pi messages.
+		// The aborted turn's tool_use has no result, so it is left to the converter.
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 8, messageCount: 4 });
+	});
+
+	it("carries an aborted text-only turn at the end, since it is paired and identical", () => {
+		const records = [user("q"), assistantText("m1", "a"), user("r"), assistantText("m2", "partial")];
+		const messages = [piUser("q"), piAssistant("a"), piUser("r"), { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "aborted" }];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 4, messageCount: 4 });
+	});
+
+	it("covers the whole history when it ends at a turn boundary", () => {
+		const records = [user("q"), assistantText("m1", "a")];
+		const messages = [piUser("q"), piAssistant("a")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 2, messageCount: 2 });
+	});
+
+	it("stops at the first diverging record: a different tool set", () => {
+		const records = [
+			user("q"), assistantToolUse("m1", "toolu_1"), toolResult("toolu_1", "o"), assistantText("m2", "a"),
+			user("r"), assistantToolUse("m3", "toolu_9"), toolResult("toolu_9", "o"), assistantText("m4", "b"),
+		];
+		const messages = [
+			piUser("q"), piAssistant("", ["toolu_1"]), piToolResult("toolu_1", "o"), piAssistant("a"),
+			piUser("r"), piAssistant("", ["toolu_2"]), piToolResult("toolu_2", "o"), piAssistant("b"),
+		];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 4, messageCount: 4 });
+	});
+
+	it("accepts a native user record that wraps the pi prompt in extra context", () => {
+		const records = [
+			{ type: "user", uuid: "u", message: { role: "user", content: [{ type: "text", text: "<system-reminder>ctx</system-reminder>" }, { type: "text", text: "hello there" }] } },
+			assistantText("m1", "hi"),
+		];
+		assert.deepEqual(alignNativePrefix(records, [piUser("hello there"), piAssistant("hi")]), { recordCount: 2, messageCount: 2 });
+	});
+
+	it("accepts parallel tool results recorded as one grouped user record", () => {
+		const records = [
+			user("q"),
+			assistantToolUse("m1", "toolu_a"), assistantToolUse("m1", "toolu_b"),
+			{ type: "user", uuid: "grp", message: { role: "user", content: [
+				{ type: "tool_result", tool_use_id: "toolu_a", content: "1" },
+				{ type: "tool_result", tool_use_id: "toolu_b", content: "2" },
+			] } },
+			assistantText("m2", "done"),
+		];
+		const messages = [piUser("q"), piAssistant("", ["toolu_a", "toolu_b"]), piToolResult("toolu_a", "1"), piToolResult("toolu_b", "2"), piAssistant("done")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 5, messageCount: 5 });
+	});
+
+	it("carries nothing after a pi compaction, whose summary is not in the native transcript", () => {
+		const records = [user("original prompt"), assistantText("m1", "a")];
+		const messages = [piUser("The conversation history was compacted: ..."), piAssistant("a")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 0, messageCount: 0 });
+	});
+
+	it("never cuts in the middle of a tool batch", () => {
+		const records = [user("q"), assistantToolUse("m1", "toolu_1")];
+		const messages = [piUser("q"), piAssistant("", ["toolu_1"]), piToolResult("toolu_1", "o")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 0, messageCount: 0 });
+	});
+});

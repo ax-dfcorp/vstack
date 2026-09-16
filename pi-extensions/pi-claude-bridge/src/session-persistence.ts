@@ -1,10 +1,10 @@
 import { type AssistantMessage, type Context } from "@earendil-works/pi-ai";
-import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing, type JsonlRecord } from "cc-session-io";
 import { createHash, randomUUID } from "crypto";
 import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { resolve as pathResolve } from "path";
 import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState } from "./bridge-state.js";
-import { convertPiMessages } from "./convert.js";
+import { convertPiMessages, sanitizeToolId } from "./convert.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import {
@@ -58,19 +58,139 @@ function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeS
 
 const PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
 
-/** The CLI's recorded system prompt: the LAST `prompt_snapshot` attachment in the jsonl, as the CLI itself resolves it. */
-export function readPromptSnapshotRecord(jsonlPath: string): Record<string, unknown> | undefined {
+export type RawSessionRecord = Record<string, any>;
+
+/** Every parsed record of a CLI session jsonl, in file order. Undefined when the file is unreadable. */
+export function readSessionRecords(jsonlPath: string): RawSessionRecord[] | undefined {
 	let text: string;
 	try { text = readFileSync(jsonlPath, "utf8"); } catch { return undefined; }
-	let found: Record<string, unknown> | undefined;
+	const records: RawSessionRecord[] = [];
 	for (const line of text.split("\n")) {
-		if (!line.includes(`"${PROMPT_SNAPSHOT_ATTACHMENT}"`)) continue;
-		try {
-			const record = JSON.parse(line) as { type?: string; attachment?: { type?: string } };
-			if (record?.type === "attachment" && record.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) found = record.attachment as Record<string, unknown>;
-		} catch { /* skip malformed line */ }
+		if (!line.trim()) continue;
+		try { records.push(JSON.parse(line)); } catch { /* skip malformed line */ }
 	}
-	return found;
+	return records;
+}
+
+/** The CLI's recorded system prompt: the LAST `prompt_snapshot` attachment, as the CLI itself resolves it. */
+export function lastPromptSnapshot(records: RawSessionRecord[]): Record<string, unknown> | undefined {
+	for (let i = records.length - 1; i >= 0; i--) {
+		const record = records[i];
+		if (record?.type === "attachment" && record.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) return record.attachment as Record<string, unknown>;
+	}
+	return undefined;
+}
+
+export function readPromptSnapshotRecord(jsonlPath: string): Record<string, unknown> | undefined {
+	const records = readSessionRecords(jsonlPath);
+	return records ? lastPromptSnapshot(records) : undefined;
+}
+
+function recordText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n");
+}
+
+function toolResultIds(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	return content.filter((b) => b && b.type === "tool_result" && typeof b.tool_use_id === "string").map((b) => b.tool_use_id as string);
+}
+
+function sameSet(left: string[], right: string[]): boolean {
+	if (left.length !== right.length) return false;
+	const set = new Set(left);
+	return right.every((id) => set.has(id));
+}
+
+/**
+ * How much of the CLI's own transcript can be reused verbatim for a rebuild.
+ *
+ * A rebuild re-serializes pi history, but the CLI's native records also carry
+ * things pi never sees (`total_tokens_reminder` and other attachments, the
+ * exact tool_result shapes), so a rebuilt prefix differs from what the API
+ * cached and every token after the first difference is written again. Walking
+ * the native records against pi's messages finds the longest leading run that
+ * is provably the same conversation; those records are carried over unchanged
+ * and only the rest is converted. Cuts happen only right before a pi user
+ * message, so a carried prefix never ends with an unpaired tool_use.
+ *
+ * Returns the number of native records to carry and the number of leading pi
+ * messages they cover. `{ 0, 0 }` means convert everything as before.
+ */
+export function alignNativePrefix(
+	records: RawSessionRecord[],
+	messages: Context["messages"],
+): { recordCount: number; messageCount: number } {
+	let best = { recordCount: 0, messageCount: 0 };
+	const ids = new Map<string, string>();
+	let r = 0;
+	let openToolCalls = false;
+	const nextMessageRecord = (): number => {
+		while (r < records.length && records[r]?.type !== "user" && records[r]?.type !== "assistant") r++;
+		return r;
+	};
+	for (let p = 0; p < messages.length; p++) {
+		const msg = messages[p] as any;
+		if (msg.role === "user") {
+			nextMessageRecord();
+			const rec = records[r];
+			if (!rec || rec.type !== "user" || toolResultIds(rec.message?.content).length > 0) break;
+			const piText = recordText(msg.content).trim();
+			const ccText = recordText(rec.message?.content);
+			if (piText.length === 0 || !ccText.includes(piText)) break;
+			r++;
+		} else if (msg.role === "assistant") {
+			nextMessageRecord();
+			const first = records[r];
+			if (!first || first.type !== "assistant") break;
+			const messageId = first.message?.id;
+			const toolUses: string[] = [];
+			let consumed = 0;
+			while (r < records.length) {
+				const rec = records[r];
+				if (rec.type !== "assistant") break;
+				if (consumed > 0 && (!messageId || rec.message?.id !== messageId)) break;
+				for (const block of Array.isArray(rec.message?.content) ? rec.message.content : []) {
+					if (block?.type === "tool_use" && typeof block.id === "string") toolUses.push(block.id);
+				}
+				consumed++;
+				r++;
+			}
+			const piCalls = (Array.isArray(msg.content) ? msg.content : [])
+				.filter((b: any) => b?.type === "toolCall" && typeof b.id === "string")
+				.map((b: any) => sanitizeToolId(b.id, ids));
+			if (!sameSet(piCalls, toolUses)) break;
+			openToolCalls = piCalls.length > 0;
+		} else if (msg.role === "toolResult") {
+			const pending = new Set<string>();
+			let q = p;
+			for (; q < messages.length && (messages[q] as any).role === "toolResult"; q++) {
+				pending.add(sanitizeToolId((messages[q] as any).toolCallId, ids));
+			}
+			let ok = true;
+			while (pending.size > 0) {
+				nextMessageRecord();
+				const rec = records[r];
+				const found = rec && rec.type === "user" ? toolResultIds(rec.message?.content) : [];
+				if (found.length === 0 || !found.every((id) => pending.has(id))) { ok = false; break; }
+				for (const id of found) pending.delete(id);
+				r++;
+			}
+			if (!ok) break;
+			p = q - 1;
+			openToolCalls = false;
+		} else {
+			break;
+		}
+		const next = messages[p + 1] as any;
+		// A cut is safe before the next user prompt, or at the end of history
+		// when no tool_use is still waiting for its result (an aborted turn's
+		// tool calls are left to the converter, which pairs them explicitly).
+		const atCleanEnd = next === undefined && !openToolCalls;
+		if (msg.role !== "user" && ((next !== undefined && next.role === "user") || atCleanEnd)) best = { recordCount: r, messageCount: p + 1 };
+	}
+	return best;
 }
 
 /** Append a `prompt_snapshot` attachment as the new leaf of a freshly written jsonl, chained to its last record like the CLI writes attachments. */
@@ -397,22 +517,57 @@ export function syncSharedSession(
 	// record, so the next launch would render a fresh prompt (new git status,
 	// re-read AGENTS.md) and miss the cache for the whole conversation. Carry
 	// the record over before the old file is deleted.
-	const carriedPromptSnapshot = sharedSession
-		? readPromptSnapshotRecord(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir))
+	const oldRecords = sharedSession
+		? readSessionRecords(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir))
 		: undefined;
+	const carriedPromptSnapshot = oldRecords ? lastPromptSnapshot(oldRecords) : undefined;
+	// Reuse the CLI's own records for the part of the conversation that is
+	// provably unchanged (see alignNativePrefix), so the API's cached prefix
+	// survives the rebuild; only the tail is converted from pi history.
+	const aligned = oldRecords && oldRecords.length > 0 ? alignNativePrefix(oldRecords, priorMessages) : { recordCount: 0, messageCount: 0 };
+	const carriedRecords = aligned.messageCount > 0 ? oldRecords!.slice(0, aligned.recordCount) : [];
 	if (preserveId) {
 		deleteSession(previousSessionId!, cwd, claudeConfigDir);
 	}
-	const session = createSession({
+	let session = createSession({
 		projectPath: cwd,
 		claudeDir: claudeConfigDir,
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		...(modelId ? { model: modelId } : {}),
 	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
+	let coveredMessages = 0;
+	if (carriedRecords.length > 0) {
+		try {
+			for (const record of carriedRecords) session.dangerousAppendRecord(record as JsonlRecord);
+			// dangerousAppendRecord deliberately does not advance the uuid chain;
+			// the converted tail must parent to the last carried message or the
+			// CLI resumes from an empty chain.
+			for (let i = carriedRecords.length - 1; i >= 0; i--) {
+				const record = carriedRecords[i];
+				if (record.type === "user" || record.type === "assistant" || record.type === "attachment") {
+					(session as unknown as { _lastUuid: string | null })._lastUuid = record.uuid ?? null;
+					break;
+				}
+			}
+			coveredMessages = aligned.messageCount;
+			debug(`Case 4: carried ${carriedRecords.length} native records covering ${coveredMessages}/${priorMessages.length} pi messages verbatim`);
+		} catch (error) {
+			// A record whose parent is outside the carried range would strand the
+			// CLI; fall back to converting everything, as before this optimization.
+			debug("Case 4: native prefix carry failed, converting the whole history:", error);
+			coveredMessages = 0;
+			session = createSession({
+				projectPath: cwd,
+				claudeDir: claudeConfigDir,
+				sessionId: session.sessionId,
+				...(modelId ? { model: modelId } : {}),
+			});
+		}
+	}
+	convertAndImportMessages(session, priorMessages.slice(coveredMessages), customToolNameToSdk, cwd);
 	session.save();
-	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd, claudeConfigDir);
-	if (carriedPromptSnapshot) {
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
+	if (carriedPromptSnapshot && !lastPromptSnapshot(carriedRecords)) {
 		const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
 		debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
 	}
