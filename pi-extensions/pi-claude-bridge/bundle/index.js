@@ -53164,23 +53164,112 @@ function latestPersistedBridgeSession(sessionManager) {
   return void 0;
 }
 var PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
-function readPromptSnapshotRecord(jsonlPath) {
+function readSessionRecords(jsonlPath) {
   let text;
   try {
     text = readFileSync9(jsonlPath, "utf8");
   } catch {
     return void 0;
   }
-  let found;
+  const records = [];
   for (const line of text.split("\n")) {
-    if (!line.includes(`"${PROMPT_SNAPSHOT_ATTACHMENT}"`)) continue;
+    if (!line.trim()) continue;
     try {
-      const record2 = JSON.parse(line);
-      if (record2?.type === "attachment" && record2.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) found = record2.attachment;
+      records.push(JSON.parse(line));
     } catch {
     }
   }
-  return found;
+  return records;
+}
+function lastPromptSnapshot(records) {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const record2 = records[i];
+    if (record2?.type === "attachment" && record2.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) return record2.attachment;
+  }
+  return void 0;
+}
+function recordText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((b2) => b2 && b2.type === "text" && typeof b2.text === "string").map((b2) => b2.text).join("\n");
+}
+function toolResultIds2(content) {
+  if (!Array.isArray(content)) return [];
+  return content.filter((b2) => b2 && b2.type === "tool_result" && typeof b2.tool_use_id === "string").map((b2) => b2.tool_use_id);
+}
+function sameSet(left, right) {
+  if (left.length !== right.length) return false;
+  const set2 = new Set(left);
+  return right.every((id) => set2.has(id));
+}
+function alignNativePrefix(records, messages) {
+  let best = { recordCount: 0, messageCount: 0 };
+  const ids = /* @__PURE__ */ new Map();
+  let r = 0;
+  let openToolCalls = false;
+  const nextMessageRecord = () => {
+    while (r < records.length && records[r]?.type !== "user" && records[r]?.type !== "assistant") r++;
+    return r;
+  };
+  for (let p = 0; p < messages.length; p++) {
+    const msg = messages[p];
+    if (msg.role === "user") {
+      nextMessageRecord();
+      const rec = records[r];
+      if (!rec || rec.type !== "user" || toolResultIds2(rec.message?.content).length > 0) break;
+      const piText = recordText(msg.content).trim();
+      const ccText = recordText(rec.message?.content);
+      if (piText.length === 0 || !ccText.includes(piText)) break;
+      r++;
+    } else if (msg.role === "assistant") {
+      nextMessageRecord();
+      const first = records[r];
+      if (!first || first.type !== "assistant") break;
+      const messageId = first.message?.id;
+      const toolUses2 = [];
+      let consumed = 0;
+      while (r < records.length) {
+        const rec = records[r];
+        if (rec.type !== "assistant") break;
+        if (consumed > 0 && (!messageId || rec.message?.id !== messageId)) break;
+        for (const block of Array.isArray(rec.message?.content) ? rec.message.content : []) {
+          if (block?.type === "tool_use" && typeof block.id === "string") toolUses2.push(block.id);
+        }
+        consumed++;
+        r++;
+      }
+      const piCalls = (Array.isArray(msg.content) ? msg.content : []).filter((b2) => b2?.type === "toolCall" && typeof b2.id === "string").map((b2) => sanitizeToolId(b2.id, ids));
+      if (!sameSet(piCalls, toolUses2)) break;
+      openToolCalls = piCalls.length > 0;
+    } else if (msg.role === "toolResult") {
+      const pending = /* @__PURE__ */ new Set();
+      let q = p;
+      for (; q < messages.length && messages[q].role === "toolResult"; q++) {
+        pending.add(sanitizeToolId(messages[q].toolCallId, ids));
+      }
+      let ok = true;
+      while (pending.size > 0) {
+        nextMessageRecord();
+        const rec = records[r];
+        const found = rec && rec.type === "user" ? toolResultIds2(rec.message?.content) : [];
+        if (found.length === 0 || !found.every((id) => pending.has(id))) {
+          ok = false;
+          break;
+        }
+        for (const id of found) pending.delete(id);
+        r++;
+      }
+      if (!ok) break;
+      p = q - 1;
+      openToolCalls = false;
+    } else {
+      break;
+    }
+    const next = messages[p + 1];
+    const atCleanEnd = next === void 0 && !openToolCalls;
+    if (msg.role !== "user" && (next !== void 0 && next.role === "user" || atCleanEnd)) best = { recordCount: r, messageCount: p + 1 };
+  }
+  return best;
 }
 function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
   try {
@@ -53396,20 +53485,47 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   const previousSessionId = sameAccount ? sharedSession?.sessionId : void 0;
   const previousCursor = sameAccount ? sharedSession?.cursor ?? 0 : 0;
   const preserveId = previousSessionId !== void 0 && !sharedSession?.forceRotate;
-  const carriedPromptSnapshot = sharedSession ? readPromptSnapshotRecord(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir)) : void 0;
+  const oldRecords = sharedSession ? readSessionRecords(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir)) : void 0;
+  const carriedPromptSnapshot = oldRecords ? lastPromptSnapshot(oldRecords) : void 0;
+  const aligned = oldRecords && oldRecords.length > 0 ? alignNativePrefix(oldRecords, priorMessages) : { recordCount: 0, messageCount: 0 };
+  const carriedRecords = aligned.messageCount > 0 ? oldRecords.slice(0, aligned.recordCount) : [];
   if (preserveId) {
     deleteSession(previousSessionId, cwd, claudeConfigDir);
   }
-  const session = createSession({
+  let session = createSession({
     projectPath: cwd,
     claudeDir: claudeConfigDir,
     ...preserveId ? { sessionId: previousSessionId } : {},
     ...modelId ? { model: modelId } : {}
   });
-  convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
+  let coveredMessages = 0;
+  if (carriedRecords.length > 0) {
+    try {
+      for (const record2 of carriedRecords) session.dangerousAppendRecord(record2);
+      for (let i = carriedRecords.length - 1; i >= 0; i--) {
+        const record2 = carriedRecords[i];
+        if (record2.type === "user" || record2.type === "assistant" || record2.type === "attachment") {
+          session._lastUuid = record2.uuid ?? null;
+          break;
+        }
+      }
+      coveredMessages = aligned.messageCount;
+      debug(`Case 4: carried ${carriedRecords.length} native records covering ${coveredMessages}/${priorMessages.length} pi messages verbatim`);
+    } catch (error51) {
+      debug("Case 4: native prefix carry failed, converting the whole history:", error51);
+      coveredMessages = 0;
+      session = createSession({
+        projectPath: cwd,
+        claudeDir: claudeConfigDir,
+        sessionId: session.sessionId,
+        ...modelId ? { model: modelId } : {}
+      });
+    }
+  }
+  convertAndImportMessages(session, priorMessages.slice(coveredMessages), customToolNameToSdk, cwd);
   session.save();
-  verifyWrittenSession2(session.jsonlPath, session.sessionId, session.messages.length, cwd, claudeConfigDir);
-  if (carriedPromptSnapshot) {
+  verifyWrittenSession2(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
+  if (carriedPromptSnapshot && !lastPromptSnapshot(carriedRecords)) {
     const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
     debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
   }
