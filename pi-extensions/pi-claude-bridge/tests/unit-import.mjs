@@ -200,15 +200,34 @@ describe("message structure", () => {
 		assert.equal(result[0].role, "user");
 		assert.equal(result[0].content[0].type, "tool_result");
 		assert.equal(result[0].content[0].tool_use_id, "id1");
-		assert.equal(result[0].content[0].content, "result text");
-		assert.equal(result[0].content[0].is_error, false);
+		// Native CLI records: a successful MCP result is an array of text blocks
+		// and `is_error` is absent unless true (prompt-cache prefix fidelity).
+		assert.deepEqual(result[0].content[0].content, [{ type: "text", text: "result text" }]);
+		assert.equal("is_error" in result[0].content[0], false);
 	});
 
-	it("toolResult with isError=true", () => {
+	it("toolResult with isError=true serializes as a plain string like the CLI", () => {
 		const msgs = [
-			{ role: "toolResult", toolCallId: "id1", content: "oh no", isError: true },
+			{ role: "toolResult", toolCallId: "id1", content: [{ type: "text", text: "oh no" }], isError: true },
 		];
-		assert.equal(convert(msgs)[0].content[0].is_error, true);
+		const block = convert(msgs)[0].content[0];
+		assert.equal(block.is_error, true);
+		assert.equal(block.content, "oh no");
+	});
+
+	it("rebuild drops the bash timeout the bridge injected, keeping the model's original input", () => {
+		const msgs = [
+			{ role: "assistant", content: [
+				{ type: "toolCall", id: "toolu_1", name: "bash", arguments: { command: "echo hi", timeout: 120 } },
+				{ type: "toolCall", id: "toolu_2", name: "bash", arguments: { command: "sleep 1", timeout: 30 } },
+				{ type: "toolCall", id: "toolu_3", name: "read", arguments: { path: "x", timeout: 120 } },
+			] },
+			{ role: "toolResult", toolCallId: "toolu_1", content: [{ type: "text", text: "hi\n" }], isError: false },
+			{ role: "toolResult", toolCallId: "toolu_2", content: [{ type: "text", text: "" }], isError: false },
+			{ role: "toolResult", toolCallId: "toolu_3", content: [{ type: "text", text: "x" }], isError: false },
+		];
+		const inputs = convert(msgs)[0].content.filter((b) => b.type === "tool_use").map((b) => b.input);
+		assert.deepEqual(inputs, [{ command: "echo hi" }, { command: "sleep 1", timeout: 30 }, { path: "x", timeout: 120 }]);
 	});
 
 	it("multiple tool results in sequence", () => {
@@ -289,8 +308,8 @@ describe("message structure", () => {
 			result[1].content.map((block) => block.tool_use_id),
 			["t1", "t2", "t3"],
 		);
-		assert.equal(result[1].content[1].content, "second");
-		assert.equal(result[1].content[2].content, "third");
+		assert.deepEqual(result[1].content[1].content, [{ type: "text", text: "second" }]);
+		assert.deepEqual(result[1].content[2].content, [{ type: "text", text: "third" }]);
 	});
 
 	it("mixed conversation: user → assistant(tool) → toolResult → assistant(text)", () => {
@@ -366,14 +385,17 @@ describe("message structure", () => {
 		assert.equal(result[0].content[1].name, "Bash");
 	});
 
-	it("toolResult with array content extracts text", () => {
+	it("toolResult with array content keeps the text blocks the CLI recorded natively", () => {
 		const msgs = [
 			{ role: "toolResult", toolCallId: "x", content: [
 				{ type: "text", text: "line 1" },
 				{ type: "text", text: "line 2" },
 			]},
 		];
-		assert.equal(convert(msgs)[0].content[0].content, "line 1\nline 2");
+		assert.deepEqual(convert(msgs)[0].content[0].content, [
+			{ type: "text", text: "line 1" },
+			{ type: "text", text: "line 2" },
+		]);
 	});
 
 	it("toolResult with image content preserves image blocks", () => {

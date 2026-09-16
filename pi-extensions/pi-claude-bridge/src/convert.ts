@@ -68,10 +68,17 @@ function imageBlockToAnthropic(block: { data?: string; mimeType?: string }): Con
 	return { type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } } as ContentBlock;
 }
 
+// Rebuilt history must serialize the way the Claude Code CLI recorded the
+// same turn natively, or the prompt-cache prefix diverges at the first
+// difference and every later token is re-written (2x the input price on a
+// 1-hour cache). Natively, a successful MCP tool result is an ARRAY of text
+// blocks and an error result is a plain string; `is_error` is present only
+// when true. Mirror that shape here.
 function toolResultContentToAnthropic(
 	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+	isError = false,
 ): string | ContentBlock[] {
-	if (typeof content === "string") return content;
+	if (typeof content === "string") return isError ? content : content ? [{ type: "text", text: content }] : "";
 	if (!Array.isArray(content)) return "";
 	const blocks: ContentBlock[] = [];
 	for (const block of content) {
@@ -85,8 +92,25 @@ function toolResultContentToAnthropic(
 		}
 	}
 	if (blocks.length === 0) return "";
-	if (blocks.every((block) => block.type === "text")) return blocks.map((block) => (block as { text: string }).text).join("\n");
+	if (isError && blocks.every((block) => block.type === "text")) return blocks.map((block) => (block as { text: string }).text).join("\n");
 	return blocks;
+}
+
+/** `is_error` only when true, matching the CLI's native tool_result records. */
+function toolResultErrorFlag(msg: PiMessage): { is_error: true } | Record<string, never> {
+	return (msg as { isError?: boolean }).isError === true ? { is_error: true } : {};
+}
+
+// mapToolArgs adds `timeout: 120` to bash calls the model issued without one
+// (pi's bash has no default). The CLI recorded the model's ORIGINAL input, so a
+// rebuild has to drop that injected default again or the tool_use block
+// differs from the native record. A model-chosen 120 is indistinguishable and
+// is dropped too; that only affects the replayed history, never execution.
+export const INJECTED_BASH_TIMEOUT = 120;
+export function stripInjectedToolArgs(toolName: string, args: Record<string, unknown> | undefined): Record<string, unknown> {
+	const input = { ...(args ?? {}) };
+	if (toolName.toLowerCase() === "bash" && input.timeout === INJECTED_BASH_TIMEOUT) delete input.timeout;
+	return input;
 }
 
 function assistantProvenancePrefix(msg: PiMessage): string | undefined {
@@ -114,12 +138,13 @@ function userMessageToAnthropic(msg: PiMessage): SessionMessage {
 }
 
 function toolResultToAnthropicBlock(msg: PiMessage, sanitizedIds: Map<string, string>): ContentBlock {
-	const content = toolResultContentToAnthropic(msg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>);
+	const isError = (msg as { isError?: boolean }).isError === true;
+	const content = toolResultContentToAnthropic(msg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>, isError);
 	return {
 		type: "tool_result",
 		tool_use_id: sanitizeToolId((msg as { toolCallId: string }).toolCallId, sanitizedIds),
 		content: content || "",
-		is_error: (msg as { isError?: boolean }).isError,
+		...toolResultErrorFlag(msg),
 	} as ContentBlock;
 }
 
@@ -152,12 +177,13 @@ export function convertPiMessages(
 		anthropicMessages.push({
 			role: "user",
 			content: toolMessages.map((toolMsg) => {
-				const content = toolResultContentToAnthropic(toolMsg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>);
+				const isError = (toolMsg as { isError?: boolean }).isError === true;
+				const content = toolResultContentToAnthropic(toolMsg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>, isError);
 				return {
 					type: "tool_result",
 					tool_use_id: sanitizeToolId((toolMsg as { toolCallId: string }).toolCallId, sanitizedIds),
 					content: content || "",
-					is_error: (toolMsg as { isError?: boolean }).isError,
+					...toolResultErrorFlag(toolMsg),
 				};
 			}),
 		});
@@ -183,7 +209,7 @@ export function convertPiMessages(
 					}
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
+					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: stripInjectedToolArgs(block.name, block.arguments) });
 				}
 			}
 			if (!blocks.length) blocks.push({ type: "text", text: emptyAssistantPlaceholder(msg) });

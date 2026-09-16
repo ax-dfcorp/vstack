@@ -1,7 +1,7 @@
 import { type AssistantMessage, type Context } from "@earendil-works/pi-ai";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
-import { createHash } from "crypto";
-import { realpathSync, statSync } from "fs";
+import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
+import { createHash, randomUUID } from "crypto";
+import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { resolve as pathResolve } from "path";
 import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState } from "./bridge-state.js";
 import { convertPiMessages } from "./convert.js";
@@ -54,6 +54,46 @@ function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeS
 		return data as PersistedBridgeSessionState;
 	}
 	return undefined;
+}
+
+const PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
+
+/** The CLI's recorded system prompt: the LAST `prompt_snapshot` attachment in the jsonl, as the CLI itself resolves it. */
+export function readPromptSnapshotRecord(jsonlPath: string): Record<string, unknown> | undefined {
+	let text: string;
+	try { text = readFileSync(jsonlPath, "utf8"); } catch { return undefined; }
+	let found: Record<string, unknown> | undefined;
+	for (const line of text.split("\n")) {
+		if (!line.includes(`"${PROMPT_SNAPSHOT_ATTACHMENT}"`)) continue;
+		try {
+			const record = JSON.parse(line) as { type?: string; attachment?: { type?: string } };
+			if (record?.type === "attachment" && record.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) found = record.attachment as Record<string, unknown>;
+		} catch { /* skip malformed line */ }
+	}
+	return found;
+}
+
+/** Append a `prompt_snapshot` attachment as the new leaf of a freshly written jsonl, chained to its last record like the CLI writes attachments. */
+export function appendPromptSnapshotRecord(jsonlPath: string, sessionId: string, attachment: Record<string, unknown>): boolean {
+	try {
+		const text = readFileSync(jsonlPath, "utf8");
+		const lines = text.split("\n").filter((line) => line.trim().length > 0);
+		const last = lines.length > 0 ? (JSON.parse(lines[lines.length - 1]) as { uuid?: string }) : undefined;
+		const record = {
+			parentUuid: last?.uuid ?? null,
+			isSidechain: false,
+			attachment,
+			type: "attachment",
+			uuid: randomUUID(),
+			timestamp: new Date().toISOString(),
+			sessionId,
+		};
+		appendFileSync(jsonlPath, `${text.endsWith("\n") || text.length === 0 ? "" : "\n"}${JSON.stringify(record)}\n`, "utf8");
+		return true;
+	} catch (error) {
+		debug("appendPromptSnapshotRecord failed:", error);
+		return false;
+	}
 }
 
 function claudeSessionExists(sessionId: string, cwd: string, claudeConfigDir?: string): boolean {
@@ -352,6 +392,14 @@ export function syncSharedSession(
 	// Preserve a UUID only within the same credential profile. Reusing an A
 	// account session id under B can resume the wrong transcript or miss the file.
 	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// The CLI records the conversation's system prompt once (systemPromptSnapshot)
+	// and replays it verbatim on every resume. A rebuilt jsonl would lose that
+	// record, so the next launch would render a fresh prompt (new git status,
+	// re-read AGENTS.md) and miss the cache for the whole conversation. Carry
+	// the record over before the old file is deleted.
+	const carriedPromptSnapshot = sharedSession
+		? readPromptSnapshotRecord(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir))
+		: undefined;
 	if (preserveId) {
 		deleteSession(previousSessionId!, cwd, claudeConfigDir);
 	}
@@ -364,6 +412,10 @@ export function syncSharedSession(
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd, claudeConfigDir);
+	if (carriedPromptSnapshot) {
+		const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
+		debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
+	}
 	setSharedSession({
 		sessionId: session.sessionId,
 		cursor: priorMessages.length,

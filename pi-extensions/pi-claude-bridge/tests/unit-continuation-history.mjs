@@ -81,7 +81,8 @@ describe("continuation history import", () => {
 		const results = toolResultBlocks(writtenRecords(sessionId));
 		assert.equal(results.length, 1, "the tool_use must be paired with exactly one result");
 		assert.equal(results[0].tool_use_id, TOOL_CALL_ID);
-		assert.equal(results[0].content, TOOL_OUTPUT);
+		// Native CLI shape: a successful MCP result is an array of text blocks.
+		assert.deepEqual(results[0].content, [{ type: "text", text: TOOL_OUTPUT }]);
 		assert.notEqual(results[0].is_error, true);
 	});
 

@@ -1267,6 +1267,18 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		...(account ? subscriberProfileEnv(account) : process.env),
 		ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
 		DISABLE_AUTO_COMPACT: "1",
+		// Static system prompt ("carved slate"). Without it the CLI renders the
+		// claude_code preset fresh on every launch, including the git status
+		// snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
+		// this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
+		// turn is a fresh launch, so in a repository where files change between
+		// turns the system prompt differed on most resumes and the API re-wrote
+		// the whole conversation behind the ~15k static prefix. Verified
+		// 2026-09-16: with the flag off, touching one untracked file between
+		// turns cost a 199k-token cache rewrite; with it on the same turn is a
+		// full cache hit. Environment changes are then delivered to the model as
+		// an appended "# Environment update" message instead.
+		CLAUDE_CODE_CARVED_SLATE: "1",
 	};
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
@@ -1286,9 +1298,22 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			...(providerSettings.fastMode ? { fastMode: true } : {}),
 			autoMemoryEnabled: false,
 		},
+		// Every pi turn is a fresh CLI process, and with `append` set the CLI's
+		// default is to re-render the claude_code preset on every launch. The
+		// preset carries per-launch state (the git status snapshot, tool
+		// descriptions), so in a repository where files change between turns the
+		// system prompt differed on almost every resume and the API re-wrote the
+		// whole conversation behind it: 58% of new-turn first responses on Fable
+		// 5.1 read only the ~15k static prefix and re-cached everything after it
+		// (2026-09-16 audit of 7,324 turns). Recording the prompt once and
+		// replaying it verbatim on every later request keeps the prefix stable;
+		// the appended AGENTS.md/skills text is then frozen until compaction,
+		// which is also how the CLI treats CLAUDE.md. (`snapshot` is forwarded by
+		// the SDK as the initialize request's `systemPromptSnapshot`.)
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
+			snapshot: true,
 		},
 		extraArgs,
 		...(strictMcpConfigEnabled ? { strictMcpConfig: true } : {}),

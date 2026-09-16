@@ -36173,8 +36173,8 @@ function imageBlockToAnthropic(block) {
   if (!block.data || !block.mimeType) return void 0;
   return { type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } };
 }
-function toolResultContentToAnthropic(content) {
-  if (typeof content === "string") return content;
+function toolResultContentToAnthropic(content, isError = false) {
+  if (typeof content === "string") return isError ? content : content ? [{ type: "text", text: content }] : "";
   if (!Array.isArray(content)) return "";
   const blocks = [];
   for (const block of content) {
@@ -36188,8 +36188,17 @@ function toolResultContentToAnthropic(content) {
     }
   }
   if (blocks.length === 0) return "";
-  if (blocks.every((block) => block.type === "text")) return blocks.map((block) => block.text).join("\n");
+  if (isError && blocks.every((block) => block.type === "text")) return blocks.map((block) => block.text).join("\n");
   return blocks;
+}
+function toolResultErrorFlag(msg) {
+  return msg.isError === true ? { is_error: true } : {};
+}
+var INJECTED_BASH_TIMEOUT = 120;
+function stripInjectedToolArgs(toolName, args) {
+  const input = { ...args ?? {} };
+  if (toolName.toLowerCase() === "bash" && input.timeout === INJECTED_BASH_TIMEOUT) delete input.timeout;
+  return input;
 }
 function assistantProvenancePrefix(msg) {
   if (msg.role !== "assistant") return void 0;
@@ -36215,12 +36224,13 @@ function userMessageToAnthropic(msg) {
   return { role: "user", content: "[empty]" };
 }
 function toolResultToAnthropicBlock(msg, sanitizedIds) {
-  const content = toolResultContentToAnthropic(msg.content);
+  const isError = msg.isError === true;
+  const content = toolResultContentToAnthropic(msg.content, isError);
   return {
     type: "tool_result",
     tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds),
     content: content || "",
-    is_error: msg.isError
+    ...toolResultErrorFlag(msg)
   };
 }
 function hasToolUse(msg) {
@@ -36242,12 +36252,13 @@ function convertPiMessages(messages, customToolNameToSdk) {
     anthropicMessages.push({
       role: "user",
       content: toolMessages.map((toolMsg) => {
-        const content = toolResultContentToAnthropic(toolMsg.content);
+        const isError = toolMsg.isError === true;
+        const content = toolResultContentToAnthropic(toolMsg.content, isError);
         return {
           type: "tool_result",
           tool_use_id: sanitizeToolId(toolMsg.toolCallId, sanitizedIds),
           content: content || "",
-          is_error: toolMsg.isError
+          ...toolResultErrorFlag(toolMsg)
         };
       })
     });
@@ -36272,7 +36283,7 @@ function convertPiMessages(messages, customToolNameToSdk) {
           }
         } else if (block.type === "toolCall") {
           const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-          blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
+          blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: stripInjectedToolArgs(block.name, block.arguments) });
         }
       }
       if (!blocks.length) blocks.push({ type: "text", text: emptyAssistantPlaceholder(msg) });
@@ -53043,8 +53054,8 @@ function readSession(jsonlPath, projectPath) {
 }
 
 // src/session-persistence.ts
-import { createHash as createHash2 } from "crypto";
-import { realpathSync as realpathSync4, statSync as statSync4 } from "fs";
+import { createHash as createHash2, randomUUID as randomUUID3 } from "crypto";
+import { appendFileSync as appendFileSync4, readFileSync as readFileSync9, realpathSync as realpathSync4, statSync as statSync4 } from "fs";
 import { resolve as pathResolve } from "path";
 
 // src/session-verify.ts
@@ -53151,6 +53162,47 @@ function latestPersistedBridgeSession(sessionManager) {
     return data;
   }
   return void 0;
+}
+var PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
+function readPromptSnapshotRecord(jsonlPath) {
+  let text;
+  try {
+    text = readFileSync9(jsonlPath, "utf8");
+  } catch {
+    return void 0;
+  }
+  let found;
+  for (const line of text.split("\n")) {
+    if (!line.includes(`"${PROMPT_SNAPSHOT_ATTACHMENT}"`)) continue;
+    try {
+      const record2 = JSON.parse(line);
+      if (record2?.type === "attachment" && record2.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) found = record2.attachment;
+    } catch {
+    }
+  }
+  return found;
+}
+function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
+  try {
+    const text = readFileSync9(jsonlPath, "utf8");
+    const lines = text.split("\n").filter((line) => line.trim().length > 0);
+    const last = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : void 0;
+    const record2 = {
+      parentUuid: last?.uuid ?? null,
+      isSidechain: false,
+      attachment,
+      type: "attachment",
+      uuid: randomUUID3(),
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      sessionId
+    };
+    appendFileSync4(jsonlPath, `${text.endsWith("\n") || text.length === 0 ? "" : "\n"}${JSON.stringify(record2)}
+`, "utf8");
+    return true;
+  } catch (error51) {
+    debug("appendPromptSnapshotRecord failed:", error51);
+    return false;
+  }
 }
 function claudeSessionExists(sessionId, cwd, claudeConfigDir) {
   try {
@@ -53344,6 +53396,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   const previousSessionId = sameAccount ? sharedSession?.sessionId : void 0;
   const previousCursor = sameAccount ? sharedSession?.cursor ?? 0 : 0;
   const preserveId = previousSessionId !== void 0 && !sharedSession?.forceRotate;
+  const carriedPromptSnapshot = sharedSession ? readPromptSnapshotRecord(getSessionPath(sharedSession.sessionId, normalizeProjectPath(sharedSession.cwd), sharedSession.claudeConfigDir)) : void 0;
   if (preserveId) {
     deleteSession(previousSessionId, cwd, claudeConfigDir);
   }
@@ -53356,6 +53409,10 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
   session.save();
   verifyWrittenSession2(session.jsonlPath, session.sessionId, session.messages.length, cwd, claudeConfigDir);
+  if (carriedPromptSnapshot) {
+    const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
+    debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
+  }
   setSharedSession({
     sessionId: session.sessionId,
     cursor: priorMessages.length,
@@ -54986,7 +55043,19 @@ function streamClaudeAgentSdk(model, context, options) {
   const childEnv = {
     ...account ? subscriberProfileEnv(account) : process.env,
     ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
-    DISABLE_AUTO_COMPACT: "1"
+    DISABLE_AUTO_COMPACT: "1",
+    // Static system prompt ("carved slate"). Without it the CLI renders the
+    // claude_code preset fresh on every launch, including the git status
+    // snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
+    // this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
+    // turn is a fresh launch, so in a repository where files change between
+    // turns the system prompt differed on most resumes and the API re-wrote
+    // the whole conversation behind the ~15k static prefix. Verified
+    // 2026-09-16: with the flag off, touching one untracked file between
+    // turns cost a 199k-token cache rewrite; with it on the same turn is a
+    // full cache hit. Environment changes are then delivered to the model as
+    // an appended "# Environment update" message instead.
+    CLAUDE_CODE_CARVED_SLATE: "1"
   };
   const queryOptions = {
     cwd,
@@ -55006,10 +55075,23 @@ function streamClaudeAgentSdk(model, context, options) {
       ...providerSettings.fastMode ? { fastMode: true } : {},
       autoMemoryEnabled: false
     },
+    // Every pi turn is a fresh CLI process, and with `append` set the CLI's
+    // default is to re-render the claude_code preset on every launch. The
+    // preset carries per-launch state (the git status snapshot, tool
+    // descriptions), so in a repository where files change between turns the
+    // system prompt differed on almost every resume and the API re-wrote the
+    // whole conversation behind it: 58% of new-turn first responses on Fable
+    // 5.1 read only the ~15k static prefix and re-cached everything after it
+    // (2026-09-16 audit of 7,324 turns). Recording the prompt once and
+    // replaying it verbatim on every later request keeps the prefix stable;
+    // the appended AGENTS.md/skills text is then frozen until compaction,
+    // which is also how the CLI treats CLAUDE.md. (`snapshot` is forwarded by
+    // the SDK as the initialize request's `systemPromptSnapshot`.)
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
-      append: systemPromptAppend ? systemPromptAppend : void 0
+      append: systemPromptAppend ? systemPromptAppend : void 0,
+      snapshot: true
     },
     extraArgs,
     ...strictMcpConfigEnabled ? { strictMcpConfig: true } : {},
