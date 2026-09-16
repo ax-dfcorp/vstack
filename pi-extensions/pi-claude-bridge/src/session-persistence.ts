@@ -86,6 +86,85 @@ export function readPromptSnapshotRecord(jsonlPath: string): Record<string, unkn
 	return records ? lastPromptSnapshot(records) : undefined;
 }
 
+const BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "The following skills provide specialized instructions"];
+
+/**
+ * The CLI replays a recorded prompt verbatim, which also freezes the block
+ * this bridge appends (AGENTS.md + pi's skills list). Before the snapshot,
+ * every launch re-read AGENTS.md, so an edit applied on the next turn. Keep
+ * that: when the current append text differs from the recorded block, return
+ * a copy of the snapshot with the block replaced. The rest of the record
+ * (the CLI's own sections, tool descriptions) is untouched. Returns undefined
+ * when nothing needs to change or the block cannot be identified.
+ */
+export function refreshSnapshotAppend(
+	snapshot: Record<string, unknown>,
+	appendText: string | undefined,
+): Record<string, unknown> | undefined {
+	const blocks = snapshot.systemPrompt;
+	if (!Array.isArray(blocks) || !appendText) return undefined;
+	let index = -1;
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		const block = blocks[i];
+		if (typeof block !== "string") continue;
+		if (BRIDGE_APPEND_MARKERS.some((marker) => block.includes(marker))) { index = i; break; }
+	}
+	if (index < 0) return undefined;
+	if (blocks[index] === appendText) return undefined;
+	const next = [...blocks];
+	next[index] = appendText;
+	return { ...snapshot, systemPrompt: next };
+}
+
+// One read per process per (session, append text): the jsonl can be tens of
+// megabytes, and the append only changes when AGENTS.md or a skill does.
+const ensuredAppend = new Map<string, string>();
+
+/** Make sure the session's recorded prompt carries the current bridge append; appends a refreshed record when it does not. */
+export function ensurePromptSnapshotAppend(jsonlPath: string, sessionId: string, appendText: string | undefined): void {
+	if (!appendText) return;
+	const key = `${jsonlPath}`;
+	const digest = createHash("sha256").update(appendText).digest("hex");
+	if (ensuredAppend.get(key) === digest) return;
+	const records = readSessionRecords(jsonlPath);
+	if (!records) return;
+	const snapshot = lastPromptSnapshot(records);
+	if (!snapshot) { ensuredAppend.set(key, digest); return; }
+	const refreshed = refreshSnapshotAppend(snapshot, appendText);
+	if (refreshed) {
+		const ok = appendPromptSnapshotRecord(jsonlPath, sessionId, refreshed);
+		debug(`ensurePromptSnapshotAppend: ${ok ? "refreshed" : "FAILED to refresh"} the recorded append block for ${sessionId.slice(0, 8)} (AGENTS.md or skills changed)`);
+		if (!ok) return;
+	}
+	ensuredAppend.set(key, digest);
+}
+
+/**
+ * After a rebuild that carried native records, prove the uuid chain is intact
+ * before the CLI reads it: every chained record's parent must appear earlier
+ * in the file, and the first converted record must parent to the last carried
+ * message. A broken chain makes the CLI resume with an empty conversation.
+ */
+export function verifyRecordChain(jsonlPath: string): string | undefined {
+	const records = readSessionRecords(jsonlPath);
+	if (!records) return "unreadable";
+	const seen = new Set<string>();
+	let chained = 0;
+	for (const record of records) {
+		if (record.type !== "user" && record.type !== "assistant" && record.type !== "attachment") continue;
+		if (typeof record.uuid !== "string") return `record without uuid (${record.type})`;
+		const parent = record.parentUuid;
+		if (parent != null) {
+			if (!seen.has(parent)) return `dangling parent ${String(parent).slice(0, 8)} on ${record.type} ${record.uuid.slice(0, 8)}`;
+		} else if (chained > 0) {
+			return `second chain root at ${record.type} ${record.uuid.slice(0, 8)}`;
+		}
+		seen.add(record.uuid);
+		chained++;
+	}
+	return undefined;
+}
+
 function recordText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -184,11 +263,13 @@ export function alignNativePrefix(
 			break;
 		}
 		const next = messages[p + 1] as any;
-		// A cut is safe before the next user prompt, or at the end of history
-		// when no tool_use is still waiting for its result (an aborted turn's
-		// tool calls are left to the converter, which pairs them explicitly).
-		const atCleanEnd = next === undefined && !openToolCalls;
-		if (msg.role !== "user" && ((next !== undefined && next.role === "user") || atCleanEnd)) best = { recordCount: r, messageCount: p + 1 };
+		// A cut is safe only where no tool_use is still waiting for its result:
+		// before the next user prompt, or at the end of history. A steer that pi
+		// slipped in between a tool call and its results is a user message with
+		// open calls and must not become a cut, or the carried prefix would end
+		// with an unpaired tool_use the converter never sees. An aborted turn's
+		// open calls are likewise left to the converter, which pairs them.
+		if (msg.role !== "user" && !openToolCalls && (next === undefined || next.role === "user")) best = { recordCount: r, messageCount: p + 1 };
 	}
 	return best;
 }
@@ -474,6 +555,8 @@ export function syncSharedSession(
 	 *  its tool_use unpaired and the repair layer would replace a real result
 	 *  with a synthetic error. */
 	dropTrailing = 1,
+	/** The bridge's current system-prompt append (AGENTS.md + skills), so a recorded prompt can be kept in sync with edits. */
+	systemPromptAppend?: string,
 ): SyncResult {
 	const priorMessages = messages.slice(0, messages.length - dropTrailing);
 	const accountProfileId = account?.accountProfileId;
@@ -496,6 +579,7 @@ export function syncSharedSession(
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
+			ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
 			return { sessionId: sharedSession.sessionId };
 		}
 	}
@@ -538,6 +622,7 @@ export function syncSharedSession(
 	let coveredMessages = 0;
 	if (carriedRecords.length > 0) {
 		try {
+			if (!("_lastUuid" in (session as object))) throw new Error("cc-session-io Session no longer exposes _lastUuid; cannot chain a converted tail after carried records");
 			for (const record of carriedRecords) session.dangerousAppendRecord(record as JsonlRecord);
 			// dangerousAppendRecord deliberately does not advance the uuid chain;
 			// the converted tail must parent to the last carried message or the
@@ -567,10 +652,28 @@ export function syncSharedSession(
 	convertAndImportMessages(session, priorMessages.slice(coveredMessages), customToolNameToSdk, cwd);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
-	if (carriedPromptSnapshot && !lastPromptSnapshot(carriedRecords)) {
+	if (coveredMessages > 0) {
+		const chainProblem = verifyRecordChain(session.jsonlPath);
+		if (chainProblem) {
+			// Never hand the CLI a file it would resume as an empty conversation:
+			// rewrite it the old way, from pi history alone.
+			debug(`Case 4: carried prefix failed chain verification (${chainProblem}); rewriting ${session.sessionId.slice(0, 8)} from pi history`);
+			diagDump("native_prefix_carry_rejected", { reason: chainProblem, carried: carriedRecords.length, covered: coveredMessages, sessionId: session.sessionId });
+			deleteSession(session.sessionId, cwd, claudeConfigDir);
+			session = createSession({ projectPath: cwd, claudeDir: claudeConfigDir, sessionId: session.sessionId, ...(modelId ? { model: modelId } : {}) });
+			convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
+			session.save();
+			verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
+			coveredMessages = 0;
+		}
+	}
+	const carriedIncludesSnapshot = coveredMessages > 0 && Boolean(lastPromptSnapshot(carriedRecords));
+	if (carriedPromptSnapshot && !carriedIncludesSnapshot) {
 		const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
 		debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
 	}
+	ensuredAppend.delete(session.jsonlPath);
+	ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
 	setSharedSession({
 		sessionId: session.sessionId,
 		cursor: priorMessages.length,

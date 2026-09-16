@@ -53188,6 +53188,65 @@ function lastPromptSnapshot(records) {
   }
   return void 0;
 }
+var BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "The following skills provide specialized instructions"];
+function refreshSnapshotAppend(snapshot, appendText) {
+  const blocks = snapshot.systemPrompt;
+  if (!Array.isArray(blocks) || !appendText) return void 0;
+  let index = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (typeof block !== "string") continue;
+    if (BRIDGE_APPEND_MARKERS.some((marker) => block.includes(marker))) {
+      index = i;
+      break;
+    }
+  }
+  if (index < 0) return void 0;
+  if (blocks[index] === appendText) return void 0;
+  const next = [...blocks];
+  next[index] = appendText;
+  return { ...snapshot, systemPrompt: next };
+}
+var ensuredAppend = /* @__PURE__ */ new Map();
+function ensurePromptSnapshotAppend(jsonlPath, sessionId, appendText) {
+  if (!appendText) return;
+  const key = `${jsonlPath}`;
+  const digest = createHash2("sha256").update(appendText).digest("hex");
+  if (ensuredAppend.get(key) === digest) return;
+  const records = readSessionRecords(jsonlPath);
+  if (!records) return;
+  const snapshot = lastPromptSnapshot(records);
+  if (!snapshot) {
+    ensuredAppend.set(key, digest);
+    return;
+  }
+  const refreshed = refreshSnapshotAppend(snapshot, appendText);
+  if (refreshed) {
+    const ok = appendPromptSnapshotRecord(jsonlPath, sessionId, refreshed);
+    debug(`ensurePromptSnapshotAppend: ${ok ? "refreshed" : "FAILED to refresh"} the recorded append block for ${sessionId.slice(0, 8)} (AGENTS.md or skills changed)`);
+    if (!ok) return;
+  }
+  ensuredAppend.set(key, digest);
+}
+function verifyRecordChain(jsonlPath) {
+  const records = readSessionRecords(jsonlPath);
+  if (!records) return "unreadable";
+  const seen = /* @__PURE__ */ new Set();
+  let chained = 0;
+  for (const record2 of records) {
+    if (record2.type !== "user" && record2.type !== "assistant" && record2.type !== "attachment") continue;
+    if (typeof record2.uuid !== "string") return `record without uuid (${record2.type})`;
+    const parent = record2.parentUuid;
+    if (parent != null) {
+      if (!seen.has(parent)) return `dangling parent ${String(parent).slice(0, 8)} on ${record2.type} ${record2.uuid.slice(0, 8)}`;
+    } else if (chained > 0) {
+      return `second chain root at ${record2.type} ${record2.uuid.slice(0, 8)}`;
+    }
+    seen.add(record2.uuid);
+    chained++;
+  }
+  return void 0;
+}
 function recordText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -53266,8 +53325,7 @@ function alignNativePrefix(records, messages) {
       break;
     }
     const next = messages[p + 1];
-    const atCleanEnd = next === void 0 && !openToolCalls;
-    if (msg.role !== "user" && (next !== void 0 && next.role === "user" || atCleanEnd)) best = { recordCount: r, messageCount: p + 1 };
+    if (msg.role !== "user" && !openToolCalls && (next === void 0 || next.role === "user")) best = { recordCount: r, messageCount: p + 1 };
   }
   return best;
 }
@@ -53457,7 +53515,7 @@ function debugSessionPaths(label, cwd, jsonlPath, claudeConfigDir) {
   debug(`${label}: fileExists=${fileExists}${fileSize != null ? ` size=${fileSize}` : ""}`);
   debug(`${label}: selected.CLAUDE_CONFIG_DIR=${claudeConfigDir ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
 }
-function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account, dropTrailing = 1) {
+function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account, dropTrailing = 1, systemPromptAppend) {
   const priorMessages = messages.slice(0, messages.length - dropTrailing);
   const accountProfileId = account?.accountProfileId;
   const claudeConfigDir = account?.claudeConfigDir;
@@ -53473,6 +53531,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
       }
       debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
       debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
+      ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
       return { sessionId: sharedSession.sessionId };
     }
   }
@@ -53501,6 +53560,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   let coveredMessages = 0;
   if (carriedRecords.length > 0) {
     try {
+      if (!("_lastUuid" in session)) throw new Error("cc-session-io Session no longer exposes _lastUuid; cannot chain a converted tail after carried records");
       for (const record2 of carriedRecords) session.dangerousAppendRecord(record2);
       for (let i = carriedRecords.length - 1; i >= 0; i--) {
         const record2 = carriedRecords[i];
@@ -53525,10 +53585,26 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   convertAndImportMessages(session, priorMessages.slice(coveredMessages), customToolNameToSdk, cwd);
   session.save();
   verifyWrittenSession2(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
-  if (carriedPromptSnapshot && !lastPromptSnapshot(carriedRecords)) {
+  if (coveredMessages > 0) {
+    const chainProblem = verifyRecordChain(session.jsonlPath);
+    if (chainProblem) {
+      debug(`Case 4: carried prefix failed chain verification (${chainProblem}); rewriting ${session.sessionId.slice(0, 8)} from pi history`);
+      diagDump("native_prefix_carry_rejected", { reason: chainProblem, carried: carriedRecords.length, covered: coveredMessages, sessionId: session.sessionId });
+      deleteSession(session.sessionId, cwd, claudeConfigDir);
+      session = createSession({ projectPath: cwd, claudeDir: claudeConfigDir, sessionId: session.sessionId, ...modelId ? { model: modelId } : {} });
+      convertAndImportMessages(session, priorMessages, customToolNameToSdk, cwd);
+      session.save();
+      verifyWrittenSession2(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeConfigDir);
+      coveredMessages = 0;
+    }
+  }
+  const carriedIncludesSnapshot = coveredMessages > 0 && Boolean(lastPromptSnapshot(carriedRecords));
+  if (carriedPromptSnapshot && !carriedIncludesSnapshot) {
     const carried = appendPromptSnapshotRecord(session.jsonlPath, session.sessionId, carriedPromptSnapshot);
     debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
   }
+  ensuredAppend.delete(session.jsonlPath);
+  ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
   setSharedSession({
     sessionId: session.sessionId,
     cursor: priorMessages.length,
@@ -55150,7 +55226,8 @@ function streamClaudeAgentSdk(model, context, options) {
     customToolNameToSdk,
     queryModel.id,
     accountSessionScope(account),
-    isContinuation ? 0 : 1
+    isContinuation ? 0 : 1,
+    systemPromptAppend
   );
   const requestedEffort = options?.reasoning ? queryModel.thinkingLevelMap?.[options.reasoning] ?? REASONING_TO_EFFORT[options.reasoning] : void 0;
   const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);

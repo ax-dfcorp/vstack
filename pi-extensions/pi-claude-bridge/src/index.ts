@@ -1232,6 +1232,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		queryModel.id,
 		accountSessionScope(account),
 		isContinuation ? 0 : 1,
+		systemPromptAppend,
 	);
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships

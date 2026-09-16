@@ -3,7 +3,10 @@
 // record that is not provably the same conversation.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { alignNativePrefix } from "../src/session-persistence.js";
+import { alignNativePrefix, refreshSnapshotAppend, verifyRecordChain } from "../src/session-persistence.js";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const user = (text) => ({ type: "user", uuid: `u-${text}`, message: { role: "user", content: text } });
 const attachment = (type) => ({ type: "attachment", uuid: `a-${type}`, attachment: { type, text: "<total_tokens>1 tokens left</total_tokens>" } });
@@ -97,5 +100,60 @@ describe("alignNativePrefix", () => {
 		const records = [user("q"), assistantToolUse("m1", "toolu_1")];
 		const messages = [piUser("q"), piAssistant("", ["toolu_1"]), piToolResult("toolu_1", "o")];
 		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 0, messageCount: 0 });
+	});
+
+	it("does not cut at a steer that arrived while a tool call was still open", () => {
+		const records = [user("q"), assistantToolUse("m1", "toolu_1"), user("steer now")];
+		const messages = [piUser("q"), piAssistant("", ["toolu_1"]), piUser("steer now")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 0, messageCount: 0 });
+	});
+
+	it("carries a steer between a tool call and its results once the results are paired", () => {
+		const records = [user("q"), assistantToolUse("m1", "toolu_1"), user("steer now"), toolResult("toolu_1", "o"), assistantText("m2", "a")];
+		const messages = [piUser("q"), piAssistant("", ["toolu_1"]), piUser("steer now"), piToolResult("toolu_1", "o"), piAssistant("a")];
+		assert.deepEqual(alignNativePrefix(records, messages), { recordCount: 5, messageCount: 5 });
+	});
+});
+
+describe("refreshSnapshotAppend", () => {
+	const snapshot = { systemPrompt: ["core", "# Environment\n - x", "<total_tokens>15000000 tokens left</total_tokens>", "# CLAUDE.md\n\nold agents text"], tools: [{ name: "t", description: "d" }] };
+
+	it("replaces only the bridge's append block when AGENTS.md changed", () => {
+		const out = refreshSnapshotAppend(snapshot, "# CLAUDE.md\n\nnew agents text");
+		assert.deepEqual(out.systemPrompt, ["core", "# Environment\n - x", "<total_tokens>15000000 tokens left</total_tokens>", "# CLAUDE.md\n\nnew agents text"]);
+		assert.deepEqual(out.tools, snapshot.tools);
+	});
+
+	it("is a no-op when the recorded block already matches", () => {
+		assert.equal(refreshSnapshotAppend(snapshot, "# CLAUDE.md\n\nold agents text"), undefined);
+	});
+
+	it("leaves a snapshot without a recognizable append block alone", () => {
+		assert.equal(refreshSnapshotAppend({ systemPrompt: ["core only"] }, "# CLAUDE.md\n\nx"), undefined);
+		assert.equal(refreshSnapshotAppend(snapshot, undefined), undefined);
+	});
+});
+
+describe("verifyRecordChain", () => {
+	function write(lines) {
+		const dir = mkdtempSync(join(tmpdir(), "chain-"));
+		const path = join(dir, "s.jsonl");
+		writeFileSync(path, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+		return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+	}
+
+	it("accepts a file whose chained records all parent to an earlier record", () => {
+		const f = write([{ type: "queue-operation" }, { type: "user", uuid: "a", parentUuid: null }, { type: "attachment", uuid: "b", parentUuid: "a" }, { type: "assistant", uuid: "c", parentUuid: "b" }]);
+		try { assert.equal(verifyRecordChain(f.path), undefined); } finally { f.cleanup(); }
+	});
+
+	it("rejects a converted tail that started a second chain root", () => {
+		const f = write([{ type: "user", uuid: "a", parentUuid: null }, { type: "assistant", uuid: "b", parentUuid: "a" }, { type: "user", uuid: "c", parentUuid: null }]);
+		try { assert.match(verifyRecordChain(f.path), /second chain root/); } finally { f.cleanup(); }
+	});
+
+	it("rejects a dangling parent", () => {
+		const f = write([{ type: "user", uuid: "a", parentUuid: null }, { type: "assistant", uuid: "b", parentUuid: "zzz" }]);
+		try { assert.match(verifyRecordChain(f.path), /dangling parent/); } finally { f.cleanup(); }
 	});
 });
