@@ -3,8 +3,8 @@
 // record that is not provably the same conversation.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { alignNativePrefix, refreshSnapshotAppend, verifyRecordChain } from "../src/session-persistence.js";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { alignNativePrefix, appendPromptSnapshotRecord, refreshSnapshotAppend, verifyRecordChain } from "../src/session-persistence.js";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -155,5 +155,28 @@ describe("verifyRecordChain", () => {
 	it("rejects a dangling parent", () => {
 		const f = write([{ type: "user", uuid: "a", parentUuid: null }, { type: "assistant", uuid: "b", parentUuid: "zzz" }]);
 		try { assert.match(verifyRecordChain(f.path), /dangling parent/); } finally { f.cleanup(); }
+	});
+
+	it("ignores subagent sidechain roots", () => {
+		const f = write([{ type: "user", uuid: "a", parentUuid: null }, { type: "user", uuid: "s", parentUuid: null, isSidechain: true }, { type: "assistant", uuid: "b", parentUuid: "a" }]);
+		try { assert.equal(verifyRecordChain(f.path), undefined); } finally { f.cleanup(); }
+	});
+
+	it("appendPromptSnapshotRecord parents to the last chained record, not to trailing bookkeeping lines", () => {
+		const f = write([
+			{ type: "user", uuid: "a", parentUuid: null },
+			{ type: "assistant", uuid: "b", parentUuid: "a" },
+			{ type: "last-prompt", lastPrompt: "x" },
+			{ type: "atis-latch", atis: "" },
+		]);
+		try {
+			assert.equal(appendPromptSnapshotRecord(f.path, "sid", { type: "prompt_snapshot", systemPrompt: ["p"] }), true);
+			const lines = readFileSync(f.path, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+			const appended = lines.at(-1);
+			assert.equal(appended.type, "attachment");
+			assert.equal(appended.parentUuid, "b");
+			assert.equal(appended.sessionId, "sid");
+			assert.equal(verifyRecordChain(f.path), undefined);
+		} finally { f.cleanup(); }
 	});
 });

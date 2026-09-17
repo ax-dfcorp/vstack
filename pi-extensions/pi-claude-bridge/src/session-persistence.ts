@@ -152,6 +152,8 @@ export function verifyRecordChain(jsonlPath: string): string | undefined {
 	let chained = 0;
 	for (const record of records) {
 		if (record.type !== "user" && record.type !== "assistant" && record.type !== "attachment") continue;
+		// Subagent sidechains have their own roots by design.
+		if (record.isSidechain === true) continue;
 		if (typeof record.uuid !== "string") return `record without uuid (${record.type})`;
 		const parent = record.parentUuid;
 		if (parent != null) {
@@ -279,9 +281,26 @@ export function appendPromptSnapshotRecord(jsonlPath: string, sessionId: string,
 	try {
 		const text = readFileSync(jsonlPath, "utf8");
 		const lines = text.split("\n").filter((line) => line.trim().length > 0);
-		const last = lines.length > 0 ? (JSON.parse(lines[lines.length - 1]) as { uuid?: string }) : undefined;
+		// Parent to the last CHAINED record. A native file almost always ends with
+		// bookkeeping lines that carry no uuid (`last-prompt`, `atis-latch`,
+		// `mode`: 199 of 200 files sampled 2026-09-17); parenting to those would
+		// make the attachment a second chain root and the CLI could resume with
+		// an empty conversation.
+		let parentUuid: string | null = null;
+		for (let i = lines.length - 1; i >= 0; i--) {
+			let candidate: { type?: string; uuid?: string; isSidechain?: boolean };
+			try { candidate = JSON.parse(lines[i]); } catch { continue; }
+			if ((candidate.type === "user" || candidate.type === "assistant" || candidate.type === "attachment") && typeof candidate.uuid === "string" && !candidate.isSidechain) {
+				parentUuid = candidate.uuid;
+				break;
+			}
+		}
+		if (parentUuid === null && lines.length > 0) {
+			debug("appendPromptSnapshotRecord: no chained record to parent to; skipping");
+			return false;
+		}
 		const record = {
-			parentUuid: last?.uuid ?? null,
+			parentUuid,
 			isSidechain: false,
 			attachment,
 			type: "attachment",

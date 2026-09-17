@@ -53235,6 +53235,7 @@ function verifyRecordChain(jsonlPath) {
   let chained = 0;
   for (const record2 of records) {
     if (record2.type !== "user" && record2.type !== "assistant" && record2.type !== "attachment") continue;
+    if (record2.isSidechain === true) continue;
     if (typeof record2.uuid !== "string") return `record without uuid (${record2.type})`;
     const parent = record2.parentUuid;
     if (parent != null) {
@@ -53333,9 +53334,25 @@ function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
   try {
     const text = readFileSync9(jsonlPath, "utf8");
     const lines = text.split("\n").filter((line) => line.trim().length > 0);
-    const last = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : void 0;
+    let parentUuid = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let candidate;
+      try {
+        candidate = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+      if ((candidate.type === "user" || candidate.type === "assistant" || candidate.type === "attachment") && typeof candidate.uuid === "string" && !candidate.isSidechain) {
+        parentUuid = candidate.uuid;
+        break;
+      }
+    }
+    if (parentUuid === null && lines.length > 0) {
+      debug("appendPromptSnapshotRecord: no chained record to parent to; skipping");
+      return false;
+    }
     const record2 = {
-      parentUuid: last?.uuid ?? null,
+      parentUuid,
       isSidechain: false,
       attachment,
       type: "attachment",
