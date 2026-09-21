@@ -25,6 +25,35 @@ export interface SessionState {
 	// this — there's no concurrent CC writer during those events, so
 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// Why needsRebuild was set (compact, tree, abort, stream-idle-timeout,
+	// context-length, a tool-result mismatch reason). Copied into `lastSync` when
+	// the rebuild happens so the pi session records why the cache was lost.
+	rebuildReason?: string;
+	// How the last syncSharedSession call resolved. Persisted with the
+	// `claude-bridge-session` entry so a prompt-cache post-mortem can attribute
+	// every cache miss from the pi session file alone: `reuse` resumes the CLI's
+	// own transcript (cache-safe), `rebuild` rewrites it from pi history.
+	lastSync?: SyncAudit;
+}
+
+export interface SyncAudit {
+	path: "clean" | "reuse" | "rebuild";
+	/** Rebuild trigger: `first`, `drift` (pi history ahead of the cursor), `account-rotation`, or the recorded rebuildReason. */
+	reason?: string;
+	/** pi messages imported (rebuild) or covered by the cursor (reuse). */
+	priors?: number;
+	/** pi messages past the cursor that forced the rebuild. */
+	missed?: number;
+	/** Native CLI records carried verbatim and the pi messages they covered. */
+	carried?: number;
+	covered?: number;
+	/** A fresh Claude session id was taken (post-abort or account rotation). */
+	rotated?: boolean;
+	/** Number of pi tools declared to the CLI this turn; a change invalidates the whole prompt cache. */
+	tools?: number;
+	/** First 12 hex chars of the sha256 of the appended system prompt (AGENTS.md, memory, skills). */
+	appendDigest?: string;
+	at: string;
 }
 
 // Shared mutable bridge state. Lives in its own module so the extracted
@@ -137,7 +166,7 @@ export function reportToolResultMismatch(
 		if (!hasMismatch) return false;
 		queryCtx.reportedToolResultMismatch = true;
 		if (sharedSession) {
-			sharedSession = { ...sharedSession, needsRebuild: true, ...(opts.forceRotate ? { forceRotate: true } : {}) };
+			sharedSession = { ...sharedSession, needsRebuild: true, rebuildReason: `tool-result-mismatch:${reason}`, ...(opts.forceRotate ? { forceRotate: true } : {}) };
 		}
 		if (opts.expectedInterruption) {
 			debug(

@@ -3,7 +3,7 @@ import { createSession, deleteSession, getSessionPath, normalizeProjectPath, ope
 import { createHash, randomUUID } from "crypto";
 import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { resolve as pathResolve } from "path";
-import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState } from "./bridge-state.js";
+import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState, type SyncAudit } from "./bridge-state.js";
 import { convertPiMessages, sanitizeToolId } from "./convert.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -121,6 +121,34 @@ export function refreshSnapshotAppend(
 const ensuredAppend = new Map<string, string>();
 
 /** Make sure the session's recorded prompt carries the current bridge append; appends a refreshed record when it does not. */
+/**
+ * The audit of a clean start cannot be attached to `sharedSession` (there is
+ * none yet); the provider picks it up when the CLI reports the new session id.
+ */
+export let pendingCleanStartAudit: SyncAudit | undefined;
+export function takePendingCleanStartAudit(): SyncAudit | undefined {
+	const audit = pendingCleanStartAudit;
+	pendingCleanStartAudit = undefined;
+	return audit;
+}
+
+function syncAudit(
+	path: SyncAudit["path"],
+	detail: Omit<SyncAudit, "path" | "at" | "tools" | "appendDigest">,
+	customToolNameToSdk: Map<string, string> | undefined,
+	systemPromptAppend: string | undefined,
+): SyncAudit {
+	// The map holds the exact name and its lowercase alias for every tool.
+	const tools = customToolNameToSdk ? new Set(customToolNameToSdk.values()).size : undefined;
+	return {
+		path,
+		...detail,
+		...(tools !== undefined ? { tools } : {}),
+		...(systemPromptAppend ? { appendDigest: createHash("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {}),
+		at: new Date().toISOString(),
+	};
+}
+
 export function ensurePromptSnapshotAppend(jsonlPath: string, sessionId: string, appendText: string | undefined): void {
 	if (!appendText) return;
 	const key = `${jsonlPath}`;
@@ -593,9 +621,11 @@ export function syncSharedSession(
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
-			if (trailingAssistantOnly) {
-				setSharedSession({ ...sharedSession, cursor: priorMessages.length, cwd });
-			}
+			setSharedSession({
+				...sharedSession,
+				...(trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {}),
+				lastSync: syncAudit("reuse", { priors: priorMessages.length }, customToolNameToSdk, systemPromptAppend),
+			});
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
 			ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
@@ -607,8 +637,16 @@ export function syncSharedSession(
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages, account=${accountProfileId ?? "default"}`);
 		debug(`syncResult: path=clean-start`);
+		pendingCleanStartAudit = syncAudit("clean", {}, customToolNameToSdk, systemPromptAppend);
 		return { sessionId: null };
 	}
+	const rebuildReason = sharedSession?.needsRebuild
+		? sharedSession.rebuildReason ?? "marked"
+		: !sharedSession
+			? "first"
+			: !sameAccount
+				? "account-rotation"
+				: "drift";
 	const replacedSessionId = sharedSession?.sessionId;
 	const previousSessionId = sameAccount ? sharedSession?.sessionId : undefined;
 	const previousCursor = sameAccount ? sharedSession?.cursor ?? 0 : 0;
@@ -699,6 +737,14 @@ export function syncSharedSession(
 		cwd,
 		...(accountProfileId ? { accountProfileId } : {}),
 		...(claudeConfigDir ? { claudeConfigDir } : {}),
+		lastSync: syncAudit("rebuild", {
+			reason: rebuildReason,
+			priors: priorMessages.length,
+			missed: Math.max(0, priorMessages.length - previousCursor),
+			carried: coveredMessages > 0 ? carriedRecords.length : 0,
+			covered: coveredMessages,
+			rotated: !preserveId,
+		}, customToolNameToSdk, systemPromptAppend),
 	});
 	if (!replacedSessionId) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);

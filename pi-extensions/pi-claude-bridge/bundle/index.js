@@ -37280,7 +37280,7 @@ function reportToolResultMismatch(queryCtx, reason, cwd, opts = {}) {
     if (!hasMismatch) return false;
     queryCtx.reportedToolResultMismatch = true;
     if (sharedSession) {
-      sharedSession = { ...sharedSession, needsRebuild: true, ...opts.forceRotate ? { forceRotate: true } : {} };
+      sharedSession = { ...sharedSession, needsRebuild: true, rebuildReason: `tool-result-mismatch:${reason}`, ...opts.forceRotate ? { forceRotate: true } : {} };
     }
     if (opts.expectedInterruption) {
       debug(
@@ -53208,6 +53208,22 @@ function refreshSnapshotAppend(snapshot, appendText) {
   return { ...snapshot, systemPrompt: next };
 }
 var ensuredAppend = /* @__PURE__ */ new Map();
+var pendingCleanStartAudit;
+function takePendingCleanStartAudit() {
+  const audit = pendingCleanStartAudit;
+  pendingCleanStartAudit = void 0;
+  return audit;
+}
+function syncAudit(path, detail, customToolNameToSdk, systemPromptAppend) {
+  const tools = customToolNameToSdk ? new Set(customToolNameToSdk.values()).size : void 0;
+  return {
+    path,
+    ...detail,
+    ...tools !== void 0 ? { tools } : {},
+    ...systemPromptAppend ? { appendDigest: createHash2("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {},
+    at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
 function ensurePromptSnapshotAppend(jsonlPath, sessionId, appendText) {
   if (!appendText) return;
   const key = `${jsonlPath}`;
@@ -53543,9 +53559,11 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     const missed = priorMessages.slice(sharedSession.cursor);
     const trailingAssistantOnly = missed.length === 1 && missed[0].role === "assistant";
     if (missed.length === 0 || trailingAssistantOnly) {
-      if (trailingAssistantOnly) {
-        setSharedSession({ ...sharedSession, cursor: priorMessages.length, cwd });
-      }
+      setSharedSession({
+        ...sharedSession,
+        ...trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {},
+        lastSync: syncAudit("reuse", { priors: priorMessages.length }, customToolNameToSdk, systemPromptAppend)
+      });
       debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
       debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
       ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
@@ -53555,8 +53573,10 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   if (priorMessages.length === 0) {
     debug(`Case 1: clean start, ${messages.length} total messages, account=${accountProfileId ?? "default"}`);
     debug(`syncResult: path=clean-start`);
+    pendingCleanStartAudit = syncAudit("clean", {}, customToolNameToSdk, systemPromptAppend);
     return { sessionId: null };
   }
+  const rebuildReason = sharedSession?.needsRebuild ? sharedSession.rebuildReason ?? "marked" : !sharedSession ? "first" : !sameAccount ? "account-rotation" : "drift";
   const replacedSessionId = sharedSession?.sessionId;
   const previousSessionId = sameAccount ? sharedSession?.sessionId : void 0;
   const previousCursor = sameAccount ? sharedSession?.cursor ?? 0 : 0;
@@ -53627,7 +53647,15 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     cursor: priorMessages.length,
     cwd,
     ...accountProfileId ? { accountProfileId } : {},
-    ...claudeConfigDir ? { claudeConfigDir } : {}
+    ...claudeConfigDir ? { claudeConfigDir } : {},
+    lastSync: syncAudit("rebuild", {
+      reason: rebuildReason,
+      priors: priorMessages.length,
+      missed: Math.max(0, priorMessages.length - previousCursor),
+      carried: coveredMessages > 0 ? carriedRecords.length : 0,
+      covered: coveredMessages,
+      rotated: !preserveId
+    }, customToolNameToSdk, systemPromptAppend)
   });
   if (!replacedSessionId) {
     debug(`Case 2: first turn with ${priorMessages.length} prior messages \u2192 session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
@@ -54613,13 +54641,29 @@ function extractAllToolResults2(context) {
   }
   return results;
 }
+var pinnedToolDescriptions = /* @__PURE__ */ new Map();
+function resetPinnedToolDescriptions() {
+  pinnedToolDescriptions.clear();
+}
+function pinToolDescription(tool) {
+  const schema = JSON.stringify(tool.parameters ?? null);
+  const pinned = pinnedToolDescriptions.get(tool.name);
+  if (pinned && pinned.schema === schema) {
+    if (pinned.description === tool.description) return tool;
+    debug(`resolveMcpTools: keeping the first-declared description of ${tool.name} (schema unchanged) to preserve the prompt cache`);
+    return { ...tool, description: pinned.description };
+  }
+  pinnedToolDescriptions.set(tool.name, { schema, description: tool.description });
+  return tool;
+}
 function resolveMcpTools(context, excludeToolName) {
   const mcpTools = [];
   const customToolNameToSdk = /* @__PURE__ */ new Map();
   const customToolNameToPi = /* @__PURE__ */ new Map();
   if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
-  for (const tool of context.tools) {
-    if (tool.name === excludeToolName) continue;
+  for (const rawTool of context.tools) {
+    if (rawTool.name === excludeToolName) continue;
+    const tool = pinToolDescription(rawTool);
     if (isChildExecutedTool(tool.name)) {
       debug(`resolveMcpTools: not re-offering child-native tool ${tool.name}`);
       continue;
@@ -55367,7 +55411,7 @@ function streamClaudeAgentSdk(model, context, options) {
       if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;
       streamIdleTimedOut = true;
       abortCtx.deferredUserMessages = [];
-      if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+      if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "stream-idle-timeout" });
       const errorMessage = buildStreamIdleTimeoutErrorMessage(timeoutMs);
       debug("provider: stream idle timeout", `model=${queryModel.id}`, `timeout=${timeoutMs}`, `idle=${idleMs}`);
       const idleFailure = { kind: "network", message: errorMessage };
@@ -55437,7 +55481,7 @@ function streamClaudeAgentSdk(model, context, options) {
     );
     if (!eligible || !sharedSession) return false;
     rotationState.contextRebuildAttempted = true;
-    setSharedSession({ ...sharedSession, needsRebuild: true });
+    setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: "context-length" });
     retryRequested = true;
     retryFailure = failure;
     attemptBuffer?.discard();
@@ -55520,7 +55564,7 @@ function streamClaudeAgentSdk(model, context, options) {
       return;
     }
     if (wasAborted || options?.signal?.aborted) {
-      if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+      if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort" });
       abortCtx.deferredUserMessages = [];
       debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
       surfaceFailure({ message: "Operation aborted" }, true);
@@ -55537,12 +55581,14 @@ function streamClaudeAgentSdk(model, context, options) {
     if (completedSessionId) {
       const cursor = Math.max(context.messages.length, abortCtx.latestCursor, sharedSession?.cursor ?? 0);
       debug(`provider: query done, session=${completedSessionId.slice(0, 8)}, cursor=${cursor}, account=${account?.label ?? "legacy"}`);
+      const cleanStartAudit = sharedSession?.lastSync ? void 0 : takePendingCleanStartAudit();
       setSharedSession({
         ...sharedSession ?? {},
         sessionId: completedSessionId,
         cursor,
         cwd,
-        ...accountSessionScope(account)
+        ...accountSessionScope(account),
+        ...cleanStartAudit ? { lastSync: cleanStartAudit } : {}
       });
     }
     if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
@@ -55595,7 +55641,7 @@ function streamClaudeAgentSdk(model, context, options) {
     debug(`provider: query error, model=${queryModel.id}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error51);
     const suppressDuplicateError = abortCtx.handledTerminalError || streamIdleTimedOut && !retryRequested;
     if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-      setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+      setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort-error" });
     }
     abortCtx.deferredUserMessages = [];
     if (suppressDuplicateError || retryRequested) {
@@ -55801,6 +55847,7 @@ function index_default(pi2) {
     setPiUI(ctx2.ui);
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
       clearSession(`session_start:${event.reason}`);
+      resetPinnedToolDescriptions();
     }
     if (event.reason === "startup" || event.reason === "resume") restoreSharedSessionFromPi(ctx2);
     applyProviderRegistration(`session_start:${event.reason}`);
@@ -55820,7 +55867,7 @@ function index_default(pi2) {
     }
     if (sharedSession) {
       debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-      setSharedSession({ ...sharedSession, needsRebuild: true });
+      setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
     }
   };
   pi2.on("session_compact", () => markRebuild("session_compact"));
@@ -55896,6 +55943,7 @@ export {
   reapStaleQueuedResults,
   recordConnectorCallResult,
   reportToolResultMismatch,
+  resetPinnedToolDescriptions,
   resetTimestampMs,
   resolveClaudeExecutable,
   resolveClaudeOAuth,

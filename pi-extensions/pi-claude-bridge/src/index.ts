@@ -60,7 +60,7 @@ import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWith
 import { appendIntegrityEntry, argKeys, extensionApi, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
-import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession } from "./session-persistence.js";
+import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
 import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
@@ -323,6 +323,37 @@ function extractAllToolResults(context: Context): McpResult[] {
 // them without activating the extension. `ctx()`, `pushContext()`, `popContext()`
 // are imported at the top of this file.
 
+// Tool declarations are the FIRST block of the API request, ahead of the system
+// prompt and the conversation, so any change to any tool's description
+// invalidates the prompt cache for the entire request. pi-mcp-adapter
+// re-registers its `mcp` gateway tool whenever a server connects or its tool
+// count changes ("paseo (61 tools)", "configured but not connected", ...), and
+// direct MCP tools re-register when their metadata refreshes. Each such
+// re-registration cost a full re-write of a 100-500k conversation on the next
+// turn (six same-account `cacheRead=0` turn starts within minutes of the
+// previous turn, 2026-09-17..18, ~1.8M tokens). The status text is advisory
+// only (`mcp({})` reports live status), so within one pi session the
+// description a tool was FIRST declared with is kept for as long as its
+// parameter schema is unchanged. A schema change is a real redefinition and
+// takes the miss; a new or removed tool necessarily does too.
+const pinnedToolDescriptions = new Map<string, { schema: string; description: string }>();
+
+export function resetPinnedToolDescriptions(): void {
+	pinnedToolDescriptions.clear();
+}
+
+function pinToolDescription(tool: Tool): Tool {
+	const schema = JSON.stringify(tool.parameters ?? null);
+	const pinned = pinnedToolDescriptions.get(tool.name);
+	if (pinned && pinned.schema === schema) {
+		if (pinned.description === tool.description) return tool;
+		debug(`resolveMcpTools: keeping the first-declared description of ${tool.name} (schema unchanged) to preserve the prompt cache`);
+		return { ...tool, description: pinned.description } as Tool;
+	}
+	pinnedToolDescriptions.set(tool.name, { schema, description: tool.description });
+	return tool;
+}
+
 export function resolveMcpTools(context: Context, excludeToolName?: string): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
@@ -334,8 +365,9 @@ export function resolveMcpTools(context: Context, excludeToolName?: string): {
 
 	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
 
-	for (const tool of context.tools) {
-		if (tool.name === excludeToolName) continue;
+	for (const rawTool of context.tools) {
+		if (rawTool.name === excludeToolName) continue;
+		const tool = pinToolDescription(rawTool);
 		// Never re-offer a tool the child owns natively. The claude.ai connector
 		// namespace belongs to the child's own MCP servers, so a Pi tool sitting
 		// on it would be advertised a SECOND time under our prefix — two names
@@ -1392,7 +1424,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;
 				streamIdleTimedOut = true;
 				abortCtx.deferredUserMessages = [];
-				if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+				if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "stream-idle-timeout" });
 				const errorMessage = buildStreamIdleTimeoutErrorMessage(timeoutMs);
 				debug("provider: stream idle timeout", `model=${queryModel.id}`, `timeout=${timeoutMs}`, `idle=${idleMs}`);
 				const idleFailure = { kind: "network" as const, message: errorMessage };
@@ -1471,7 +1503,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		);
 		if (!eligible || !sharedSession) return false;
 		rotationState.contextRebuildAttempted = true;
-		setSharedSession({ ...sharedSession, needsRebuild: true });
+		setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: "context-length" });
 		retryRequested = true;
 		retryFailure = failure;
 		attemptBuffer?.discard();
@@ -1566,7 +1598,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			}
 
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+				if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort" });
 				abortCtx.deferredUserMessages = [];
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 				surfaceFailure({ message: "Operation aborted" }, true);
@@ -1585,12 +1617,16 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			if (completedSessionId) {
 				const cursor = Math.max(context.messages.length, abortCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${completedSessionId.slice(0, 8)}, cursor=${cursor}, account=${account?.label ?? "legacy"}`);
+				// A clean start had no sharedSession to carry its sync audit; attach it now
+				// so the persisted entry for this turn records `path: "clean"`.
+				const cleanStartAudit = sharedSession?.lastSync ? undefined : takePendingCleanStartAudit();
 				setSharedSession({
 					...(sharedSession ?? {} as any),
 					sessionId: completedSessionId,
 					cursor,
 					cwd,
 					...accountSessionScope(account),
+					...(cleanStartAudit ? { lastSync: cleanStartAudit } : {}),
 				});
 			}
 			if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
@@ -1650,7 +1686,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			debug(`provider: query error, model=${queryModel.id}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			const suppressDuplicateError = abortCtx.handledTerminalError || (streamIdleTimedOut && !retryRequested);
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true });
+				setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort-error" });
 			}
 			abortCtx.deferredUserMessages = [];
 			if (suppressDuplicateError || retryRequested) {
@@ -1928,6 +1964,7 @@ export default function (pi: ExtensionAPI) {
 		setPiUI(ctx.ui);
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
+			resetPinnedToolDescriptions();
 		}
 		// Note: "fork" intentionally omitted from restoration. createBranchedSession
 		// copies the parent's persisted bridge entries into the fork; restoring from
@@ -1961,7 +1998,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (sharedSession) {
 			debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-			setSharedSession({ ...sharedSession, needsRebuild: true });
+			setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
 		}
 	};
 	pi.on("session_compact", () => markRebuild("session_compact"));
