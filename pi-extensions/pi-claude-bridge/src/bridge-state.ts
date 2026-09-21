@@ -29,6 +29,11 @@ export interface SessionState {
 	// context-length, a tool-result mismatch reason). Copied into `lastSync` when
 	// the rebuild happens so the pi session records why the cache was lost.
 	rebuildReason?: string;
+	// sha256 of the system-prompt append (AGENTS.md, project memory, skills)
+	// most recently delivered to the model as an in-conversation update, when
+	// it differs from the block frozen in the CLI's recorded prompt snapshot.
+	// See pendingAppendUpdate in session-persistence.ts.
+	deliveredAppendDigest?: string;
 	// How the last syncSharedSession call resolved. Persisted with the
 	// `claude-bridge-session` entry so a prompt-cache post-mortem can attribute
 	// every cache miss from the pi session file alone: `reuse` resumes the CLI's
@@ -53,6 +58,8 @@ export interface SyncAudit {
 	tools?: number;
 	/** First 12 hex chars of the sha256 of the appended system prompt (AGENTS.md, memory, skills). */
 	appendDigest?: string;
+	/** The append changed since the recorded snapshot and was delivered in this turn's prompt instead of by rewriting the snapshot. */
+	appendDelivered?: boolean;
 	at: string;
 }
 

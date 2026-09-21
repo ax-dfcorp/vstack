@@ -52,11 +52,16 @@ export function extractAgentsAppend(): string | undefined {
 	}
 }
 
+// Only the harness NAME is rewritten. Paths and identifiers that merely
+// contain "pi" are real things on disk that the model's tools must reach:
+// until 2026-09-22 this also turned `~/.pi/agent/sessions` into
+// `~/.claude/agent/sessions` and `~/ws/pi-local` into `~/ws/environment-local`,
+// so the forwarded AGENTS.md told the model to run scripts at paths that do
+// not exist. The Claude Code subprocess does not act on `.pi` paths itself, so
+// leaving them intact is safe.
+// A sentence may end in "pi." but "pi.json" is a file name.
+const STANDALONE_PI = /(?<![\w./@~-])pi(?![\w/@-]|\.\w)/gi;
+
 export function sanitizeAgentsContent(content: string): string {
-	let sanitized = content;
-	sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
-	sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
-	sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-	sanitized = sanitized.replace(/\bpi\b/gi, "environment");
-	return sanitized;
+	return content.replace(STANDALONE_PI, "environment");
 }

@@ -35684,6 +35684,15 @@ function extractSkillsBlock(systemPrompt) {
   if (end === -1) return void 0;
   return rewriteSkillsBlock(systemPrompt.slice(start, end + endMarker.length).trim());
 }
+function extractMemoryBlock(systemPrompt) {
+  if (!systemPrompt) return void 0;
+  const startMarker = "# Project memory\n";
+  const start = systemPrompt.indexOf(startMarker);
+  if (start === -1) return void 0;
+  const skillsStart = systemPrompt.indexOf("The following skills provide specialized instructions", start);
+  const block = systemPrompt.slice(start, skillsStart === -1 ? void 0 : skillsStart).trim();
+  return block.length > startMarker.length ? block : void 0;
+}
 function rewriteSkillsBlock(skillsBlock) {
   return skillsBlock.replace(
     "Use the read tool to load a skill's file",
@@ -37533,13 +37542,9 @@ ${sanitized}` : void 0;
     return void 0;
   }
 }
+var STANDALONE_PI = /(?<![\w./@~-])pi(?![\w/@-]|\.\w)/gi;
 function sanitizeAgentsContent(content) {
-  let sanitized = content;
-  sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
-  sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
-  sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-  sanitized = sanitized.replace(/\bpi\b/gi, "environment");
-  return sanitized;
+  return content.replace(STANDALONE_PI, "environment");
 }
 
 // src/prompt-context.ts
@@ -53188,7 +53193,35 @@ function lastPromptSnapshot(records) {
   }
   return void 0;
 }
-var BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "The following skills provide specialized instructions"];
+var BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "# Project memory", "The following skills provide specialized instructions"];
+function recordedAppendBlock(snapshot) {
+  const blocks = snapshot?.systemPrompt;
+  if (!Array.isArray(blocks)) return void 0;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (typeof block === "string" && BRIDGE_APPEND_MARKERS.some((marker) => block.includes(marker))) return block;
+  }
+  return void 0;
+}
+function appendDigest(text) {
+  return createHash2("sha256").update(text).digest("hex");
+}
+var recordedAppendDigests = /* @__PURE__ */ new Map();
+function pendingAppendUpdate(jsonlPath, appendText, deliveredDigest) {
+  if (!appendText) return void 0;
+  let recorded = recordedAppendDigests.get(jsonlPath);
+  if (recorded === void 0) {
+    const records = readSessionRecords(jsonlPath);
+    const block = records ? recordedAppendBlock(lastPromptSnapshot(records)) : void 0;
+    recorded = block === void 0 ? null : appendDigest(block);
+    recordedAppendDigests.set(jsonlPath, recorded);
+  }
+  if (recorded === null) return void 0;
+  const digest = appendDigest(appendText);
+  if (digest === recorded || digest === deliveredDigest) return void 0;
+  debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the recorded prompt; delivering the update in the prompt instead of rewriting the snapshot`);
+  return { text: appendText, digest };
+}
 function refreshSnapshotAppend(snapshot, appendText) {
   const blocks = snapshot.systemPrompt;
   if (!Array.isArray(blocks) || !appendText) return void 0;
@@ -53559,15 +53592,19 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     const missed = priorMessages.slice(sharedSession.cursor);
     const trailingAssistantOnly = missed.length === 1 && missed[0].role === "assistant";
     if (missed.length === 0 || trailingAssistantOnly) {
+      const appendUpdate2 = pendingAppendUpdate(
+        getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir),
+        systemPromptAppend,
+        sharedSession.deliveredAppendDigest
+      );
       setSharedSession({
         ...sharedSession,
         ...trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {},
-        lastSync: syncAudit("reuse", { priors: priorMessages.length }, customToolNameToSdk, systemPromptAppend)
+        lastSync: syncAudit("reuse", { priors: priorMessages.length, ...appendUpdate2 ? { appendDelivered: true } : {} }, customToolNameToSdk, systemPromptAppend)
       });
       debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
       debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
-      ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
-      return { sessionId: sharedSession.sessionId };
+      return { sessionId: sharedSession.sessionId, ...appendUpdate2 ? { appendUpdate: appendUpdate2 } : {} };
     }
   }
   if (priorMessages.length === 0) {
@@ -53641,20 +53678,29 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
   }
   ensuredAppend.delete(session.jsonlPath);
-  ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
+  recordedAppendDigests.delete(session.jsonlPath);
+  const carriedPrefix = coveredMessages > 0;
+  let appendUpdate;
+  if (carriedPrefix) {
+    appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend, sameAccount ? sharedSession?.deliveredAppendDigest : void 0);
+  } else {
+    ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
+  }
   setSharedSession({
     sessionId: session.sessionId,
     cursor: priorMessages.length,
     cwd,
     ...accountProfileId ? { accountProfileId } : {},
     ...claudeConfigDir ? { claudeConfigDir } : {},
+    ...carriedPrefix && sameAccount && sharedSession?.deliveredAppendDigest ? { deliveredAppendDigest: sharedSession.deliveredAppendDigest } : {},
     lastSync: syncAudit("rebuild", {
       reason: rebuildReason,
       priors: priorMessages.length,
       missed: Math.max(0, priorMessages.length - previousCursor),
       carried: coveredMessages > 0 ? carriedRecords.length : 0,
       covered: coveredMessages,
-      rotated: !preserveId
+      rotated: !preserveId,
+      ...appendUpdate ? { appendDelivered: true } : {}
     }, customToolNameToSdk, systemPromptAppend)
   });
   if (!replacedSessionId) {
@@ -53669,7 +53715,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   }
   debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeConfigDir);
   debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"}`);
-  return { sessionId: session.sessionId };
+  return { sessionId: session.sessionId, ...appendUpdate ? { appendUpdate } : {} };
 }
 
 // src/stream-idle-watchdog.ts
@@ -54642,6 +54688,15 @@ function extractAllToolResults2(context) {
   return results;
 }
 var pinnedToolDescriptions = /* @__PURE__ */ new Map();
+function formatAppendUpdate(text) {
+  return [
+    "<system_prompt_update>",
+    "The project instructions, project memory index, and skills that were appended to the system prompt when this conversation started have changed on disk. The current full text follows and supersedes the earlier copy in the system prompt.",
+    "",
+    text,
+    "</system_prompt_update>"
+  ].join("\n");
+}
 function resetPinnedToolDescriptions() {
   pinnedToolDescriptions.clear();
 }
@@ -55262,9 +55317,6 @@ function streamClaudeAgentSdk(model, context, options) {
     });
     promptText = "[continue]";
   }
-  const inputChannel = createQueryInputChannel(promptBlocks ?? [{ type: "text", text: promptText }]);
-  ctx().inputChannel = inputChannel;
-  const prompt = inputChannel.stream;
   const mcpServers = buildMcpServers(mcpTools, ctx());
   const bridgeConfig = loadConfig(cwd);
   const providerSettings = bridgeConfig.provider ?? {};
@@ -55273,15 +55325,16 @@ function streamClaudeAgentSdk(model, context, options) {
   const connectorServers = enableCloudMcp ? connectorServersSnapshot(account?.configDir) : {};
   const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
   const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : void 0;
+  const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : void 0;
   const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : void 0;
   const promptContextAppend = buildPromptContextAppend(context.systemPrompt, cwd, bridgeConfig.promptContext ?? {});
-  const appendParts = [agentsAppend, skillsAppend, promptContextAppend.text].filter((part) => Boolean(part));
+  const appendParts = [agentsAppend, memoryAppend, skillsAppend, promptContextAppend.text].filter((part) => Boolean(part));
   const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : void 0;
   const settingSources = enableCloudMcp ? providerSettings.settingSources ?? ["user", "project", "local"] : appendSystemPrompt ? void 0 : providerSettings.settingSources ?? ["user", "project"];
   const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
   const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
   const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : void 0;
-  const { sessionId: resumeSessionId } = syncSharedSession(
+  const { sessionId: resumeSessionId, appendUpdate } = syncSharedSession(
     context.messages,
     cwd,
     customToolNameToSdk,
@@ -55290,6 +55343,14 @@ function streamClaudeAgentSdk(model, context, options) {
     isContinuation ? 0 : 1,
     systemPromptAppend
   );
+  const initialBlocks = promptBlocks ?? [{ type: "text", text: promptText }];
+  if (appendUpdate) {
+    initialBlocks.unshift({ type: "text", text: formatAppendUpdate(appendUpdate.text) });
+    debug(`provider: delivering the changed system-prompt append (${appendUpdate.text.length} chars) in the prompt`);
+  }
+  const inputChannel = createQueryInputChannel(initialBlocks);
+  ctx().inputChannel = inputChannel;
+  const prompt = inputChannel.stream;
   const requestedEffort = options?.reasoning ? queryModel.thinkingLevelMap?.[options.reasoning] ?? REASONING_TO_EFFORT[options.reasoning] : void 0;
   const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);
   const extraArgs = {};
@@ -55588,7 +55649,10 @@ function streamClaudeAgentSdk(model, context, options) {
         cursor,
         cwd,
         ...accountSessionScope(account),
-        ...cleanStartAudit ? { lastSync: cleanStartAudit } : {}
+        ...cleanStartAudit ? { lastSync: cleanStartAudit } : {},
+        // Recorded only once the model has actually seen it, so an aborted
+        // or replayed attempt delivers it again next turn.
+        ...appendUpdate ? { deliveredAppendDigest: appendUpdate.digest } : {}
       });
     }
     if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
@@ -55923,6 +55987,7 @@ export {
   finalizeToolUseTurnFromMcpInvocation,
   flushConnectorCallAudit,
   formatAllowedRateLimitWarning,
+  formatAppendUpdate,
   formatResetTimestamp,
   isChildExecutedTool,
   isConnectorWriteTool,

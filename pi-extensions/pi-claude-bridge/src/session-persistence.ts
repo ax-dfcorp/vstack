@@ -86,7 +86,60 @@ export function readPromptSnapshotRecord(jsonlPath: string): Record<string, unkn
 	return records ? lastPromptSnapshot(records) : undefined;
 }
 
-const BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "The following skills provide specialized instructions"];
+const BRIDGE_APPEND_MARKERS = ["# CLAUDE.md", "# Project memory", "The following skills provide specialized instructions"];
+
+/** The bridge's append block as frozen in a recorded prompt snapshot, or undefined when none is recognizable. */
+export function recordedAppendBlock(snapshot: Record<string, unknown> | undefined): string | undefined {
+	const blocks = snapshot?.systemPrompt;
+	if (!Array.isArray(blocks)) return undefined;
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		const block = blocks[i];
+		if (typeof block === "string" && BRIDGE_APPEND_MARKERS.some((marker) => block.includes(marker))) return block;
+	}
+	return undefined;
+}
+
+export function appendDigest(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+// Digest of the append block frozen in each session file's recorded snapshot,
+// read once per process per file: the block only changes when this bridge
+// rewrites the file (full rebuild), which invalidates the entry below.
+const recordedAppendDigests = new Map<string, string | null>();
+
+/**
+ * The system-prompt append is frozen in the CLI's recorded snapshot for the
+ * lifetime of a Claude session. The snapshot is the FIRST thing in every API
+ * request after the tool declarations, so rewriting it (as this bridge did
+ * until 2026-09-22 whenever AGENTS.md or a skill changed) invalidated the
+ * prompt cache for the entire conversation: every AGENTS.md commit in a
+ * repository cost a 100-500k re-write on the next turn of every Claude session
+ * in that repository. The CLI itself never rewrites the snapshot; it delivers
+ * environment changes as an appended message. This does the same: when the
+ * current append differs from the recorded block and has not been delivered
+ * yet, it is returned so the caller can prepend it to the user prompt, where it
+ * costs only its own tokens.
+ */
+export function pendingAppendUpdate(
+	jsonlPath: string,
+	appendText: string | undefined,
+	deliveredDigest: string | undefined,
+): { text: string; digest: string } | undefined {
+	if (!appendText) return undefined;
+	let recorded = recordedAppendDigests.get(jsonlPath);
+	if (recorded === undefined) {
+		const records = readSessionRecords(jsonlPath);
+		const block = records ? recordedAppendBlock(lastPromptSnapshot(records)) : undefined;
+		recorded = block === undefined ? null : appendDigest(block);
+		recordedAppendDigests.set(jsonlPath, recorded);
+	}
+	if (recorded === null) return undefined;
+	const digest = appendDigest(appendText);
+	if (digest === recorded || digest === deliveredDigest) return undefined;
+	debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the recorded prompt; delivering the update in the prompt instead of rewriting the snapshot`);
+	return { text: appendText, digest };
+}
 
 /**
  * The CLI replays a recorded prompt verbatim, which also freezes the block
@@ -510,6 +563,8 @@ function convertAndImportMessages(
 
 interface SyncResult {
 	sessionId: string | null;
+	/** Current system-prompt append to deliver in this turn's prompt, because it differs from the recorded snapshot (see pendingAppendUpdate). */
+	appendUpdate?: { text: string; digest: string };
 }
 
 /**
@@ -621,15 +676,19 @@ export function syncSharedSession(
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
+			const appendUpdate = pendingAppendUpdate(
+				getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir),
+				systemPromptAppend,
+				sharedSession.deliveredAppendDigest,
+			);
 			setSharedSession({
 				...sharedSession,
 				...(trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {}),
-				lastSync: syncAudit("reuse", { priors: priorMessages.length }, customToolNameToSdk, systemPromptAppend),
+				lastSync: syncAudit("reuse", { priors: priorMessages.length, ...(appendUpdate ? { appendDelivered: true } : {}) }, customToolNameToSdk, systemPromptAppend),
 			});
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
-			ensurePromptSnapshotAppend(getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir), sharedSession.sessionId, systemPromptAppend);
-			return { sessionId: sharedSession.sessionId };
+			return { sessionId: sharedSession.sessionId, ...(appendUpdate ? { appendUpdate } : {}) };
 		}
 	}
 
@@ -730,13 +789,25 @@ export function syncSharedSession(
 		debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
 	}
 	ensuredAppend.delete(session.jsonlPath);
-	ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
+	recordedAppendDigests.delete(session.jsonlPath);
+	// A rebuild that carried native records still has a chance at the cached
+	// prefix, so its snapshot is left as recorded and an append change is
+	// delivered in the prompt like the reuse path. A full rewrite has already
+	// lost the cache, so the recorded snapshot is simply brought up to date.
+	const carriedPrefix = coveredMessages > 0;
+	let appendUpdate: SyncResult["appendUpdate"];
+	if (carriedPrefix) {
+		appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend, sameAccount ? sharedSession?.deliveredAppendDigest : undefined);
+	} else {
+		ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
+	}
 	setSharedSession({
 		sessionId: session.sessionId,
 		cursor: priorMessages.length,
 		cwd,
 		...(accountProfileId ? { accountProfileId } : {}),
 		...(claudeConfigDir ? { claudeConfigDir } : {}),
+		...(carriedPrefix && sameAccount && sharedSession?.deliveredAppendDigest ? { deliveredAppendDigest: sharedSession.deliveredAppendDigest } : {}),
 		lastSync: syncAudit("rebuild", {
 			reason: rebuildReason,
 			priors: priorMessages.length,
@@ -744,6 +815,7 @@ export function syncSharedSession(
 			carried: coveredMessages > 0 ? carriedRecords.length : 0,
 			covered: coveredMessages,
 			rotated: !preserveId,
+			...(appendUpdate ? { appendDelivered: true } : {}),
 		}, customToolNameToSdk, systemPromptAppend),
 	});
 	if (!replacedSessionId) {
@@ -758,5 +830,5 @@ export function syncSharedSession(
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeConfigDir);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"}`);
-	return { sessionId: session.sessionId };
+	return { sessionId: session.sessionId, ...(appendUpdate ? { appendUpdate } : {}) };
 }

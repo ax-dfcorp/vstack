@@ -6,6 +6,7 @@ import {
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import {
 	LEGACY_PROVIDER_ID,
 	PROVIDER_ID,
@@ -21,7 +22,7 @@ import {
 } from "./user-prompt.js";
 import { createQueryInputChannel, type QueryInputChannel } from "./input-channel.js";
 import { buildModels, modelDisplayName } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
+import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractMemoryBlock, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
@@ -337,6 +338,16 @@ function extractAllToolResults(context: Context): McpResult[] {
 // parameter schema is unchanged. A schema change is a real redefinition and
 // takes the miss; a new or removed tool necessarily does too.
 const pinnedToolDescriptions = new Map<string, { schema: string; description: string }>();
+
+export function formatAppendUpdate(text: string): string {
+	return [
+		"<system_prompt_update>",
+		"The project instructions, project memory index, and skills that were appended to the system prompt when this conversation started have changed on disk. The current full text follows and supersedes the earlier copy in the system prompt.",
+		"",
+		text,
+		"</system_prompt_update>",
+	].join("\n");
+}
 
 export function resetPinnedToolDescriptions(): void {
 	pinnedToolDescriptions.clear();
@@ -1213,12 +1224,6 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		promptText = "[continue]";
 	}
 
-	// Held open for the whole query so a steer arriving mid-run can be written
-	// straight into it (see the tool-result delivery path). consumeQuery closes
-	// it at `result`, which is what ends the query.
-	const inputChannel = createQueryInputChannel(promptBlocks ?? [{ type: "text", text: promptText }]);
-	ctx().inputChannel = inputChannel;
-	const prompt: AsyncIterable<SDKUserMessage> = inputChannel.stream;
 	const mcpServers = buildMcpServers(mcpTools, ctx());
 	const bridgeConfig = loadConfig(cwd);
 	const providerSettings = bridgeConfig.provider ?? {};
@@ -1235,9 +1240,10 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const connectorServers = enableCloudMcp ? connectorServersSnapshot(account?.configDir) : {};
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
+	const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : undefined;
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
 	const promptContextAppend = buildPromptContextAppend(context.systemPrompt, cwd, bridgeConfig.promptContext ?? {});
-	const appendParts = [agentsAppend, skillsAppend, promptContextAppend.text].filter((part): part is string => Boolean(part));
+	const appendParts = [agentsAppend, memoryAppend, skillsAppend, promptContextAppend.text].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 
 	// MCP auto-loading suppression: with appendSystemPrompt=true (default), the
@@ -1257,7 +1263,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
 	const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : undefined;
-	const { sessionId: resumeSessionId } = syncSharedSession(
+	const { sessionId: resumeSessionId, appendUpdate } = syncSharedSession(
 		context.messages,
 		cwd,
 		customToolNameToSdk,
@@ -1266,6 +1272,21 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		isContinuation ? 0 : 1,
 		systemPromptAppend,
 	);
+	// AGENTS.md, project memory, or a skill changed since the CLI recorded this
+	// session's system prompt. The recorded prompt stays frozen (rewriting it
+	// would invalidate the whole conversation's cache); the current text rides
+	// in this prompt instead, the same way the CLI delivers environment updates.
+	const initialBlocks: ContentBlockParam[] = promptBlocks ?? [{ type: "text", text: promptText }];
+	if (appendUpdate) {
+		initialBlocks.unshift({ type: "text", text: formatAppendUpdate(appendUpdate.text) });
+		debug(`provider: delivering the changed system-prompt append (${appendUpdate.text.length} chars) in the prompt`);
+	}
+	// Held open for the whole query so a steer arriving mid-run can be written
+	// straight into it (see the tool-result delivery path). consumeQuery closes
+	// it at `result`, which is what ends the query.
+	const inputChannel = createQueryInputChannel(initialBlocks);
+	ctx().inputChannel = inputChannel;
+	const prompt: AsyncIterable<SDKUserMessage> = inputChannel.stream;
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
 	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
@@ -1627,6 +1648,9 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 					cwd,
 					...accountSessionScope(account),
 					...(cleanStartAudit ? { lastSync: cleanStartAudit } : {}),
+					// Recorded only once the model has actually seen it, so an aborted
+					// or replayed attempt delivers it again next turn.
+					...(appendUpdate ? { deliveredAppendDigest: appendUpdate.digest } : {}),
 				});
 			}
 			if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
