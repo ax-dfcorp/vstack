@@ -4,10 +4,13 @@
 
 export const FABLE_MODEL_ID = "claude-fable-5-1";
 export const FABLE_5_MODEL_ID = "claude-fable-5";
-// Opus 4.8 remains the preferred implementation model. It is NOT a Fable
-// fallback: a Fable request never changes model, on any path (no SDK
-// `fallbackModel`, no router substitution). Fable is the reason for the
-// subscription; when its allowance is spent the session waits for the reset.
+// Opus 5.5 is the preferred implementation model (Claude Code 2.1.280+ / Agent
+// SDK 0.3.280+ know its id; older CLIs treat it as an unrecognized model and
+// assume a 200k window). No Opus is a Fable fallback: a Fable request never
+// changes model, on any path (no SDK `fallbackModel`, no router substitution).
+// Fable is the reason for the subscription; when its allowance is spent the
+// session waits for the reset.
+export const OPUS_5_5_MODEL_ID = "claude-opus-5-5";
 export const OPUS_4_8_MODEL_ID = "claude-opus-4-8";
 export const OPUS_5_MODEL_ID = "claude-opus-5";
 export const SONNET_5_MODEL_ID = "claude-sonnet-5";
@@ -15,6 +18,7 @@ export const SONNET_5_MODEL_ID = "claude-sonnet-5";
 export const MODEL_IDS_IN_ORDER = [
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
+	OPUS_5_5_MODEL_ID,
 	OPUS_4_8_MODEL_ID,
 	OPUS_5_MODEL_ID,
 	"claude-opus-4-7",
@@ -46,6 +50,7 @@ const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
 const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
+	OPUS_5_5_MODEL_ID,
 	OPUS_4_8_MODEL_ID,
 	OPUS_5_MODEL_ID,
 ]);
@@ -63,6 +68,15 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 	[FABLE_5_MODEL_ID]: {
 		id: FABLE_5_MODEL_ID,
 		name: "Claude Fable 5",
+		reasoning: true,
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
+		input: ["text", "image"],
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	[OPUS_5_5_MODEL_ID]: {
+		id: OPUS_5_5_MODEL_ID,
+		name: "Claude Opus 5.5",
 		reasoning: true,
 		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],

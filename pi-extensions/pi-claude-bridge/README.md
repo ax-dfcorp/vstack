@@ -11,7 +11,7 @@ Forked from [`elidickinson/pi-claude-bridge`](https://github.com/elidickinson/pi
 
 ## Highlights
 
-- Claude Fable 5.1, Fable 5, Opus 5, Opus 4.8, older Opus/Sonnet releases, and Haiku in `/model`. `/model fable` selects Fable 5.1; `/model opus` selects Opus 4.8.
+- Claude Fable 5.1, Fable 5, Opus 5.5, Opus 4.8, Opus 5, older Opus/Sonnet releases, and Haiku in `/model`. `/model fable` selects Fable 5.1; `/model opus` selects Opus 5.5.
 - Pi tool calls run on Pi; Claude Code handles reasoning.
 - Tool-use turns block until Pi-delivered tool results reach Claude Code, including persistent subagent panes.
 - Steering lands inside the running turn: a message sent while Claude is working reaches it at the next tool boundary, not after the whole run finishes.
@@ -95,7 +95,7 @@ The bridge also reads `claude-bridge.json` (`~/.pi/agent/claude-bridge.json`, an
 | Model effort overrides | JSON object mapping model IDs to Claude Code efforts, e.g. `{"claude-opus-4-8":"max"}`. Per-model entries beat the global force setting. |
 | Claude executable path | Explicit `claude` binary path; empty auto-detects. |
 
-Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, Opus 4.8, and Opus 5 expose Claude's five native effort levels: `low`, `medium`, `high`, `xhigh`, and `max`. Generic Pi aliases such as `off` and `minimal` are excluded for these models. **Force Claude effort** and **Model effort overrides** remain available when one bridge model needs a different fixed effort. For example, to force only Opus 4.8 to `max`:
+Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, Opus 5.5, Opus 4.8, and Opus 5 expose Claude's five native effort levels: `low`, `medium`, `high`, `xhigh`, and `max`. Generic Pi aliases such as `off` and `minimal` are excluded for these models. **Force Claude effort** and **Model effort overrides** remain available when one bridge model needs a different fixed effort. For example, to force only Opus 4.8 to `max`:
 
 ```json
 {"claude-opus-4-8":"max"}
@@ -176,7 +176,7 @@ Bridge settings come only from the authoritative `<PI_CODING_AGENT_DIR>/claude-b
 
 ### Fable caveat
 
-The bridge registers `pi-claude/claude-fable-5-1`, `pi-claude/claude-fable-5`, and the other curated Claude models even when Pi's Anthropic registry has not shipped those entries yet. The bridge never passes Claude Code a `fallbackModel` and an account route never substitutes a model: a Fable turn runs on Fable or fails with the reset time, so Fable's allowance is never silently traded for Opus. If Claude Code reroutes a turn on its own, the bridge labels the model that actually answered and warns. Fable 5.1 requires Claude Code or Claude Agent SDK 2.1.255/0.3.255 or newer; set `ANTHROPIC_DEFAULT_FABLE_MODEL` when routing provider-specific model IDs through Bedrock, Vertex, or Foundry.
+The bridge registers `pi-claude/claude-fable-5-1`, `pi-claude/claude-fable-5`, and the other curated Claude models even when Pi's Anthropic registry has not shipped those entries yet. The bridge never passes Claude Code a `fallbackModel` and an account route never substitutes a model: a Fable turn runs on Fable or fails with the reset time, so Fable's allowance is never silently traded for Opus. If Claude Code reroutes a turn on its own, the bridge labels the model that actually answered and warns. Fable 5.1 requires Claude Code or Claude Agent SDK 2.1.255/0.3.255 or newer, and Opus 5.5 requires 2.1.280/0.3.280 or newer (older CLIs log `unrecognized_model` and cap the assumed context at 200k); set `ANTHROPIC_DEFAULT_FABLE_MODEL` when routing provider-specific model IDs through Bedrock, Vertex, or Foundry.
 
 ## Connector inventory
 
