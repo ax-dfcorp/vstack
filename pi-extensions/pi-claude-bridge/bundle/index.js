@@ -53600,66 +53600,239 @@ function toLegacyContext(context) {
   };
 }
 
-// src/connector-cache.ts
-import { createHash } from "node:crypto";
-import { mkdirSync as mkdirSync3, readFileSync as readFileSync6, writeFileSync } from "node:fs";
-import { dirname as dirname8, join as join10 } from "node:path";
-var CACHE_VERSION = 1;
-var MAX_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
-function connectorCacheScopeKey(env = process.env) {
-  return env.CLAUDE_CONFIG_DIR?.trim() || "<default>";
-}
-function connectorCachePath(scopeKey = connectorCacheScopeKey()) {
-  const digest = createHash("sha256").update(scopeKey).digest("hex").slice(0, 16);
-  return join10(piUserDir(), "connector-cache", `${digest}.json`);
-}
-function readCachedConnectors(scopeKey = connectorCacheScopeKey(), now = Date.now()) {
-  let raw;
+// src/one-shot-summary.ts
+import { calculateCost } from "@earendil-works/pi-ai";
+
+// src/rate-limit.ts
+var RATE_LIMIT_AUTO_RESUME_EVENT = "vstack:rate-limit";
+var RATE_LIMIT_TOKEN = "\x1B[31m[rate-limit]\x1B[39m";
+var USAGE_LIMIT_PREFIXES = Array.isArray(Aj) ? Aj : [];
+function coerceMessageText(value) {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.message;
   try {
-    raw = readFileSync6(connectorCachePath(scopeKey), "utf8");
+    return JSON.stringify(value ?? "");
   } catch {
-    return void 0;
+    return String(value);
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return void 0;
-  }
-  if (parsed?.version !== CACHE_VERSION) return void 0;
-  if (parsed?.scope !== scopeKey) return void 0;
-  const savedAt = typeof parsed?.savedAt === "number" ? parsed.savedAt : 0;
-  if (!savedAt || now - savedAt > MAX_AGE_MS || savedAt > now) return void 0;
-  if (!Array.isArray(parsed?.connectors)) return void 0;
-  const connectors = parsed.connectors.filter(
-    (entry) => entry && typeof entry.name === "string" && entry.name.trim()
-  );
-  return connectors.length > 0 ? connectors : void 0;
 }
-function writeCachedConnectors(connectors, scopeKey = connectorCacheScopeKey(), now = Date.now()) {
-  if (!Array.isArray(connectors) || connectors.length === 0) return false;
-  const path = connectorCachePath(scopeKey);
-  try {
-    mkdirSync3(dirname8(path), { recursive: true, mode: 448 });
-    writeFileSync(
-      path,
-      JSON.stringify({ version: CACHE_VERSION, scope: scopeKey, savedAt: now, connectors }),
-      { mode: 384 }
-    );
-    return true;
-  } catch {
-    return false;
+function isUsageLimitMessage(value) {
+  const text = coerceMessageText(value);
+  return USAGE_LIMIT_PREFIXES.some((prefix) => text.includes(prefix));
+}
+function modelFamilyFromLimitMessage(value) {
+  const text = coerceMessageText(value);
+  const match = /\byour (fable|opus|sonnet|haiku)\b[^.\n]{0,40}?\blimit\b/i.exec(text);
+  return match ? match[1].toLowerCase() : void 0;
+}
+function attachAttemptFailure(error51, failure) {
+  if (failure && error51 && typeof error51 === "object" && !("claudeAttemptFailure" in error51)) {
+    try {
+      Object.defineProperty(error51, "claudeAttemptFailure", { value: failure, enumerable: false });
+    } catch {
+    }
   }
+  return error51;
+}
+function attachedAttemptFailure(error51) {
+  return error51 && typeof error51 === "object" ? error51.claudeAttemptFailure : void 0;
+}
+function uniqueNonEmptyLines(values) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const value of values) {
+    const text = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+function resetTimestampMs(value) {
+  let parsed = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(parsed)) return void 0;
+  if (typeof value === "number" && Math.abs(parsed) < 1e12) parsed *= 1e3;
+  return parsed;
+}
+function formatResetTimestamp(value) {
+  const parsed = resetTimestampMs(value);
+  if (parsed === void 0) return "unknown";
+  return new Date(parsed).toLocaleString(void 0, {
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+    second: "2-digit",
+    timeZoneName: "short",
+    year: "numeric"
+  });
+}
+var PI_NON_RETRYABLE_DETAIL_PATTERN = /billing|quota|budget|balance|insufficient/i;
+function formatAutoResumeRateLimitMessage(input) {
+  const type = input.rateLimitType?.trim();
+  const resetMs = resetTimestampMs(input.resetAt);
+  const parts = [
+    `Claude rate limit on ${input.accountLabel}${type ? ` (${type})` : ""}`,
+    resetMs !== void 0 ? `resets ${formatResetTimestamp(resetMs)}` : void 0,
+    `Pi auto-retry resumes this turn on ${input.nextAccountLabel}`
+  ].filter((part) => Boolean(part));
+  const detail = input.detail?.trim();
+  const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail) ? detail.replace(/\s+/g, " ").slice(0, 200) : void 0;
+  return `${parts.join(" \u2014 ")}.${quotable ? ` (${quotable})` : ""}`;
+}
+var ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
+function normalizeRateLimitUtilization(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
+  if (value === 0) return 0;
+  if (value > 0 && value < 1) return value * 100;
+  if (value > 1 && value <= 100) return value;
+  return void 0;
+}
+function rateLimitTypeLabel(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || "unknown";
+}
+function formatAllowedRateLimitWarning(info) {
+  if (info?.status !== "allowed_warning") return void 0;
+  const utilization = normalizeRateLimitUtilization(info.utilization);
+  if (utilization === void 0 || utilization < ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD) return void 0;
+  return `Claude rate limit warning: nearing ${rateLimitTypeLabel(info.rateLimitType)} limit; check Claude Code /usage for exact utilization.`;
+}
+
+// src/account-router.ts
+var CLAUDE_ACCOUNT_ROUTER_SYMBOL = /* @__PURE__ */ Symbol.for("vstack.pi.claude-account-router.v1");
+var CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL = /* @__PURE__ */ Symbol.for("vstack.pi.claude-bridge.account-host.v1");
+function resolveClaudeAccountRouter() {
+  const host = globalThis;
+  const candidate = host[CLAUDE_ACCOUNT_ROUTER_SYMBOL];
+  return candidate?.version === 1 ? candidate : void 0;
+}
+function subscriberProfileEnv(profile, base = process.env) {
+  const env = { ...base };
+  const directOverrides = /* @__PURE__ */ new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK"
+  ]);
+  for (const key of Object.keys(env)) {
+    if (directOverrides.has(key) || key.startsWith("CLAUDE_CODE_USE_")) delete env[key];
+  }
+  if (profile.configDir) env.CLAUDE_CONFIG_DIR = profile.configDir;
+  else delete env.CLAUDE_CONFIG_DIR;
+  return env;
+}
+function accountSessionScope(profile) {
+  return profile ? {
+    accountProfileId: profile.profileId,
+    ...profile.configDir ? { claudeConfigDir: profile.configDir } : {}
+  } : {};
+}
+function commitsVisibleOutput(event) {
+  if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") {
+    return event.delta.length > 0;
+  }
+  if (event.type === "text_end" || event.type === "thinking_end") return event.content.length > 0;
+  return event.type === "toolcall_end";
+}
+var RetryEventBuffer = class {
+  constructor(target, onCommit) {
+    this.target = target;
+    this.onCommit = onCommit;
+  }
+  target;
+  onCommit;
+  pending = [];
+  committed = false;
+  ended = false;
+  discarded = false;
+  push(event) {
+    if (this.discarded) return;
+    if (this.committed) {
+      this.target.push(event);
+      return;
+    }
+    this.pending.push(event);
+    if (commitsVisibleOutput(event) || event.type === "done" || event.type === "error") this.commit();
+  }
+  end() {
+    if (this.discarded) return;
+    this.ended = true;
+    if (this.committed) this.target.end();
+  }
+  commit() {
+    if (this.discarded || this.committed) return;
+    this.committed = true;
+    this.onCommit?.();
+    for (const event of this.pending) this.target.push(event);
+    this.pending.length = 0;
+    if (this.ended) this.target.end();
+  }
+  discard() {
+    if (this.committed) return;
+    this.discarded = true;
+    this.pending.length = 0;
+  }
+  get hasCommittedOutput() {
+    return this.committed;
+  }
+};
+function rateLimitTypeFromInfo(info) {
+  return info?.rateLimitType ?? info?.rate_limit_type ?? info?.type;
+}
+function rateLimitResetFromInfo(info) {
+  return info?.resetsAt ?? info?.resets_at ?? info?.resetAt ?? info?.reset_at;
+}
+function rateLimitResetMs(info) {
+  const value = rateLimitResetFromInfo(info);
+  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1e3 : value;
+  if (typeof value !== "string" || !value.trim()) return void 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1e3 : numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : void 0;
+}
+function classifyClaudeFailure(value) {
+  const details = [value];
+  if (value && typeof value === "object") {
+    const record2 = value;
+    details.push(record2.name, record2.message, record2.code, record2.status, record2.statusCode, record2.body, record2.error);
+  }
+  const text = details.map((detail) => {
+    if (typeof detail === "string" || typeof detail === "number") return String(detail);
+    try {
+      return JSON.stringify(detail ?? "");
+    } catch {
+      return String(detail);
+    }
+  }).join(" ");
+  const normalized = text.toLowerCase().replace(/[_-]+/g, " ");
+  if (/\b401\b|authentication (?:failed|error)|oauth org not allowed|oauth token.*expired|token.*expired|unauthorized|invalid token|login required|please run .*login|not logged in/.test(normalized)) return "auth";
+  if (/extra usage|overage/.test(normalized)) return "rate-limit";
+  if (/billing error|payment|required.*billing|credit balance.*(?:low|insufficient|empty)|insufficient credits/.test(normalized)) return "billing";
+  if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve (?:hit|reached) your .* limit|reached your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
+  if (/overloaded|capacity/.test(normalized)) return "overloaded";
+  if (/server error|internal server|\b5\d\d\b/.test(normalized)) return "server";
+  if (/network|timeout|timed out|socket|econn|connection closed|fetch failed|unexpected end|\beof\b/.test(normalized)) return "network";
+  return void 0;
 }
 
 // src/claude-executable.ts
 import { spawn as spawnProcess } from "child_process";
-import { accessSync, constants as fsConstants, readFileSync as readFileSync7, realpathSync as realpathSync2, statSync as statSync2 } from "fs";
-import { delimiter as delimiter2, join as join11 } from "path";
+import { accessSync, constants as fsConstants, readFileSync as readFileSync6, realpathSync as realpathSync2, statSync as statSync2 } from "fs";
+import { delimiter as delimiter2, join as join10 } from "path";
 function executableFromPath(name) {
   const paths = (process.env.PATH ?? "").split(delimiter2).filter(Boolean);
   for (const dir of paths) {
-    const candidate = join11(dir, name);
+    const candidate = join10(dir, name);
     try {
       accessSync(candidate, fsConstants.X_OK);
       return candidate;
@@ -53775,7 +53948,7 @@ function preflightClaudeExecutable(path, cwd) {
   }
   let fileType;
   try {
-    fileType = classifyClaudeExecutableBytes(readFileSync7(realPath).subarray(0, 16));
+    fileType = classifyClaudeExecutableBytes(readFileSync6(realPath).subarray(0, 16));
   } catch (err) {
     throw makeClaudePreflightError("Claude Code executable preflight failed: cannot read executable header before spawning Claude Code.", {
       code: codeValue(err, "EACCES"),
@@ -53866,6 +54039,318 @@ function spawnClaudeCodeWithDiagnostics(options) {
     once: child.once.bind(child),
     off: child.off.bind(child)
   };
+}
+
+// src/one-shot-summary.ts
+function isOneShotSummaryRequest(options) {
+  return options?.cacheRetention === "none";
+}
+function lastUserPromptBlocks(context) {
+  for (let i = context.messages.length - 1; i >= 0; i--) {
+    const message = context.messages[i];
+    if (message.role !== "user") continue;
+    const blocks = extractUserPromptBlocks([message]);
+    if (blocks) return blocks;
+    return [{ type: "text", text: extractUserPrompt([message]) ?? "" }];
+  }
+  return [{ type: "text", text: "" }];
+}
+function promptLength(blocks) {
+  return blocks.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0);
+}
+function mapStopReason(reason) {
+  return reason === "max_tokens" ? "length" : "stop";
+}
+function streamOneShotSummary(model, context, options, deps) {
+  const stream = deps.createStream();
+  const output = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now()
+  };
+  let ended = false;
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    stream.push({ type: "start", partial: output });
+  };
+  const fail = (message, reason = "error", extra) => {
+    if (ended) return;
+    ended = true;
+    output.stopReason = reason;
+    output.errorMessage = message;
+    if (extra) Object.assign(output, extra);
+    stream.push({ type: "error", reason, error: output });
+    stream.end();
+  };
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    start();
+    stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
+    stream.end();
+  };
+  const prepared = deps.prepare();
+  if (prepared.status === "failed") {
+    debug(`provider: one-shot summary not started: ${prepared.message}`);
+    queueMicrotask(() => fail(prepared.message, "error", Number.isFinite(prepared.resetAtMs) ? { resetAtMs: prepared.resetAtMs, rateLimitType: prepared.rateLimitType } : void 0));
+    return stream;
+  }
+  const { account, router } = prepared;
+  const blocks = lastUserPromptBlocks(context);
+  const inputChannel = createQueryInputChannel(blocks);
+  const queryOptions = {
+    cwd: deps.cwd,
+    model: model.id,
+    env: prepared.env,
+    // Pi's summarization system prompt, verbatim: no claude_code preset, no
+    // AGENTS.md append, no recorded snapshot. Pi 0.87 fixed Fable's summary
+    // refusals in this prompt, so it must reach the model unchanged.
+    systemPrompt: context.systemPrompt ?? "",
+    // No tools of any kind: built-ins off, nothing auto-allowed, no MCP servers
+    // (Pi's tools or claude.ai connectors), and no filesystem MCP discovery.
+    tools: [],
+    allowedTools: [],
+    disallowedTools: DISALLOWED_BUILTIN_TOOLS,
+    strictMcpConfig: true,
+    maxTurns: 1,
+    permissionMode: "bypassPermissions",
+    includePartialMessages: true,
+    // Ephemeral: the summary exchange must not become a resumable session or
+    // land in the account's project history.
+    persistSession: false,
+    settings: { ...prepared.fastMode ? { fastMode: true } : {}, autoMemoryEnabled: false },
+    extraArgs: prepared.extraArgs,
+    ...prepared.effort ? { effort: prepared.effort } : {},
+    ...prepared.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: prepared.pathToClaudeCodeExecutable } : {},
+    spawnClaudeCodeProcess: spawnClaudeCodeWithDiagnostics,
+    ...makeCliDebugOptions("one-shot-summary")
+  };
+  debug(
+    "provider: one-shot summary",
+    `model=${model.id} promptChars=${promptLength(blocks)} images=${blocks.some((block) => block.type === "image")}`,
+    `systemChars=${(context.systemPrompt ?? "").length} effort=${prepared.effort ?? "default"} account=${account?.label ?? "legacy"}`,
+    `activeQuery=${deps.activeQuery} resume=none mcpTools=0`
+  );
+  const sdkQuery = deps.queryFactory({ prompt: inputChannel.stream, options: queryOptions });
+  let aborted2 = false;
+  const onAbort = () => {
+    aborted2 = true;
+    inputChannel.close();
+    void sdkQuery.interrupt().catch(() => {
+    });
+    try {
+      sdkQuery.close();
+    } catch {
+    }
+  };
+  if (options?.signal?.aborted) onAbort();
+  else options?.signal?.addEventListener("abort", onAbort, { once: true });
+  void consume().finally(() => {
+    options?.signal?.removeEventListener("abort", onAbort);
+    inputChannel.close();
+    try {
+      sdkQuery.close();
+    } catch {
+    }
+  });
+  return stream;
+  async function consume() {
+    const blockIndex = /* @__PURE__ */ new Map();
+    let sawStreamContent = false;
+    let resultUsage;
+    const streamedUsage = {};
+    let failure;
+    const addBlock = (block) => {
+      start();
+      output.content.push(block);
+      return output.content.length - 1;
+    };
+    const addCompletedText = (text) => {
+      if (!text) return;
+      const index = addBlock({ type: "text", text });
+      stream.push({ type: "text_start", contentIndex: index, partial: output });
+      stream.push({ type: "text_delta", contentIndex: index, delta: text, partial: output });
+      stream.push({ type: "text_end", contentIndex: index, content: text, partial: output });
+    };
+    try {
+      for await (const message of sdkQuery) {
+        if (aborted2) break;
+        switch (message.type) {
+          case "stream_event": {
+            const event = message.event;
+            if (event?.type === "message_start") {
+              Object.assign(streamedUsage, event.message?.usage ?? {});
+            } else if (event?.type === "content_block_start") {
+              const type = event.content_block?.type;
+              if (type === "text") {
+                sawStreamContent = true;
+                const index = addBlock({ type: "text", text: "" });
+                blockIndex.set(event.index, index);
+                stream.push({ type: "text_start", contentIndex: index, partial: output });
+              } else if (type === "thinking") {
+                sawStreamContent = true;
+                const index = addBlock({ type: "thinking", thinking: "", thinkingSignature: "" });
+                blockIndex.set(event.index, index);
+                stream.push({ type: "thinking_start", contentIndex: index, partial: output });
+              } else {
+                debug(`one-shot summary: ignoring ${type} content block`);
+              }
+            } else if (event?.type === "content_block_delta") {
+              const index = blockIndex.get(event.index);
+              const block = index === void 0 ? void 0 : output.content[index];
+              if (!block || index === void 0) break;
+              if (event.delta?.type === "text_delta" && block.type === "text") {
+                block.text += event.delta.text;
+                stream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
+              } else if (event.delta?.type === "thinking_delta" && block.type === "thinking") {
+                block.thinking += event.delta.thinking;
+                stream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: output });
+              } else if (event.delta?.type === "signature_delta" && block.type === "thinking") {
+                block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
+              }
+            } else if (event?.type === "content_block_stop") {
+              const index = blockIndex.get(event.index);
+              const block = index === void 0 ? void 0 : output.content[index];
+              if (!block || index === void 0) break;
+              blockIndex.delete(event.index);
+              if (block.type === "text") stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
+              else if (block.type === "thinking") stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
+            } else if (event?.type === "message_delta") {
+              output.stopReason = mapStopReason(event.delta?.stop_reason);
+              Object.assign(streamedUsage, event.usage ?? {});
+            }
+            break;
+          }
+          case "assistant": {
+            const sdkError = message.error;
+            if (sdkError) {
+              failure ??= { kind: classifyClaudeFailure(sdkError), message: String(sdkError) };
+              break;
+            }
+            if (!sawStreamContent) {
+              for (const block of message.message?.content ?? []) {
+                if (block?.type === "text") addCompletedText(block.text ?? "");
+              }
+              sawStreamContent = output.content.length > 0;
+            }
+            break;
+          }
+          case "result": {
+            inputChannel.close();
+            const result = message;
+            if (result.usage) resultUsage = result.usage;
+            if (failure) break;
+            if (result.subtype === "success") {
+              if (!sawStreamContent) addCompletedText(String(result.result ?? ""));
+            } else if (result.subtype === "error_max_turns") {
+              debug("one-shot summary: result error_max_turns; delivering the text received");
+            } else {
+              const lines = Array.isArray(result.errors) ? uniqueNonEmptyLines(result.errors) : [];
+              const text = lines.length > 0 ? lines.join("\n") : String(result.result || result.subtype || "Claude Code request failed");
+              failure = { kind: isUsageLimitMessage(message) ? "rate-limit" : classifyClaudeFailure(text), message: text };
+            }
+            break;
+          }
+          case "rate_limit_event": {
+            const info = message.rate_limit_info;
+            if (info?.status === "rejected") {
+              const type = String(info.rateLimitType ?? info.rate_limit_type ?? "unknown");
+              failure = { kind: "rate-limit", message: `${type} rate limit`, rateLimited: true };
+              if (account && router) router.recordRateLimit(account.profileId, info, model.id);
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    } catch (error51) {
+      if (!aborted2) {
+        failure ??= { kind: classifyClaudeFailure(error51), message: error51 instanceof Error ? error51.message : String(error51) };
+      }
+    }
+    if (aborted2 || options?.signal?.aborted) {
+      debug("one-shot summary: aborted");
+      fail("Operation aborted", "aborted");
+      return;
+    }
+    if (failure) {
+      debug(`one-shot summary: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
+      if (account && router && failure.kind && !failure.rateLimited) {
+        router.recordFailure(account.profileId, failure.kind, model.id);
+      }
+      fail(failure.message);
+      return;
+    }
+    const usage = resultUsage ?? streamedUsage;
+    output.usage.input = usage.input_tokens ?? 0;
+    output.usage.output = usage.output_tokens ?? 0;
+    output.usage.cacheRead = usage.cache_read_input_tokens ?? 0;
+    output.usage.cacheWrite = usage.cache_creation_input_tokens ?? 0;
+    output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+    calculateCost(model, output.usage);
+    debug(`one-shot summary: done, chars=${output.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)} in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} stop=${output.stopReason}`);
+    finish();
+  }
+}
+
+// src/connector-cache.ts
+import { createHash } from "node:crypto";
+import { mkdirSync as mkdirSync3, readFileSync as readFileSync7, writeFileSync } from "node:fs";
+import { dirname as dirname8, join as join11 } from "node:path";
+var CACHE_VERSION = 1;
+var MAX_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
+function connectorCacheScopeKey(env = process.env) {
+  return env.CLAUDE_CONFIG_DIR?.trim() || "<default>";
+}
+function connectorCachePath(scopeKey = connectorCacheScopeKey()) {
+  const digest = createHash("sha256").update(scopeKey).digest("hex").slice(0, 16);
+  return join11(piUserDir(), "connector-cache", `${digest}.json`);
+}
+function readCachedConnectors(scopeKey = connectorCacheScopeKey(), now = Date.now()) {
+  let raw;
+  try {
+    raw = readFileSync7(connectorCachePath(scopeKey), "utf8");
+  } catch {
+    return void 0;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+  if (parsed?.version !== CACHE_VERSION) return void 0;
+  if (parsed?.scope !== scopeKey) return void 0;
+  const savedAt = typeof parsed?.savedAt === "number" ? parsed.savedAt : 0;
+  if (!savedAt || now - savedAt > MAX_AGE_MS || savedAt > now) return void 0;
+  if (!Array.isArray(parsed?.connectors)) return void 0;
+  const connectors = parsed.connectors.filter(
+    (entry) => entry && typeof entry.name === "string" && entry.name.trim()
+  );
+  return connectors.length > 0 ? connectors : void 0;
+}
+function writeCachedConnectors(connectors, scopeKey = connectorCacheScopeKey(), now = Date.now()) {
+  if (!Array.isArray(connectors) || connectors.length === 0) return false;
+  const path = connectorCachePath(scopeKey);
+  try {
+    mkdirSync3(dirname8(path), { recursive: true, mode: 448 });
+    writeFileSync(
+      path,
+      JSON.stringify({ version: CACHE_VERSION, scope: scopeKey, savedAt: now, connectors }),
+      { mode: 384 }
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // node_modules/cc-session-io/dist/chunk-7JUXR4CP.js
@@ -55159,102 +55644,6 @@ function createStreamIdleWatchdog({
   };
 }
 
-// src/rate-limit.ts
-var RATE_LIMIT_AUTO_RESUME_EVENT = "vstack:rate-limit";
-var RATE_LIMIT_TOKEN = "\x1B[31m[rate-limit]\x1B[39m";
-var USAGE_LIMIT_PREFIXES = Array.isArray(Aj) ? Aj : [];
-function coerceMessageText(value) {
-  if (typeof value === "string") return value;
-  if (value instanceof Error) return value.message;
-  try {
-    return JSON.stringify(value ?? "");
-  } catch {
-    return String(value);
-  }
-}
-function isUsageLimitMessage(value) {
-  const text = coerceMessageText(value);
-  return USAGE_LIMIT_PREFIXES.some((prefix) => text.includes(prefix));
-}
-function modelFamilyFromLimitMessage(value) {
-  const text = coerceMessageText(value);
-  const match = /\byour (fable|opus|sonnet|haiku)\b[^.\n]{0,40}?\blimit\b/i.exec(text);
-  return match ? match[1].toLowerCase() : void 0;
-}
-function attachAttemptFailure(error51, failure) {
-  if (failure && error51 && typeof error51 === "object" && !("claudeAttemptFailure" in error51)) {
-    try {
-      Object.defineProperty(error51, "claudeAttemptFailure", { value: failure, enumerable: false });
-    } catch {
-    }
-  }
-  return error51;
-}
-function attachedAttemptFailure(error51) {
-  return error51 && typeof error51 === "object" ? error51.claudeAttemptFailure : void 0;
-}
-function uniqueNonEmptyLines(values) {
-  const seen = /* @__PURE__ */ new Set();
-  const out = [];
-  for (const value of values) {
-    const text = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
-    if (!text || seen.has(text)) continue;
-    seen.add(text);
-    out.push(text);
-  }
-  return out;
-}
-function resetTimestampMs(value) {
-  let parsed = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
-  if (!Number.isFinite(parsed)) return void 0;
-  if (typeof value === "number" && Math.abs(parsed) < 1e12) parsed *= 1e3;
-  return parsed;
-}
-function formatResetTimestamp(value) {
-  const parsed = resetTimestampMs(value);
-  if (parsed === void 0) return "unknown";
-  return new Date(parsed).toLocaleString(void 0, {
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    month: "short",
-    second: "2-digit",
-    timeZoneName: "short",
-    year: "numeric"
-  });
-}
-var PI_NON_RETRYABLE_DETAIL_PATTERN = /billing|quota|budget|balance|insufficient/i;
-function formatAutoResumeRateLimitMessage(input) {
-  const type = input.rateLimitType?.trim();
-  const resetMs = resetTimestampMs(input.resetAt);
-  const parts = [
-    `Claude rate limit on ${input.accountLabel}${type ? ` (${type})` : ""}`,
-    resetMs !== void 0 ? `resets ${formatResetTimestamp(resetMs)}` : void 0,
-    `Pi auto-retry resumes this turn on ${input.nextAccountLabel}`
-  ].filter((part) => Boolean(part));
-  const detail = input.detail?.trim();
-  const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail) ? detail.replace(/\s+/g, " ").slice(0, 200) : void 0;
-  return `${parts.join(" \u2014 ")}.${quotable ? ` (${quotable})` : ""}`;
-}
-var ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
-function normalizeRateLimitUtilization(value) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
-  if (value === 0) return 0;
-  if (value > 0 && value < 1) return value * 100;
-  if (value > 1 && value <= 100) return value;
-  return void 0;
-}
-function rateLimitTypeLabel(value) {
-  const text = typeof value === "string" ? value.trim() : "";
-  return text || "unknown";
-}
-function formatAllowedRateLimitWarning(info) {
-  if (info?.status !== "allowed_warning") return void 0;
-  const utilization = normalizeRateLimitUtilization(info.utilization);
-  if (utilization === void 0 || utilization < ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD) return void 0;
-  return `Claude rate limit warning: nearing ${rateLimitTypeLabel(info.rateLimitType)} limit; check Claude Code /usage for exact utilization.`;
-}
-
 // src/tool-mapping.ts
 var SDK_TO_PI_TOOL_NAME = {
   read: "read",
@@ -55300,7 +55689,7 @@ function mapToolArgs(toolName, args) {
 }
 
 // src/assistant-stream.ts
-import { calculateCost } from "@earendil-works/pi-ai";
+import { calculateCost as calculateCost2 } from "@earendil-works/pi-ai";
 function updateUsage(output, usage, model) {
   const c = ctx();
   const current = c.currentMessageUsage;
@@ -55314,12 +55703,12 @@ function updateUsage(output, usage, model) {
   output.usage.cacheRead = carry.cacheRead + current.cacheRead;
   output.usage.cacheWrite = carry.cacheWrite + current.cacheWrite;
   output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-  calculateCost(model, output.usage);
+  calculateCost2(model, output.usage);
   const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
   const cachePct = promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0;
   debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens} cachePct=${cachePct}% model=${model.id}`);
 }
-function mapStopReason(reason) {
+function mapStopReason2(reason) {
   switch (reason) {
     case "tool_use":
       return "toolUse";
@@ -55634,7 +56023,7 @@ function processStreamEvent(message, customToolNameToPi, model) {
     return;
   }
   if (event?.type === "message_delta") {
-    c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
+    c.turnOutput.stopReason = mapStopReason2(event.delta?.stop_reason);
     if (event.usage) updateUsage(c.turnOutput, event.usage, model);
     return;
   }
@@ -55791,132 +56180,6 @@ function processAssistantMessage(message, model, customToolNameToPi) {
   if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
     endToolUseTurn(c);
   }
-}
-
-// src/account-router.ts
-var CLAUDE_ACCOUNT_ROUTER_SYMBOL = /* @__PURE__ */ Symbol.for("vstack.pi.claude-account-router.v1");
-var CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL = /* @__PURE__ */ Symbol.for("vstack.pi.claude-bridge.account-host.v1");
-function resolveClaudeAccountRouter() {
-  const host = globalThis;
-  const candidate = host[CLAUDE_ACCOUNT_ROUTER_SYMBOL];
-  return candidate?.version === 1 ? candidate : void 0;
-}
-function subscriberProfileEnv(profile, base = process.env) {
-  const env = { ...base };
-  const directOverrides = /* @__PURE__ */ new Set([
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_AWS_API_KEY",
-    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "AWS_BEARER_TOKEN_BEDROCK"
-  ]);
-  for (const key of Object.keys(env)) {
-    if (directOverrides.has(key) || key.startsWith("CLAUDE_CODE_USE_")) delete env[key];
-  }
-  if (profile.configDir) env.CLAUDE_CONFIG_DIR = profile.configDir;
-  else delete env.CLAUDE_CONFIG_DIR;
-  return env;
-}
-function accountSessionScope(profile) {
-  return profile ? {
-    accountProfileId: profile.profileId,
-    ...profile.configDir ? { claudeConfigDir: profile.configDir } : {}
-  } : {};
-}
-function commitsVisibleOutput(event) {
-  if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") {
-    return event.delta.length > 0;
-  }
-  if (event.type === "text_end" || event.type === "thinking_end") return event.content.length > 0;
-  return event.type === "toolcall_end";
-}
-var RetryEventBuffer = class {
-  constructor(target, onCommit) {
-    this.target = target;
-    this.onCommit = onCommit;
-  }
-  target;
-  onCommit;
-  pending = [];
-  committed = false;
-  ended = false;
-  discarded = false;
-  push(event) {
-    if (this.discarded) return;
-    if (this.committed) {
-      this.target.push(event);
-      return;
-    }
-    this.pending.push(event);
-    if (commitsVisibleOutput(event) || event.type === "done" || event.type === "error") this.commit();
-  }
-  end() {
-    if (this.discarded) return;
-    this.ended = true;
-    if (this.committed) this.target.end();
-  }
-  commit() {
-    if (this.discarded || this.committed) return;
-    this.committed = true;
-    this.onCommit?.();
-    for (const event of this.pending) this.target.push(event);
-    this.pending.length = 0;
-    if (this.ended) this.target.end();
-  }
-  discard() {
-    if (this.committed) return;
-    this.discarded = true;
-    this.pending.length = 0;
-  }
-  get hasCommittedOutput() {
-    return this.committed;
-  }
-};
-function rateLimitTypeFromInfo(info) {
-  return info?.rateLimitType ?? info?.rate_limit_type ?? info?.type;
-}
-function rateLimitResetFromInfo(info) {
-  return info?.resetsAt ?? info?.resets_at ?? info?.resetAt ?? info?.reset_at;
-}
-function rateLimitResetMs(info) {
-  const value = rateLimitResetFromInfo(info);
-  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1e3 : value;
-  if (typeof value !== "string" || !value.trim()) return void 0;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1e3 : numeric;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : void 0;
-}
-function classifyClaudeFailure(value) {
-  const details = [value];
-  if (value && typeof value === "object") {
-    const record2 = value;
-    details.push(record2.name, record2.message, record2.code, record2.status, record2.statusCode, record2.body, record2.error);
-  }
-  const text = details.map((detail) => {
-    if (typeof detail === "string" || typeof detail === "number") return String(detail);
-    try {
-      return JSON.stringify(detail ?? "");
-    } catch {
-      return String(detail);
-    }
-  }).join(" ");
-  const normalized = text.toLowerCase().replace(/[_-]+/g, " ");
-  if (/\b401\b|authentication (?:failed|error)|oauth org not allowed|oauth token.*expired|token.*expired|unauthorized|invalid token|login required|please run .*login|not logged in/.test(normalized)) return "auth";
-  if (/extra usage|overage/.test(normalized)) return "rate-limit";
-  if (/billing error|payment|required.*billing|credit balance.*(?:low|insufficient|empty)|insufficient credits/.test(normalized)) return "billing";
-  if (/\b429\b|rate limit|usage limit|session limit|weekly limit|monthly limit|limit reached|you(?:'|’)ve (?:hit|reached) your .* limit|reached your .* limit|quota|too many requests|resets? (?:at )?\d/.test(normalized)) return "rate-limit";
-  if (/overloaded|capacity/.test(normalized)) return "overloaded";
-  if (/server error|internal server|\b5\d\d\b/.test(normalized)) return "server";
-  if (/network|timeout|timed out|socket|econn|connection closed|fetch failed|unexpected end|\beof\b/.test(normalized)) return "network";
-  return void 0;
 }
 
 // src/index.ts
@@ -56192,6 +56455,72 @@ function resolveConfiguredEffort(modelId, reasoningEffort, providerConfig) {
   }
   return normalizeEffortLevel(providerConfig?.forceEffort) ?? reasoningEffort;
 }
+function resolveRequestEffort(model, reasoning, providerConfig) {
+  const requestedEffort = reasoning ? model.thinkingLevelMap?.[reasoning] ?? REASONING_TO_EFFORT[reasoning] : void 0;
+  return resolveConfiguredEffort(model.id, requestedEffort, providerConfig);
+}
+function effortExtraArgs(effort) {
+  const extraArgs = {};
+  if (effort) extraArgs["thinking-display"] = "summarized";
+  return extraArgs;
+}
+function buildChildEnv(account, enableCloudMcp) {
+  return {
+    ...account ? subscriberProfileEnv(account) : process.env,
+    ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
+    DISABLE_AUTO_COMPACT: "1",
+    // Static system prompt ("carved slate"). Without it the CLI renders the
+    // claude_code preset fresh on every launch, including the git status
+    // snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
+    // this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
+    // turn is a fresh launch, so in a repository where files change between
+    // turns the system prompt differed on most resumes and the API re-wrote
+    // the whole conversation behind the ~15k static prefix. Verified
+    // 2026-09-16: with the flag off, touching one untracked file between
+    // turns cost a 199k-token cache rewrite; with it on the same turn is a
+    // full cache hit. Environment changes are then delivered to the model as
+    // an appended "# Environment update" message instead.
+    CLAUDE_CODE_CARVED_SLATE: "1"
+  };
+}
+function missingClaudeAccountMessage() {
+  if (hasClaudeCredentials() || resolveClaudeAccountRouter()) return void 0;
+  try {
+    applyProviderRegistration("pre-spawn");
+  } catch {
+  }
+  return "Claude account not connected \u2014 connect an account (or run `claude login`) and retry.";
+}
+function acquireRequestAccount(router, model, sessionId, excludedProfileIds) {
+  try {
+    const accountFailover = excludedProfileIds.length > 0;
+    const account = router.acquire({
+      modelId: model.id,
+      sessionId,
+      excludedProfileIds,
+      forceRerank: accountFailover,
+      reason: accountFailover ? "automatic-failover" : void 0
+    });
+    return { status: "acquired", account };
+  } catch (error51) {
+    const message = error51 instanceof Error ? error51.message : String(error51);
+    const resetAtMs = Number(error51?.resetAtMs);
+    const rateLimitType = error51?.rateLimitType;
+    if (Number.isFinite(resetAtMs)) {
+      emitRateLimitEvent({
+        model: model.id,
+        provider: model.provider,
+        rateLimitType: rateLimitType ?? "all_accounts",
+        reason: message,
+        resetAt: new Date(resetAtMs).toISOString(),
+        resetAtMs,
+        source: "claude-bridge",
+        status: "rejected"
+      });
+    }
+    return { status: "unavailable", message, resetAtMs, rateLimitType };
+  }
+}
 function isClaudeContextLengthFailure(message) {
   return /\bprompt is too long\b|\binput (?:is |was )?too long\b|\bcontext(?: window)? (?:is |was )?(?:too long|exceeded|overflow)|\bexceeds? (?:the )?context window\b/i.test(message);
 }
@@ -56427,10 +56756,50 @@ function applyProviderRegistration(trigger) {
     debug(`${trigger}: registerProvider threw; released stream guard for retry (kept primary):`, err);
   }
 }
+function streamOneShotSummaryRequest(model, context, options) {
+  const cwd = options?.cwd ?? process.cwd();
+  return streamOneShotSummary(model, context, options, {
+    cwd,
+    createStream: newAssistantMessageEventStream,
+    queryFactory: sdkQueryFactory,
+    activeQuery: ctx().activeQuery !== null,
+    prepare: () => {
+      const missingAccount = missingClaudeAccountMessage();
+      if (missingAccount) return { status: "failed", message: missingAccount };
+      const router = resolveClaudeAccountRouter();
+      let account;
+      if (router) {
+        const acquisition = acquireRequestAccount(router, model, options?.sessionId, []);
+        if (acquisition.status === "unavailable") return { ...acquisition, status: "failed" };
+        account = acquisition.account;
+      }
+      const providerSettings = loadConfig(cwd).provider ?? {};
+      const effort = resolveRequestEffort(model, options?.reasoning, providerSettings);
+      const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
+      try {
+        if (claudeExecutable) preflightClaudeExecutable(claudeExecutable, cwd);
+      } catch (error51) {
+        return { status: "failed", message: error51 instanceof Error ? error51.message : String(error51) };
+      }
+      return {
+        status: "ready",
+        account,
+        router,
+        // Connectors stay off: a summary never calls tools.
+        env: buildChildEnv(account, false),
+        effort,
+        extraArgs: effortExtraArgs(effort),
+        fastMode: providerSettings.fastMode === true,
+        ...claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}
+      };
+    }
+  });
+}
 function streamClaudeAgentSdk(model, context, options) {
   return streamWithContext(model, toLegacyContext(context), options);
 }
 function streamWithContext(model, context, options) {
+  if (isOneShotSummaryRequest(options)) return streamOneShotSummaryRequest(model, context, options);
   const stream = newAssistantMessageEventStream();
   const lastMsgRole = context.messages[context.messages.length - 1]?.role;
   const cwd = options?.cwd ?? process.cwd();
@@ -56560,12 +56929,9 @@ function streamWithContext(model, context, options) {
     });
     return stream;
   }
-  if (!hasClaudeCredentials() && !resolveClaudeAccountRouter()) {
-    try {
-      applyProviderRegistration("pre-spawn");
-    } catch {
-    }
-    const message = "Claude account not connected \u2014 connect an account (or run `claude login`) and retry.";
+  const missingAccount = missingClaudeAccountMessage();
+  if (missingAccount) {
+    const message = missingAccount;
     debug(`provider: pre-spawn credential check failed; failing fast: ${message}`);
     const errorOutput = {
       role: "assistant",
@@ -56611,38 +56977,18 @@ function streamWithContext(model, context, options) {
   };
   let account;
   if (router) {
-    try {
-      const accountFailover = rotationState.excludedProfileIds.size > 0;
-      account = router.acquire({
-        modelId: model.id,
-        sessionId: options?.sessionId,
-        excludedProfileIds: [...rotationState.excludedProfileIds],
-        forceRerank: accountFailover,
-        reason: accountFailover ? "automatic-failover" : void 0
-      });
+    const acquisition = acquireRequestAccount(router, model, options?.sessionId, [...rotationState.excludedProfileIds]);
+    if (acquisition.status === "acquired") {
+      account = acquisition.account;
       rotationState.attempts += 1;
-    } catch (error51) {
-      const message = error51 instanceof Error ? error51.message : String(error51);
-      const resetAtMs = Number(error51?.resetAtMs);
-      const rateLimitType = error51?.rateLimitType;
+    } else {
+      const { message, resetAtMs, rateLimitType } = acquisition;
       if (ctx().turnOutput) {
         ctx().turnOutput.stopReason = "error";
         ctx().turnOutput.errorMessage = message;
         if (Number.isFinite(resetAtMs)) {
           Object.assign(ctx().turnOutput, { resetAtMs, rateLimitType });
         }
-      }
-      if (Number.isFinite(resetAtMs)) {
-        emitRateLimitEvent({
-          model: model.id,
-          provider: model.provider,
-          rateLimitType: rateLimitType ?? "all_accounts",
-          reason: message,
-          resetAt: new Date(resetAtMs).toISOString(),
-          resetAtMs,
-          source: "claude-bridge",
-          status: "rejected"
-        });
       }
       const errorOutput = ctx().turnOutput;
       if (isReentrant) popContext();
@@ -56709,27 +57055,9 @@ function streamWithContext(model, context, options) {
   const inputChannel = createQueryInputChannel(initialBlocks);
   ctx().inputChannel = inputChannel;
   const prompt = inputChannel.stream;
-  const requestedEffort = options?.reasoning ? queryModel.thinkingLevelMap?.[options.reasoning] ?? REASONING_TO_EFFORT[options.reasoning] : void 0;
-  const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);
-  const extraArgs = {};
-  if (effort) extraArgs["thinking-display"] = "summarized";
-  const childEnv = {
-    ...account ? subscriberProfileEnv(account) : process.env,
-    ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
-    DISABLE_AUTO_COMPACT: "1",
-    // Static system prompt ("carved slate"). Without it the CLI renders the
-    // claude_code preset fresh on every launch, including the git status
-    // snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
-    // this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
-    // turn is a fresh launch, so in a repository where files change between
-    // turns the system prompt differed on most resumes and the API re-wrote
-    // the whole conversation behind the ~15k static prefix. Verified
-    // 2026-09-16: with the flag off, touching one untracked file between
-    // turns cost a 199k-token cache rewrite; with it on the same turn is a
-    // full cache hit. Environment changes are then delivered to the model as
-    // an appended "# Environment update" message instead.
-    CLAUDE_CODE_CARVED_SLATE: "1"
-  };
+  const effort = resolveRequestEffort(queryModel, options?.reasoning, providerSettings);
+  const extraArgs = effortExtraArgs(effort);
+  const childEnv = buildChildEnv(account, enableCloudMcp);
   const queryOptions = {
     cwd,
     model: queryModel.id,

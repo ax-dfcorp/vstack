@@ -35,6 +35,7 @@ import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
+import { isOneShotSummaryRequest, streamOneShotSummary } from "./one-shot-summary.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
 // regenerate their vendored package.json with a CLOSED exports map
@@ -540,6 +541,113 @@ export function resolveConfiguredEffort(
 	return (normalizeEffortLevel(providerConfig?.forceEffort) as EffortLevel | undefined) ?? reasoningEffort;
 }
 
+/** The effort a request on this model runs at: Pi's reasoning level mapped to a
+ *  Claude effort, then the configured overrides. */
+function resolveRequestEffort(model: Model<any>, reasoning: string | undefined, providerConfig?: Config["provider"]): EffortLevel | undefined {
+	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
+	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
+	// Fall back to our generic table for older pi-ai or unmapped levels.
+	const requestedEffort = reasoning
+		? ((model as any).thinkingLevelMap?.[reasoning] as EffortLevel | undefined)
+			?? REASONING_TO_EFFORT[reasoning]
+		: undefined;
+	return resolveConfiguredEffort(model.id, requestedEffort, providerConfig);
+}
+
+function effortExtraArgs(effort: EffortLevel | undefined): Record<string, string | null> {
+	const extraArgs: Record<string, string | null> = {};
+	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
+	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
+	// Deliberately the raw flag, NOT the typed `thinking` option: every non-disabled
+	// ThinkingConfig also emits `--thinking adaptive` or `--max-thinking-tokens`
+	// (verified in sdk.mjs flag mapping), so the typed form cannot set display
+	// without overriding the model's thinking mode alongside our `--effort`.
+	if (effort) extraArgs["thinking-display"] = "summarized";
+	return extraArgs;
+}
+
+// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
+// when the user is logged into Anthropic). These are a separate code path from
+// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
+// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
+// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
+// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
+// /compact via session_compact (see handler in default export). Letting CC
+// also autocompact would double-flush the prompt cache and races pi's
+// threshold with CC's, including CC's anti-thrashing guard (issue #8).
+// Manual /compact in CC still works (we never invoke it).
+// When connectors are enabled, allow claude.ai cloud MCP servers so the
+// authenticated account's Gmail/Calendar/Drive tools load. Default stays "0".
+function buildChildEnv(account: ClaudeAccountRoute | undefined, enableCloudMcp: boolean): Record<string, string | undefined> {
+	return {
+		...(account ? subscriberProfileEnv(account) : process.env),
+		ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
+		DISABLE_AUTO_COMPACT: "1",
+		// Static system prompt ("carved slate"). Without it the CLI renders the
+		// claude_code preset fresh on every launch, including the git status
+		// snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
+		// this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
+		// turn is a fresh launch, so in a repository where files change between
+		// turns the system prompt differed on most resumes and the API re-wrote
+		// the whole conversation behind the ~15k static prefix. Verified
+		// 2026-09-16: with the flag off, touching one untracked file between
+		// turns cost a 199k-token cache rewrite; with it on the same turn is a
+		// full cache hit. Environment changes are then delivered to the model as
+		// an appended "# Environment update" message instead.
+		CLAUDE_CODE_CARVED_SLATE: "1",
+	};
+}
+
+/** Undefined when a Claude account is available. Otherwise re-upserts provider
+ *  availability (so pi hides the models) and returns the actionable message. */
+function missingClaudeAccountMessage(): string | undefined {
+	if (hasClaudeCredentials() || resolveClaudeAccountRouter()) return undefined;
+	try { applyProviderRegistration("pre-spawn"); } catch { /* best effort */ }
+	return "Claude account not connected — connect an account (or run `claude login`) and retry.";
+}
+
+type AccountAcquisition =
+	| { status: "acquired"; account: ClaudeAccountRoute }
+	| { status: "unavailable"; message: string; resetAtMs: number; rateLimitType: unknown };
+
+/** Ask the companion router for this request's account. A refusal that names a
+ *  reset time is broadcast as a rate-limit event for pi-qol's auto-resume. */
+function acquireRequestAccount(
+	router: ClaudeAccountRouterV1,
+	model: Model<any>,
+	sessionId: string | undefined,
+	excludedProfileIds: string[],
+): AccountAcquisition {
+	try {
+		const accountFailover = excludedProfileIds.length > 0;
+		const account = router.acquire({
+			modelId: model.id,
+			sessionId,
+			excludedProfileIds,
+			forceRerank: accountFailover,
+			reason: accountFailover ? "automatic-failover" : undefined,
+		});
+		return { status: "acquired", account };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const resetAtMs = Number((error as { resetAtMs?: unknown })?.resetAtMs);
+		const rateLimitType = (error as { rateLimitType?: unknown })?.rateLimitType;
+		if (Number.isFinite(resetAtMs)) {
+			emitRateLimitEvent({
+				model: model.id,
+				provider: model.provider,
+				rateLimitType: rateLimitType ?? "all_accounts",
+				reason: message,
+				resetAt: new Date(resetAtMs).toISOString(),
+				resetAtMs,
+				source: "claude-bridge",
+				status: "rejected",
+			});
+		}
+		return { status: "unavailable", message, resetAtMs, rateLimitType };
+	}
+}
+
 // --- Provider: streaming function ---
 //
 // Push-based streaming with MCP tool bridge:
@@ -905,6 +1013,46 @@ function applyProviderRegistration(trigger: string): void {
 	}
 }
 
+function streamOneShotSummaryRequest(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	return streamOneShotSummary(model, context, options, {
+		cwd,
+		createStream: newAssistantMessageEventStream,
+		queryFactory: sdkQueryFactory,
+		activeQuery: ctx().activeQuery !== null,
+		prepare: () => {
+			const missingAccount = missingClaudeAccountMessage();
+			if (missingAccount) return { status: "failed", message: missingAccount };
+			const router = resolveClaudeAccountRouter();
+			let account: ClaudeAccountRoute | undefined;
+			if (router) {
+				const acquisition = acquireRequestAccount(router, model, options?.sessionId, []);
+				if (acquisition.status === "unavailable") return { ...acquisition, status: "failed" };
+				account = acquisition.account;
+			}
+			const providerSettings = loadConfig(cwd).provider ?? {};
+			const effort = resolveRequestEffort(model, options?.reasoning, providerSettings);
+			const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
+			try {
+				if (claudeExecutable) preflightClaudeExecutable(claudeExecutable, cwd);
+			} catch (error) {
+				return { status: "failed", message: error instanceof Error ? error.message : String(error) };
+			}
+			return {
+				status: "ready",
+				account,
+				router,
+				// Connectors stay off: a summary never calls tools.
+				env: buildChildEnv(account, false),
+				effort,
+				extraArgs: effortExtraArgs(effort),
+				fastMode: providerSettings.fastMode === true,
+				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+			};
+		},
+	});
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. Pi 0.86+
  *  passes a TranscriptContext; everything below reads the Context shape, so it
@@ -914,6 +1062,13 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context | Trans
 }
 
 function streamWithContext(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	// Pi's compaction and branch summaries are self-contained completions, not
+	// turns of this conversation. They run as an isolated one-shot query ahead of
+	// every session path below — in particular ahead of tool-result delivery, which
+	// would otherwise write the summary prompt into a live tool-use query as a
+	// steer and deadlock it (see one-shot-summary.ts).
+	if (isOneShotSummaryRequest(options)) return streamOneShotSummaryRequest(model, context, options);
+
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -1109,9 +1264,9 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// the logout-visibility window from "next session boundary" to "first use":
 	// if neither a direct Claude login nor the companion account pool exists,
 	// re-upsert provider availability and fail with an actionable message.
-	if (!hasClaudeCredentials() && !resolveClaudeAccountRouter()) {
-		try { applyProviderRegistration("pre-spawn"); } catch { /* best effort */ }
-		const message = "Claude account not connected — connect an account (or run `claude login`) and retry.";
+	const missingAccount = missingClaudeAccountMessage();
+	if (missingAccount) {
+		const message = missingAccount;
 		debug(`provider: pre-spawn credential check failed; failing fast: ${message}`);
 		const errorOutput: AssistantMessage = {
 			role: "assistant", content: [],
@@ -1153,38 +1308,18 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	};
 	let account: ClaudeAccountRoute | undefined;
 	if (router) {
-		try {
-			const accountFailover = rotationState.excludedProfileIds.size > 0;
-			account = router.acquire({
-				modelId: model.id,
-				sessionId: options?.sessionId,
-				excludedProfileIds: [...rotationState.excludedProfileIds],
-				forceRerank: accountFailover,
-				reason: accountFailover ? "automatic-failover" : undefined,
-			});
+		const acquisition = acquireRequestAccount(router, model, options?.sessionId, [...rotationState.excludedProfileIds]);
+		if (acquisition.status === "acquired") {
+			account = acquisition.account;
 			rotationState.attempts += 1;
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const resetAtMs = Number((error as { resetAtMs?: unknown })?.resetAtMs);
-			const rateLimitType = (error as { rateLimitType?: unknown })?.rateLimitType;
+		} else {
+			const { message, resetAtMs, rateLimitType } = acquisition;
 			if (ctx().turnOutput) {
 				ctx().turnOutput.stopReason = "error";
 				ctx().turnOutput.errorMessage = message;
 				if (Number.isFinite(resetAtMs)) {
 					Object.assign(ctx().turnOutput as AssistantMessage & Record<string, unknown>, { resetAtMs, rateLimitType });
 				}
-			}
-			if (Number.isFinite(resetAtMs)) {
-				emitRateLimitEvent({
-					model: model.id,
-					provider: model.provider,
-					rateLimitType: rateLimitType ?? "all_accounts",
-					reason: message,
-					resetAt: new Date(resetAtMs).toISOString(),
-					resetAtMs,
-					source: "claude-bridge",
-					status: "rejected",
-				});
 			}
 			const errorOutput = ctx().turnOutput!;
 			if (isReentrant) popContext();
@@ -1295,52 +1430,9 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	ctx().inputChannel = inputChannel;
 	const prompt: AsyncIterable<SDKUserMessage> = inputChannel.stream;
 
-	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
-	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
-	// Fall back to our generic table for older pi-ai or unmapped levels.
-	const requestedEffort = options?.reasoning
-		? ((queryModel as any).thinkingLevelMap?.[options.reasoning] as EffortLevel | undefined)
-			?? REASONING_TO_EFFORT[options.reasoning]
-		: undefined;
-	const effort = resolveConfiguredEffort(queryModel.id, requestedEffort, providerSettings);
-
-	const extraArgs: Record<string, string | null> = {};
-	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
-	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
-	// Deliberately the raw flag, NOT the typed `thinking` option: every non-disabled
-	// ThinkingConfig also emits `--thinking adaptive` or `--max-thinking-tokens`
-	// (verified in sdk.mjs flag mapping), so the typed form cannot set display
-	// without overriding the model's thinking mode alongside our `--effort`.
-	if (effort) extraArgs["thinking-display"] = "summarized";
-	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
-	// when the user is logged into Anthropic). These are a separate code path from
-	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
-	// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
-	// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
-	// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
-	// /compact via session_compact (see handler in default export). Letting CC
-	// also autocompact would double-flush the prompt cache and races pi's
-	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
-	// Manual /compact in CC still works (we never invoke it).
-	// When connectors are enabled, allow claude.ai cloud MCP servers so the
-	// authenticated account's Gmail/Calendar/Drive tools load. Default stays "0".
-	const childEnv = {
-		...(account ? subscriberProfileEnv(account) : process.env),
-		ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
-		DISABLE_AUTO_COMPACT: "1",
-		// Static system prompt ("carved slate"). Without it the CLI renders the
-		// claude_code preset fresh on every launch, including the git status
-		// snapshot, and ignores `systemPrompt.snapshot` (the recorder is gated on
-		// this flag; CLI 2.1.258 defaults it off via a server-side flag). Every pi
-		// turn is a fresh launch, so in a repository where files change between
-		// turns the system prompt differed on most resumes and the API re-wrote
-		// the whole conversation behind the ~15k static prefix. Verified
-		// 2026-09-16: with the flag off, touching one untracked file between
-		// turns cost a 199k-token cache rewrite; with it on the same turn is a
-		// full cache hit. Environment changes are then delivered to the model as
-		// an appended "# Environment update" message instead.
-		CLAUDE_CODE_CARVED_SLATE: "1",
-	};
+	const effort = resolveRequestEffort(queryModel, options?.reasoning, providerSettings);
+	const extraArgs = effortExtraArgs(effort);
+	const childEnv = buildChildEnv(account, enableCloudMcp);
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		model: queryModel.id,
