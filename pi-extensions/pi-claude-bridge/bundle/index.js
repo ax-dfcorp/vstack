@@ -5,7 +5,7 @@ var __export = (target, all) => {
 };
 
 // src/index.ts
-import * as piAi from "@earendil-works/pi-ai";
+import * as piAi2 from "@earendil-works/pi-ai";
 
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs
 import { createRequire as Hie } from "node:module";
@@ -38799,8 +38799,8 @@ function hasClaudeCredentials(env = process.env, platform = osPlatform()) {
 
 // src/native-provider.ts
 var NATIVE_PROVIDER_UNSUPPORTED_MESSAGE = "Claude bridge 2.x requires pi >= 0.81 (native provider API). Upgrade the host pi, or pin @vanillagreen/pi-claude-bridge@1.x.";
-function supportsNativeProvider(piAi2) {
-  return typeof piAi2?.createProvider === "function";
+function supportsNativeProvider(piAi3) {
+  return typeof piAi3?.createProvider === "function";
 }
 function claudeAuthSourceLabel(env = process.env) {
   if (env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) return "CLAUDE_CODE_OAUTH_TOKEN";
@@ -38808,14 +38808,14 @@ function claudeAuthSourceLabel(env = process.env) {
   if (env.ANTHROPIC_AUTH_TOKEN?.trim()) return "ANTHROPIC_AUTH_TOKEN";
   return "Claude Code login";
 }
-function buildNativeProvider(piAi2, models, streamSimple, env = process.env, hasCredentials = () => hasClaudeCredentials(env), providerId = PROVIDER_ID, providerName = "Pi Claude") {
-  if (!supportsNativeProvider(piAi2)) throw new Error(NATIVE_PROVIDER_UNSUPPORTED_MESSAGE);
+function buildNativeProvider(piAi3, models, streamSimple, env = process.env, hasCredentials = () => hasClaudeCredentials(env), providerId = PROVIDER_ID, providerName = "Pi Claude") {
+  if (!supportsNativeProvider(piAi3)) throw new Error(NATIVE_PROVIDER_UNSUPPORTED_MESSAGE);
   const stamped = models.map((model) => ({ ...model, api: "claude-bridge", baseUrl: "claude-bridge", provider: providerId }));
   const streams = {
     stream: streamSimple,
     streamSimple
   };
-  return piAi2.createProvider({
+  return piAi3.createProvider({
     id: providerId,
     name: providerName,
     baseUrl: "claude-bridge",
@@ -53576,6 +53576,30 @@ async function resolveGetModels(root, loadCompat = () => dynamicImport("@earendi
   return compat.getModels;
 }
 
+// src/transcript-context.ts
+import * as piAi from "@earendil-works/pi-ai";
+function hasSystemMessage(messages) {
+  return messages.some((message) => message.role === "system");
+}
+function withoutSystemMessages(messages) {
+  return hasSystemMessage(messages) ? messages.filter((message) => message.role !== "system") : messages;
+}
+function toLegacyContext(context) {
+  const raw = context;
+  if (!hasSystemMessage(raw.messages)) return raw;
+  const replay = piAi;
+  if (typeof replay.getCurrentSystemPrompt !== "function" || typeof replay.getCurrentTools !== "function") {
+    throw new Error("pi-claude-bridge: the host sent system messages but its pi-ai has no transcript replay helpers");
+  }
+  const systemPrompt = replay.getCurrentSystemPrompt(raw.messages) || raw.systemPrompt;
+  const tools = replay.getCurrentTools(raw.messages);
+  return {
+    ...systemPrompt ? { systemPrompt } : {},
+    ...tools.length > 0 ? { tools } : raw.tools ? { tools: raw.tools } : {},
+    messages: withoutSystemMessages(raw.messages)
+  };
+}
+
 // src/connector-cache.ts
 import { createHash } from "node:crypto";
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync6, writeFileSync } from "node:fs";
@@ -54485,7 +54509,7 @@ function fingerprintMessages(messages) {
 }
 function readBuiltSessionContext(sessionManager) {
   const built = typeof sessionManager?.buildSessionContext === "function" ? sessionManager.buildSessionContext() : void 0;
-  return Array.isArray(built?.messages) ? built : void 0;
+  return Array.isArray(built?.messages) ? { messages: withoutSystemMessages(built.messages) } : void 0;
 }
 function latestPersistedBridgeSession(sessionManager) {
   const entries = typeof sessionManager?.getEntries === "function" ? sessionManager.getEntries() : [];
@@ -55896,7 +55920,7 @@ function classifyClaudeFailure(value) {
 }
 
 // src/index.ts
-var _piAi = piAi;
+var _piAi = piAi2;
 var getModels = await resolveGetModels(_piAi);
 var newAssistantMessageEventStream = typeof _piAi.createAssistantMessageEventStream === "function" ? _piAi.createAssistantMessageEventStream : () => new _piAi.AssistantMessageEventStream();
 var PRIMARY_INSTANCE_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:primaryInstance");
@@ -56404,6 +56428,9 @@ function applyProviderRegistration(trigger) {
   }
 }
 function streamClaudeAgentSdk(model, context, options) {
+  return streamWithContext(model, toLegacyContext(context), options);
+}
+function streamWithContext(model, context, options) {
   const stream = newAssistantMessageEventStream();
   const lastMsgRole = context.messages[context.messages.length - 1]?.role;
   const cwd = options?.cwd ?? process.cwd();
@@ -56414,7 +56441,7 @@ function streamClaudeAgentSdk(model, context, options) {
     void (async () => {
       try {
         await settlingCtx.waitForQuerySettlement();
-        const resumed = streamClaudeAgentSdk(model, context, options);
+        const resumed = streamWithContext(model, context, options);
         for await (const event of resumed) stream.push(event);
         stream.end();
       } catch (error51) {
@@ -57069,7 +57096,7 @@ function streamClaudeAgentSdk(model, context, options) {
   }).then(async () => {
     if (!retryRequested || wasAborted || options?.signal?.aborted) return;
     debug(`provider: starting account retry after ${retryFailure?.kind ?? "failure"}; excluded=${[...rotationState.excludedProfileIds].join(",")}`);
-    const retryStream = streamClaudeAgentSdk(model, context, {
+    const retryStream = streamWithContext(model, context, {
       ...options ?? {},
       [ROTATION_STATE_KEY]: rotationState
     });

@@ -5,6 +5,7 @@ import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { resolve as pathResolve } from "path";
 import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState, type SyncAudit } from "./bridge-state.js";
 import { convertPiMessages, sanitizeToolId } from "./convert.js";
+import { withoutSystemMessages } from "./transcript-context.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import {
@@ -40,7 +41,9 @@ function fingerprintMessages(messages: Context["messages"]): string {
 
 function readBuiltSessionContext(sessionManager: unknown): { messages: Context["messages"] } | undefined {
 	const built = typeof (sessionManager as any)?.buildSessionContext === "function" ? (sessionManager as any).buildSessionContext() : undefined;
-	return Array.isArray(built?.messages) ? built as { messages: Context["messages"] } : undefined;
+	// Pi 0.86+ persists prompt/tool system messages in the session; cursors and
+	// fingerprints are numbered over the provider's list, which excludes them.
+	return Array.isArray(built?.messages) ? { messages: withoutSystemMessages(built.messages as Context["messages"]) } : undefined;
 }
 
 function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeSessionState | undefined {

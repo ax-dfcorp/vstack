@@ -1,4 +1,4 @@
-import { type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool, type TranscriptContext } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
@@ -34,6 +34,7 @@ import { buildPromptContextAppend } from "./prompt-context.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
+import { toLegacyContext } from "./transcript-context.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
 // regenerate their vendored package.json with a CLOSED exports map
@@ -905,8 +906,14 @@ function applyProviderRegistration(trigger: string): void {
 }
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
- *  Two cases: tool result delivery (active query) or fresh query. */
-export function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+ *  Two cases: tool result delivery (active query) or fresh query. Pi 0.86+
+ *  passes a TranscriptContext; everything below reads the Context shape, so it
+ *  is normalized once here (see transcript-context.ts). */
+export function streamClaudeAgentSdk(model: Model<any>, context: Context | TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	return streamWithContext(model, toLegacyContext(context), options);
+}
+
+function streamWithContext(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -925,7 +932,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		void (async () => {
 			try {
 				await settlingCtx.waitForQuerySettlement();
-				const resumed = streamClaudeAgentSdk(model, context, options);
+				const resumed = streamWithContext(model, context, options);
 				for await (const event of resumed) stream.push(event);
 				stream.end();
 			} catch (error) {
@@ -1745,7 +1752,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		.then(async () => {
 			if (!retryRequested || wasAborted || options?.signal?.aborted) return;
 			debug(`provider: starting account retry after ${retryFailure?.kind ?? "failure"}; excluded=${[...rotationState.excludedProfileIds].join(",")}`);
-			const retryStream = streamClaudeAgentSdk(model, context, {
+			const retryStream = streamWithContext(model, context, {
 				...(options ?? {}),
 				[ROTATION_STATE_KEY]: rotationState,
 			} as BridgeStreamOptions);
