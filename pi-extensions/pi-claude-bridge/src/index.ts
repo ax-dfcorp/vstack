@@ -60,7 +60,7 @@ export {
 export { connectorCachePath, connectorCacheScopeKey, readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "./claude-executable.js";
-import { appendIntegrityEntry, argKeys, extensionApi, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
+import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
@@ -1061,6 +1061,29 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context | Trans
 	return streamWithContext(model, toLegacyContext(context), options);
 }
 
+/** Waits for `settlingCtx`'s query to finish tearing down, then runs the same
+ *  provider call again and pipes its events into `stream`, which pi already
+ *  holds. Used when a call arrives while the live query is being discarded. */
+function rerunAfterQuerySettlement(settlingCtx: QueryContext, stream: AssistantMessageEventStream, model: Model<any>, context: Context, options?: SimpleStreamOptions): void {
+	void (async () => {
+		try {
+			await settlingCtx.waitForQuerySettlement();
+			const resumed = streamWithContext(model, context, options);
+			for await (const event of resumed) stream.push(event);
+			stream.end();
+		} catch (error) {
+			const output: AssistantMessage = {
+				role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "error", timestamp: Date.now(),
+				errorMessage: error instanceof Error ? error.message : String(error),
+			};
+			stream.push({ type: "error", reason: "error", error: output });
+			stream.end();
+		}
+	})();
+}
+
 function streamWithContext(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	// Pi's compaction and branch summaries are self-contained completions, not
 	// turns of this conversation. They run as an isolated one-shot query ahead of
@@ -1082,25 +1105,48 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// Keep its provider stream open, wait for the dying query to release the
 	// context, then run the prompt normally through a fresh query.
 	if (ctx().activeQuery && ctx().abortRequested && lastMsgRole === "user") {
-		const settlingCtx = ctx();
 		debug("provider: user prompt arrived during abort teardown — deferring until query settlement");
-		void (async () => {
-			try {
-				await settlingCtx.waitForQuerySettlement();
-				const resumed = streamWithContext(model, context, options);
-				for await (const event of resumed) stream.push(event);
-				stream.end();
-			} catch (error) {
-				const output: AssistantMessage = {
-					role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-					stopReason: "error", timestamp: Date.now(),
-					errorMessage: error instanceof Error ? error.message : String(error),
-				};
-				stream.push({ type: "error", reason: "error", error: output });
-				stream.end();
-			}
-		})();
+		rerunAfterQuerySettlement(ctx(), stream, model, context, options);
+		return stream;
+	}
+
+	// --- Compaction during an active query ---
+	// Pi's threshold auto-compaction can fire inside a tool loop, between a tool
+	// result and the next model request. The live query is then running on the
+	// pre-compaction transcript: delivering this turn's results into it keeps
+	// the model on the full history, pi's threshold check fires again after
+	// every tool round, and each repeat is another full summary call. Discard
+	// the query instead and re-run the turn after it settles; with no active
+	// query the re-run takes the REBUILD path (rebuildReason=session_compact)
+	// from pi's compacted context — summary, kept tail, and the tool results pi
+	// just appended — and continues from the tool-result tail. Top-level only:
+	// tearing down a pushed (subagent) context pops back to its parent, and the
+	// re-run would then discard the parent's live query as well.
+	const historyRewrite = isCompactionRebuild(sharedSession) ? sharedSession!.rebuildReason! : ctx().pendingHistoryRewrite;
+	if (ctx().activeQuery && !ctx().abortRequested && stackDepth() === 0 && historyRewrite) {
+		const restartCtx = ctx();
+		const rebuildReason = historyRewrite;
+		debug("provider: compaction during active query — restarting query on compacted history");
+		diagDump("compaction_active_query_restart", {
+			reason: rebuildReason,
+			sessionId: sharedSession?.sessionId.slice(0, 8),
+			contextMessages: context.messages.length,
+			lastMsgRole,
+			toolResults: extractAllToolResults(context).length,
+			waitingToolCalls: restartCtx.pendingToolCalls.size,
+			queuedResults: restartCtx.pendingResults.size,
+		});
+		// markRebuild normally reported the interrupted delivery already; report
+		// it here otherwise (a no-op when it did), so teardown's own report cannot
+		// relabel the rebuild as a generic query-teardown mismatch.
+		reportToolResultMismatch(restartCtx, rebuildReason, cwd);
+		// The killed child may still flush a late record into its jsonl; take a
+		// fresh session id so that write cannot land in the rebuilt file. With no
+		// shared session yet, teardown creates one from the child's session id.
+		if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason, forceRotate: true });
+		restartCtx.pendingHistoryRewrite = rebuildReason;
+		restartCtx.requestCompactionRestart();
+		rerunAfterQuerySettlement(restartCtx, stream, model, context, options);
 		return stream;
 	}
 
@@ -1711,6 +1757,10 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel)
 		.then(async ({ capturedSessionId, failure }) => {
 			debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
+			if (abortCtx.compactionRestartRequested) {
+				debug("provider: query discarded for compaction restart; the re-run owns the turn");
+				return;
+			}
 			if (streamIdleTimedOut) {
 				abortCtx.deferredUserMessages = [];
 				debug(`provider: stream idle timeout ${retryRequested ? "queued account rotation" : "already surfaced"}`);
@@ -1781,6 +1831,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 
 					try {
 						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+						if (abortCtx.compactionRestartRequested) break;
 						if (continuation.failure) {
 							recordAttemptFailure(continuation.failure);
 							surfaceFailure(continuation.failure);
@@ -1790,6 +1841,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 						if (sid) setSharedSession({ ...(sharedSession ?? {} as any), sessionId: sid, cursor: sharedSession?.cursor ?? 0, cwd, ...accountSessionScope(account) });
 					} catch (contError) {
 						debug(`provider: continuation query error:`, contError);
+						if (abortCtx.compactionRestartRequested) break;
 						const continuationFailure = { kind: classifyClaudeFailure(contError), message: contError instanceof Error ? contError.message : String(contError) };
 						recordAttemptFailure(continuationFailure);
 						surfaceFailure(continuationFailure);
@@ -1803,10 +1855,15 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 				abortCtx.activeQuery = sdkQuery;
 			}
 
+			if (abortCtx.compactionRestartRequested) return;
 			finalizeCurrentStream(abortCtx.turnOutput?.stopReason, abortCtx);
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${queryModel.id}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
+			if (abortCtx.compactionRestartRequested) {
+				debug("provider: query error after compaction restart ignored; the re-run owns the turn");
+				return;
+			}
 			const suppressDuplicateError = abortCtx.handledTerminalError || (streamIdleTimedOut && !retryRequested);
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort-error" });
@@ -1833,9 +1890,26 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 			streamIdleWatchdog?.dispose();
 			activeStreamIdleWatchdogs.delete(abortCtx);
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
-			const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, streamIdleTimedOut });
+			const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, compactionRestart: abortCtx.compactionRestartRequested, streamIdleTimedOut });
 			try {
 				teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
+				// The first query of a fresh pi session had no shared session when pi
+				// compacted under it. Record its child session as one due for the
+				// compaction rebuild, so the re-run rebuilds with that reason and can
+				// carry the recorded prompt from the child's jsonl. Without a captured
+				// session id the re-run takes the plain first-turn rebuild instead.
+				if (cause === "compaction-restart" && !sharedSession && abortCtx.pendingHistoryRewrite && abortCtx.childSessionId) {
+					debug(`provider: compaction restart recorded child session ${abortCtx.childSessionId.slice(0, 8)} for ${abortCtx.pendingHistoryRewrite} rebuild`);
+					setSharedSession({
+						sessionId: abortCtx.childSessionId,
+						cursor: 0,
+						cwd,
+						...accountSessionScope(account),
+						needsRebuild: true,
+						rebuildReason: abortCtx.pendingHistoryRewrite,
+						forceRotate: true,
+					});
+				}
 			} finally {
 				abortCtx.markQuerySettled();
 				sdkQuery.close();
@@ -2050,6 +2124,28 @@ function registerBridgeCommands(pi: ExtensionAPI): void {
 	}
 }
 
+// pi /compact and session-tree navigation (rewind / fork-at-point /
+// branch switch) both mutate pi's messages array out from under the
+// bridge. syncSharedSession's REUSE check would otherwise see
+// slice(cursor) === [] (or skip entries) and keep --resume'ing a CC
+// session that no longer matches pi's history. /compact in particular
+// triggers CC's autocompact-thrashing guard (issue #8). Force the next
+// call down the REBUILD path so CC sees the current history.
+export function markHistoryRewrite(event: string): void {
+	if (ctx().activeQuery) {
+		reportToolResultMismatch(ctx(), event, sharedSession?.cwd ?? process.cwd());
+	}
+	if (sharedSession) {
+		debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
+		setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
+	} else if (ctx().activeQuery && stackDepth() === 0) {
+		// First query of a fresh pi session: no shared session exists until it
+		// completes, so the rewrite is recorded on the live query itself.
+		debug(`${event}: marking needsRebuild on live query, child session ${ctx().childSessionId?.slice(0, 8) ?? "unknown"}`);
+		ctx().pendingHistoryRewrite = event;
+	}
+}
+
 // --- Extension registration ---
 
 export default function (pi: ExtensionAPI) {
@@ -2108,24 +2204,8 @@ export default function (pi: ExtensionAPI) {
 		if (message?.role === "assistant" && isClaudeProvider(message.provider)) schedulePersistSharedSession(ctx);
 	});
 
-	// pi /compact and session-tree navigation (rewind / fork-at-point /
-	// branch switch) both mutate pi's messages array out from under the
-	// bridge. syncSharedSession's REUSE check would otherwise see
-	// slice(cursor) === [] (or skip entries) and keep --resume'ing a CC
-	// session that no longer matches pi's history. /compact in particular
-	// triggers CC's autocompact-thrashing guard (issue #8). Force the next
-	// call down the REBUILD path so CC sees the current history.
-	const markRebuild = (event: string) => {
-		if (ctx().activeQuery) {
-			reportToolResultMismatch(ctx(), event, sharedSession?.cwd ?? process.cwd());
-		}
-		if (sharedSession) {
-			debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-			setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
-		}
-	};
-	pi.on("session_compact", () => markRebuild("session_compact"));
-	pi.on("session_tree", () => markRebuild("session_tree"));
+	pi.on("session_compact", () => markHistoryRewrite("session_compact"));
+	pi.on("session_tree", () => markHistoryRewrite("session_tree"));
 
 	// --- Provider ---
 	//

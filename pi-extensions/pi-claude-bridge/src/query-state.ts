@@ -22,11 +22,15 @@ export interface PendingToolCall {
 // turn died, which a consumer cannot tell apart from a tool that genuinely
 // returned that string. The cause is carried because an abort, an idle timeout,
 // and a plain end-with-stragglers are different things to act on.
-export type ToolCallDrainCause = "abort" | "stream-idle-timeout" | "query-end";
+// `compaction-restart` is the bridge discarding a live query on purpose because
+// pi compacted its history mid tool loop (see requestCompactionRestart); pi
+// still wants that turn continued, on the compacted history.
+export type ToolCallDrainCause = "abort" | "stream-idle-timeout" | "compaction-restart" | "query-end";
 
 const DRAIN_CAUSE_TEXT: Record<ToolCallDrainCause, string> = {
 	"abort": "the turn was aborted",
 	"stream-idle-timeout": "the Claude Code stream went idle and the turn timed out",
+	"compaction-restart": "pi compacted the conversation and the query was restarted on the compacted history",
 	"query-end": "the query ended",
 };
 
@@ -50,7 +54,9 @@ export function interruptedToolCallResult(cause: ToolCallDrainCause): McpResult 
  *
  * Only an abort makes the tail meaningless, so that is what this excludes:
  * `abortRequested` covers the in-flight window before teardown, and the cause
- * recorded at teardown covers everything after.
+ * recorded at teardown covers everything after. A `compaction-restart` teardown
+ * is a continuation by definition: the bridge discarded the query so the same
+ * turn could go on from pi's compacted history.
  */
 export function isTurnContinuation(queryCtx: QueryContext, lastMsgRole: string | undefined): boolean {
 	if (lastMsgRole !== "toolResult") return false;
@@ -76,10 +82,12 @@ export function canInjectSteer(queryCtx: QueryContext, lastMsgRole: string | und
 }
 
 // Precedence matches the forceRotate expression at the query-teardown site: an
-// explicit abort (pi's signal or our own abort handler) outranks a stream-idle
-// timeout, which outranks a plain end with stragglers.
-export function toolCallDrainCause(flags: { wasAborted?: boolean; signalAborted?: boolean; streamIdleTimedOut?: boolean }): ToolCallDrainCause {
+// explicit abort (pi's signal or our own abort handler) outranks a deliberate
+// compaction restart, which outranks a stream-idle timeout, which outranks a
+// plain end with stragglers.
+export function toolCallDrainCause(flags: { wasAborted?: boolean; signalAborted?: boolean; compactionRestart?: boolean; streamIdleTimedOut?: boolean }): ToolCallDrainCause {
 	if (flags.wasAborted || flags.signalAborted) return "abort";
+	if (flags.compactionRestart) return "compaction-restart";
 	if (flags.streamIdleTimedOut) return "stream-idle-timeout";
 	return "query-end";
 }
@@ -238,6 +246,17 @@ export class QueryContext {
 	 *  prompt arriving in that narrow window must wait and retry, not be mistaken
 	 *  for tool-result delivery to the dying query. */
 	abortRequested = false;
+	/** True once requestCompactionRestart discarded this query. Its completion
+	 *  handlers then leave the shared session, the account router, and pi's
+	 *  streams alone: the provider call that requested the restart owns the turn
+	 *  from here and re-runs it on the compacted history after settlement. */
+	compactionRestartRequested = false;
+	/** A history rewrite (`session_compact` / `session_tree`) pi reported while
+	 *  this query was live and before any shared session existed — the first
+	 *  query of a fresh pi session has none until it completes. It stands in for
+	 *  `sharedSession.needsRebuild` so the query is still restarted, and names
+	 *  the rebuild reason of the session created at its teardown. */
+	pendingHistoryRewrite: string | null = null;
 	/** Why the last query on this context ended, recorded at teardown and read by
 	 *  the next provider call that arrives with a tool-result tail and no active
 	 *  query. Pi re-enters the provider that way for two very different reasons:
@@ -528,6 +547,9 @@ export class QueryContext {
 
 	beginQuerySettlement(): void {
 		this.abortRequested = false;
+		this.compactionRestartRequested = false;
+		this.pendingHistoryRewrite = null;
+		this.childSessionId = undefined;
 		this.lastQueryEndCause = null;
 		this.querySettledPromise = new Promise<void>((resolve) => {
 			this.resolveQuerySettled = resolve;
@@ -541,6 +563,27 @@ export class QueryContext {
 
 	waitForQuerySettlement(): Promise<void> {
 		return this.querySettledPromise;
+	}
+
+	/**
+	 * Discard the live query because pi compacted its history mid tool loop.
+	 * Delivering the turn's tool results into it would continue the child's own,
+	 * uncompacted transcript, so pi's threshold check fires again after every
+	 * tool round and each repeat costs a full summary call. Instead the query is
+	 * killed and the turn re-run from pi's compacted context.
+	 *
+	 * The pi stream is detached first so nothing the dying query still emits can
+	 * reach the new turn's stream. Its waiting MCP handlers are drained by
+	 * teardownQuery with cause `compaction-restart` (their errors go to a child
+	 * that is being discarded), and that cause is what makes the re-run a
+	 * continuation rather than an abort orphan.
+	 */
+	requestCompactionRestart(): void {
+		this.compactionRestartRequested = true;
+		this.currentPiStream = null;
+		this.deferredUserMessages = [];
+		this.inputChannel?.close();
+		try { (this.activeQuery as { close?: () => void } | null)?.close?.(); } catch {}
 	}
 
 	claimToolCall(toolName: string, args: Record<string, unknown> = {}): ClaimedToolCall {

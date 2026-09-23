@@ -17,6 +17,12 @@
 //   F < T < X + estimate(tool output)
 // i.e. compaction fires exactly once — before the tool result is delivered —
 // and the post-compaction final response does not trigger another.
+//
+// The bridge must then continue on the COMPACTED history: the live query
+// (still on the pre-compaction transcript) is discarded and the turn re-runs
+// through a rebuilt Claude session (rebuildReason=session_compact) with a fresh
+// session id. Delivering the tool result into the live query instead kept the
+// model on the full history and re-fired compaction after every tool round.
 
 console.log("=== int-compact-mid-tool-loop.mjs ===");
 
@@ -57,11 +63,18 @@ async function runPhase(name, compaction) {
 	const assistants = [];
 	const toolResults = [];
 	const compactions = [];
+	// Assistant messages and compaction ends in arrival order, to find the first
+	// response after a compaction.
+	const timeline = [];
 	harness.start();
 	harness.addListener((msg) => {
-		if (msg.type === "message_end" && msg.message?.role === "assistant") assistants.push(msg.message);
+		if (msg.type === "message_end" && msg.message?.role === "assistant") {
+			assistants.push(msg.message);
+			timeline.push({ kind: "assistant", message: msg.message });
+		}
 		if (msg.type === "message_end" && msg.message?.role === "toolResult") toolResults.push(msg.message);
 		if (msg.type === "compaction_start" || msg.type === "compaction_end") compactions.push(msg);
+		if (msg.type === "compaction_end") timeline.push({ kind: "compaction_end" });
 	});
 	await new Promise((r) => setTimeout(r, 2000));
 	const state = await harness.send({ type: "get_state" });
@@ -78,6 +91,7 @@ async function runPhase(name, compaction) {
 		assistants,
 		toolResults,
 		compactions,
+		timeline,
 		elapsedMs: Date.now() - startedAt,
 		debugLog: readFileSync(harness.DEBUG_LOG, "utf8"),
 	};
@@ -130,6 +144,39 @@ try {
 	}
 	if (idleTimeouts.length > 0) throw new Error(`stream idle timeout during the run: ${idleTimeouts[0]}`);
 	if (last?.stopReason !== "stop") throw new Error(`turn did not end normally: stopReason=${last?.stopReason} error=${last?.errorMessage}`);
+
+	// The turn continued on the compacted history, not the live pre-compaction query.
+	const compactionAt = run.timeline.findIndex((entry) => entry.kind === "compaction_end");
+	const beforeCompaction = run.timeline.slice(0, compactionAt).filter((entry) => entry.kind === "assistant").at(-1)?.message;
+	const afterCompaction = run.timeline.slice(compactionAt + 1).find((entry) => entry.kind === "assistant")?.message;
+	const contextBefore = contextTokens(beforeCompaction?.usage);
+	const contextAfter = contextTokens(afterCompaction?.usage);
+	console.log(`  context before compaction=${contextBefore} first response after compaction=${contextAfter} threshold=${threshold}`);
+	if (!afterCompaction) throw new Error("no assistant response after the compaction");
+	if (contextAfter >= threshold) {
+		throw new Error(`post-compaction context ${contextAfter} is not below the threshold ${threshold}: the turn continued on the uncompacted history`);
+	}
+	const debugLines = run.debugLog.split("\n");
+	// This run's tool loop is the first query of a fresh pi session, so there is
+	// no shared session yet and the rewrite is marked on the live query.
+	const markPattern = /session_compact: marking needsRebuild on (?:live query, child )?session ([0-9a-f]{8})/;
+	const markLine = debugLines.findIndex((line) => markPattern.test(line));
+	if (markLine < 0) throw new Error("session_compact never marked the Claude session for rebuild");
+	const sessionBefore = debugLines[markLine].match(markPattern)?.[1];
+	const restartLine = debugLines.findIndex((line, i) => i > markLine && line.includes("provider: compaction during active query — restarting query on compacted history"));
+	if (restartLine < 0) throw new Error("the live query was not restarted after the mid-loop compaction");
+	const rebuildLine = debugLines.find((line, i) => i > restartLine && line.includes("syncResult: path=rebuild") && line.includes("reason=session_compact"));
+	if (!rebuildLine) throw new Error("no rebuild with reason=session_compact after the compaction");
+	const sessionAfter = rebuildLine.match(/sessionId=([0-9a-f]{8})/)?.[1];
+	console.log(`  claude session before=${sessionBefore} after=${sessionAfter}`);
+	if (!sessionBefore || !sessionAfter || sessionBefore === sessionAfter) {
+		throw new Error(`the Claude session id did not change across the compaction: before=${sessionBefore} after=${sessionAfter}`);
+	}
+	const answer = (last?.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join(" ");
+	console.log(`  final answer: ${answer.slice(0, 200)}`);
+	if (!/\b780\b/.test(answer.replace(/,/g, ""))) {
+		throw new Error(`final answer does not report the tool output's 780 lines, so the tool result did not survive the restart: ${answer.slice(0, 200)}`);
+	}
 	console.log("PASS");
 } catch (error) {
 	failed = true;

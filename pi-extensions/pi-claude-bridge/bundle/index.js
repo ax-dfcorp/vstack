@@ -37888,6 +37888,7 @@ function extractAllToolResults(messages) {
 var DRAIN_CAUSE_TEXT = {
   "abort": "the turn was aborted",
   "stream-idle-timeout": "the Claude Code stream went idle and the turn timed out",
+  "compaction-restart": "pi compacted the conversation and the query was restarted on the compacted history",
   "query-end": "the query ended"
 };
 function interruptedToolCallResult(cause) {
@@ -37906,6 +37907,7 @@ function canInjectSteer(queryCtx, lastMsgRole) {
 }
 function toolCallDrainCause(flags) {
   if (flags.wasAborted || flags.signalAborted) return "abort";
+  if (flags.compactionRestart) return "compaction-restart";
   if (flags.streamIdleTimedOut) return "stream-idle-timeout";
   return "query-end";
 }
@@ -37976,6 +37978,17 @@ var QueryContext = class {
    *  prompt arriving in that narrow window must wait and retry, not be mistaken
    *  for tool-result delivery to the dying query. */
   abortRequested = false;
+  /** True once requestCompactionRestart discarded this query. Its completion
+   *  handlers then leave the shared session, the account router, and pi's
+   *  streams alone: the provider call that requested the restart owns the turn
+   *  from here and re-runs it on the compacted history after settlement. */
+  compactionRestartRequested = false;
+  /** A history rewrite (`session_compact` / `session_tree`) pi reported while
+   *  this query was live and before any shared session existed — the first
+   *  query of a fresh pi session has none until it completes. It stands in for
+   *  `sharedSession.needsRebuild` so the query is still restarted, and names
+   *  the rebuild reason of the session created at its teardown. */
+  pendingHistoryRewrite = null;
   /** Why the last query on this context ended, recorded at teardown and read by
    *  the next provider call that arrives with a tool-result tail and no active
    *  query. Pi re-enters the provider that way for two very different reasons:
@@ -38237,6 +38250,9 @@ var QueryContext = class {
   }
   beginQuerySettlement() {
     this.abortRequested = false;
+    this.compactionRestartRequested = false;
+    this.pendingHistoryRewrite = null;
+    this.childSessionId = void 0;
     this.lastQueryEndCause = null;
     this.querySettledPromise = new Promise((resolve8) => {
       this.resolveQuerySettled = resolve8;
@@ -38248,6 +38264,29 @@ var QueryContext = class {
   }
   waitForQuerySettlement() {
     return this.querySettledPromise;
+  }
+  /**
+   * Discard the live query because pi compacted its history mid tool loop.
+   * Delivering the turn's tool results into it would continue the child's own,
+   * uncompacted transcript, so pi's threshold check fires again after every
+   * tool round and each repeat costs a full summary call. Instead the query is
+   * killed and the turn re-run from pi's compacted context.
+   *
+   * The pi stream is detached first so nothing the dying query still emits can
+   * reach the new turn's stream. Its waiting MCP handlers are drained by
+   * teardownQuery with cause `compaction-restart` (their errors go to a child
+   * that is being discarded), and that cause is what makes the re-run a
+   * continuation rather than an abort orphan.
+   */
+  requestCompactionRestart() {
+    this.compactionRestartRequested = true;
+    this.currentPiStream = null;
+    this.deferredUserMessages = [];
+    this.inputChannel?.close();
+    try {
+      this.activeQuery?.close?.();
+    } catch {
+    }
   }
   claimToolCall(toolName, args = {}) {
     const unclaimed = this.turnToolCalls.filter((call) => !this.claimedToolCallIds.has(call.id));
@@ -38545,6 +38584,10 @@ function summarizeMissingToolNames(missing) {
 }
 
 // src/bridge-state.ts
+var HISTORY_REWRITE_REBUILD_REASONS = /* @__PURE__ */ new Set(["session_compact", "session_tree"]);
+function isCompactionRebuild(session) {
+  return session?.needsRebuild === true && HISTORY_REWRITE_REBUILD_REASONS.has(session.rebuildReason ?? "");
+}
 var sharedSession = null;
 var extensionApi;
 var piUI;
@@ -55554,7 +55597,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     debug(`Case 4 post-abort: ${priorMessages.length} total \u2192 new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
   }
   debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeConfigDir);
-  debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"}`);
+  debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"} reason=${rebuildReason}`);
   return { sessionId: session.sessionId, ...appendUpdate ? { appendUpdate } : {} };
 }
 
@@ -56798,6 +56841,30 @@ function streamOneShotSummaryRequest(model, context, options) {
 function streamClaudeAgentSdk(model, context, options) {
   return streamWithContext(model, toLegacyContext(context), options);
 }
+function rerunAfterQuerySettlement(settlingCtx, stream, model, context, options) {
+  void (async () => {
+    try {
+      await settlingCtx.waitForQuerySettlement();
+      const resumed = streamWithContext(model, context, options);
+      for await (const event of resumed) stream.push(event);
+      stream.end();
+    } catch (error51) {
+      const output = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "error",
+        timestamp: Date.now(),
+        errorMessage: error51 instanceof Error ? error51.message : String(error51)
+      };
+      stream.push({ type: "error", reason: "error", error: output });
+      stream.end();
+    }
+  })();
+}
 function streamWithContext(model, context, options) {
   if (isOneShotSummaryRequest(options)) return streamOneShotSummaryRequest(model, context, options);
   const stream = newAssistantMessageEventStream();
@@ -56805,30 +56872,29 @@ function streamWithContext(model, context, options) {
   const cwd = options?.cwd ?? process.cwd();
   debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
   if (ctx().activeQuery && ctx().abortRequested && lastMsgRole === "user") {
-    const settlingCtx = ctx();
     debug("provider: user prompt arrived during abort teardown \u2014 deferring until query settlement");
-    void (async () => {
-      try {
-        await settlingCtx.waitForQuerySettlement();
-        const resumed = streamWithContext(model, context, options);
-        for await (const event of resumed) stream.push(event);
-        stream.end();
-      } catch (error51) {
-        const output = {
-          role: "assistant",
-          content: [],
-          api: model.api,
-          provider: model.provider,
-          model: model.id,
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-          stopReason: "error",
-          timestamp: Date.now(),
-          errorMessage: error51 instanceof Error ? error51.message : String(error51)
-        };
-        stream.push({ type: "error", reason: "error", error: output });
-        stream.end();
-      }
-    })();
+    rerunAfterQuerySettlement(ctx(), stream, model, context, options);
+    return stream;
+  }
+  const historyRewrite = isCompactionRebuild(sharedSession) ? sharedSession.rebuildReason : ctx().pendingHistoryRewrite;
+  if (ctx().activeQuery && !ctx().abortRequested && stackDepth() === 0 && historyRewrite) {
+    const restartCtx = ctx();
+    const rebuildReason = historyRewrite;
+    debug("provider: compaction during active query \u2014 restarting query on compacted history");
+    diagDump("compaction_active_query_restart", {
+      reason: rebuildReason,
+      sessionId: sharedSession?.sessionId.slice(0, 8),
+      contextMessages: context.messages.length,
+      lastMsgRole,
+      toolResults: extractAllToolResults2(context).length,
+      waitingToolCalls: restartCtx.pendingToolCalls.size,
+      queuedResults: restartCtx.pendingResults.size
+    });
+    reportToolResultMismatch(restartCtx, rebuildReason, cwd);
+    if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason, forceRotate: true });
+    restartCtx.pendingHistoryRewrite = rebuildReason;
+    restartCtx.requestCompactionRestart();
+    rerunAfterQuerySettlement(restartCtx, stream, model, context, options);
     return stream;
   }
   if (ctx().activeQuery) {
@@ -57305,6 +57371,10 @@ function streamWithContext(model, context, options) {
   };
   consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel).then(async ({ capturedSessionId, failure }) => {
     debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
+    if (abortCtx.compactionRestartRequested) {
+      debug("provider: query discarded for compaction restart; the re-run owns the turn");
+      return;
+    }
     if (streamIdleTimedOut) {
       abortCtx.deferredUserMessages = [];
       debug(`provider: stream idle timeout ${retryRequested ? "queued account rotation" : "already surfaced"}`);
@@ -57366,6 +57436,7 @@ function streamWithContext(model, context, options) {
         );
         try {
           const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+          if (abortCtx.compactionRestartRequested) break;
           if (continuation.failure) {
             recordAttemptFailure(continuation.failure);
             surfaceFailure(continuation.failure);
@@ -57375,6 +57446,7 @@ function streamWithContext(model, context, options) {
           if (sid) setSharedSession({ ...sharedSession ?? {}, sessionId: sid, cursor: sharedSession?.cursor ?? 0, cwd, ...accountSessionScope(account) });
         } catch (contError) {
           debug(`provider: continuation query error:`, contError);
+          if (abortCtx.compactionRestartRequested) break;
           const continuationFailure = { kind: classifyClaudeFailure(contError), message: contError instanceof Error ? contError.message : String(contError) };
           recordAttemptFailure(continuationFailure);
           surfaceFailure(continuationFailure);
@@ -57386,9 +57458,14 @@ function streamWithContext(model, context, options) {
     } finally {
       abortCtx.activeQuery = sdkQuery;
     }
+    if (abortCtx.compactionRestartRequested) return;
     finalizeCurrentStream(abortCtx.turnOutput?.stopReason, abortCtx);
   }).catch((error51) => {
     debug(`provider: query error, model=${queryModel.id}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error51);
+    if (abortCtx.compactionRestartRequested) {
+      debug("provider: query error after compaction restart ignored; the re-run owns the turn");
+      return;
+    }
     const suppressDuplicateError = abortCtx.handledTerminalError || streamIdleTimedOut && !retryRequested;
     if ((wasAborted || options?.signal?.aborted) && sharedSession) {
       setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "abort-error" });
@@ -57414,9 +57491,21 @@ function streamWithContext(model, context, options) {
     streamIdleWatchdog?.dispose();
     activeStreamIdleWatchdogs.delete(abortCtx);
     if (options?.signal) options.signal.removeEventListener("abort", onAbort);
-    const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, streamIdleTimedOut });
+    const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, compactionRestart: abortCtx.compactionRestartRequested, streamIdleTimedOut });
     try {
       teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
+      if (cause === "compaction-restart" && !sharedSession && abortCtx.pendingHistoryRewrite && abortCtx.childSessionId) {
+        debug(`provider: compaction restart recorded child session ${abortCtx.childSessionId.slice(0, 8)} for ${abortCtx.pendingHistoryRewrite} rebuild`);
+        setSharedSession({
+          sessionId: abortCtx.childSessionId,
+          cursor: 0,
+          cwd,
+          ...accountSessionScope(account),
+          needsRebuild: true,
+          rebuildReason: abortCtx.pendingHistoryRewrite,
+          forceRotate: true
+        });
+      }
     } finally {
       abortCtx.markQuerySettled();
       sdkQuery.close();
@@ -57573,6 +57662,18 @@ function registerBridgeCommands(pi) {
     });
   }
 }
+function markHistoryRewrite(event) {
+  if (ctx().activeQuery) {
+    reportToolResultMismatch(ctx(), event, sharedSession?.cwd ?? process.cwd());
+  }
+  if (sharedSession) {
+    debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
+    setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
+  } else if (ctx().activeQuery && stackDepth() === 0) {
+    debug(`${event}: marking needsRebuild on live query, child session ${ctx().childSessionId?.slice(0, 8) ?? "unknown"}`);
+    ctx().pendingHistoryRewrite = event;
+  }
+}
 function index_default(pi) {
   setExtensionApi(pi);
   process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
@@ -57611,17 +57712,8 @@ function index_default(pi) {
     const message = event.message;
     if (message?.role === "assistant" && isClaudeProvider(message.provider)) schedulePersistSharedSession(ctx2);
   });
-  const markRebuild = (event) => {
-    if (ctx().activeQuery) {
-      reportToolResultMismatch(ctx(), event, sharedSession?.cwd ?? process.cwd());
-    }
-    if (sharedSession) {
-      debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-      setSharedSession({ ...sharedSession, needsRebuild: true, rebuildReason: event });
-    }
-  };
-  pi.on("session_compact", () => markRebuild("session_compact"));
-  pi.on("session_tree", () => markRebuild("session_tree"));
+  pi.on("session_compact", () => markHistoryRewrite("session_compact"));
+  pi.on("session_tree", () => markHistoryRewrite("session_tree"));
   applyProviderRegistration("load");
 }
 export {
@@ -57681,6 +57773,7 @@ export {
   isUsageLimitMessage,
   listAccountConnectors,
   mapToolName,
+  markHistoryRewrite,
   normalizeRateLimitUtilization,
   noteChildExecutedToolResults,
   preflightClaudeExecutable,

@@ -21,9 +21,11 @@ export interface SessionState {
 	// Reusing the same sessionId/path would race that orphan write into our
 	// fresh file and break CC's parent-uuid chain on the next resume. When
 	// this flag is set, REBUILD takes a fresh UUID and skips deleteSession
-	// so the orphan writes land on a dead inode. Compact/tree do NOT set
-	// this — there's no concurrent CC writer during those events, so
+	// so the orphan writes land on a dead inode. Compact/tree at a turn
+	// boundary do NOT set this — there's no concurrent CC writer then, so
 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
+	// A compaction that kills a live query mid tool loop does set it, for the
+	// same reason an abort does.
 	forceRotate?: boolean;
 	// Why needsRebuild was set (compact, tree, abort, stream-idle-timeout,
 	// context-length, a tool-result mismatch reason). Copied into `lastSync` when
@@ -61,6 +63,18 @@ export interface SyncAudit {
 	/** The append changed since the recorded snapshot and was delivered in this turn's prompt instead of by rewriting the snapshot. */
 	appendDelivered?: boolean;
 	at: string;
+}
+
+/** Rebuild triggers that mean pi rewrote its history out from under the bridge
+ *  (see markRebuild in index.ts), as opposed to repairing the bridge's own
+ *  transcript after an abort, idle timeout, or rejection. */
+const HISTORY_REWRITE_REBUILD_REASONS = new Set(["session_compact", "session_tree"]);
+
+/** True when `session` is waiting for a rebuild because pi compacted or
+ *  re-branched its history. A live query at that point is running on the
+ *  superseded history and has to be restarted, not fed this turn's results. */
+export function isCompactionRebuild(session: SessionState | null | undefined): boolean {
+	return session?.needsRebuild === true && HISTORY_REWRITE_REBUILD_REASONS.has(session.rebuildReason ?? "");
 }
 
 // Shared mutable bridge state. Lives in its own module so the extracted
