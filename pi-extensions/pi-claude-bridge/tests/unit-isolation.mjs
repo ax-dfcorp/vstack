@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { isolatedFromEnv, loadConfig, piUserDir, recordProjectTrust } from "../src/config.ts";
-import { extractAgentsAppend, resolveAgentsMdPath } from "../src/agents-md.ts";
+import { extractAgentsAppend, resolveAgentsMdPaths } from "../src/agents-md.ts";
 import { readAppendSystemPromptFiles } from "../src/prompt-context.ts";
 import { resolveClaudeExecutable } from "../src/index.ts";
 
@@ -77,16 +77,18 @@ describe("piUserDir", () => {
 	}));
 });
 
-describe("resolveAgentsMdPath isolation", () => {
+describe("resolveAgentsMdPaths isolation", () => {
 	it("default mode still finds AGENTS.md in cwd parents", () => withTempDir((dir) => {
 		const cwdDir = join(dir, "cwd");
+		const agentDir = join(dir, "agent");
 		mkdirSync(cwdDir, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(join(cwdDir, "AGENTS.md"), "# personal instructions\n");
 		const oldCwd = process.cwd();
 		try {
 			process.chdir(cwdDir);
-			withEnv({ CLAUDE_BRIDGE_ISOLATED: undefined }, () => {
-				assert.equal(resolveAgentsMdPath(), join(process.cwd(), "AGENTS.md"));
+			withEnv({ CLAUDE_BRIDGE_ISOLATED: undefined, PI_CODING_AGENT_DIR: agentDir }, () => {
+				assert.deepEqual(resolveAgentsMdPaths(), [join(process.cwd(), "AGENTS.md")]);
 			});
 		} finally {
 			process.chdir(oldCwd);
@@ -103,7 +105,7 @@ describe("resolveAgentsMdPath isolation", () => {
 		try {
 			process.chdir(cwdDir);
 			withEnv({ CLAUDE_BRIDGE_ISOLATED: undefined, PI_CODING_AGENT_DIR: agentDir }, () => {
-				assert.equal(resolveAgentsMdPath(), resolve(join(agentDir, "AGENTS.md")));
+				assert.deepEqual(resolveAgentsMdPaths(), [resolve(join(agentDir, "AGENTS.md"))]);
 				assert.match(extractAgentsAppend() ?? "", /global instructions/);
 			});
 		} finally {
@@ -122,7 +124,7 @@ describe("resolveAgentsMdPath isolation", () => {
 		try {
 			process.chdir(cwdDir);
 			withEnv({ CLAUDE_BRIDGE_ISOLATED: "1", PI_CODING_AGENT_DIR: agentDir }, () => {
-				assert.equal(resolveAgentsMdPath(), undefined);
+				assert.deepEqual(resolveAgentsMdPaths(), []);
 				assert.equal(extractAgentsAppend(), undefined);
 			});
 		} finally {

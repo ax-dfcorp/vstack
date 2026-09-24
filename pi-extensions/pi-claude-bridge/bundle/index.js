@@ -38878,43 +38878,68 @@ function buildNativeProvider(piAi3, models, streamSimple, env = process.env, has
 }
 
 // src/agents-md.ts
-import { existsSync as existsSync4, readFileSync as readFileSync4 } from "fs";
+import { existsSync as existsSync4, readFileSync as readFileSync4, realpathSync as realpathSync2, statSync as statSync2 } from "fs";
 import { dirname as dirname6, join as join8, resolve as resolve6 } from "path";
-function globalAgentsPath() {
-  return join8(piUserDir(), "AGENTS.md");
-}
-function resolveAgentsMdPath() {
-  if (isolatedFromEnv()) return void 0;
-  const fromCwd = findAgentsMdInParents(process.cwd());
-  if (fromCwd) return fromCwd;
-  const globalPath = globalAgentsPath();
-  if (existsSync4(globalPath)) return globalPath;
+var CONTEXT_FILE_NAMES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+function contextFileInDir(dir) {
+  for (const name of CONTEXT_FILE_NAMES) {
+    const candidate = join8(dir, name);
+    try {
+      if (existsSync4(candidate) && statSync2(candidate).isFile()) return candidate;
+    } catch {
+    }
+  }
   return void 0;
 }
-function findAgentsMdInParents(startDir) {
-  let current = resolve6(startDir);
+function canonical(path) {
+  try {
+    return realpathSync2(path);
+  } catch {
+    return path;
+  }
+}
+function resolveAgentsMdPaths() {
+  if (isolatedFromEnv()) return [];
+  const paths = [];
+  const seen = /* @__PURE__ */ new Set();
+  const add = (path) => {
+    if (!path) return false;
+    const key = canonical(path);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  };
+  const globalPath = contextFileInDir(piUserDir());
+  if (add(globalPath)) paths.push(globalPath);
+  const ancestors = [];
+  let current = resolve6(process.cwd());
   while (true) {
-    const candidate = join8(current, "AGENTS.md");
-    if (existsSync4(candidate)) return candidate;
+    const found = contextFileInDir(current);
+    if (add(found)) ancestors.unshift(found);
     const parent = dirname6(current);
     if (parent === current) break;
     current = parent;
   }
-  return void 0;
+  return [...paths, ...ancestors];
 }
 function extractAgentsAppend() {
-  const agentsPath = resolveAgentsMdPath();
-  if (!agentsPath) return void 0;
-  try {
-    const content = readFileSync4(agentsPath, "utf-8").trim();
-    if (!content) return void 0;
+  const blocks = [];
+  for (const path of resolveAgentsMdPaths()) {
+    let content;
+    try {
+      content = readFileSync4(path, "utf-8").replace(/^\uFEFF/, "").trim();
+    } catch {
+      continue;
+    }
     const sanitized = sanitizeAgentsContent(content);
-    return sanitized.length > 0 ? `# CLAUDE.md
-
-${sanitized}` : void 0;
-  } catch {
-    return void 0;
+    if (!sanitized) continue;
+    blocks.push(`<project_instructions path="${path}">
+${sanitized}
+</project_instructions>`);
   }
+  return blocks.length > 0 ? `# CLAUDE.md
+
+${blocks.join("\n\n")}` : void 0;
 }
 var STANDALONE_PI = /(?<![\w./@~-])pi(?![\w/@-]|\.\w)/gi;
 function sanitizeAgentsContent(content) {
@@ -53870,7 +53895,7 @@ function classifyClaudeFailure(value) {
 
 // src/claude-executable.ts
 import { spawn as spawnProcess } from "child_process";
-import { accessSync, constants as fsConstants, readFileSync as readFileSync6, realpathSync as realpathSync2, statSync as statSync2 } from "fs";
+import { accessSync, constants as fsConstants, readFileSync as readFileSync6, realpathSync as realpathSync3, statSync as statSync3 } from "fs";
 import { delimiter as delimiter2, join as join10 } from "path";
 function executableFromPath(name) {
   const paths = (process.env.PATH ?? "").split(delimiter2).filter(Boolean);
@@ -53943,7 +53968,7 @@ function classifyClaudeExecutableBytes(bytes) {
 function preflightClaudeExecutable(path, cwd) {
   let realCwd;
   try {
-    const cwdStat = statSync2(cwd);
+    const cwdStat = statSync3(cwd);
     if (!cwdStat.isDirectory()) {
       throw makeClaudePreflightError("Claude Code spawn cwd preflight failed: cwd is not a directory.", {
         code: "ENOTDIR",
@@ -53953,7 +53978,7 @@ function preflightClaudeExecutable(path, cwd) {
       });
     }
     accessSync(cwd, fsConstants.X_OK);
-    realCwd = realpathSync2(cwd);
+    realCwd = realpathSync3(cwd);
   } catch (err) {
     if (err.name === "ClaudeExecutablePreflightError") throw err;
     throw makeClaudePreflightError("Claude Code spawn cwd preflight failed: cwd is not reachable before spawning Claude Code.", {
@@ -53967,7 +53992,7 @@ function preflightClaudeExecutable(path, cwd) {
   }
   let realPath;
   try {
-    const stat2 = statSync2(path);
+    const stat2 = statSync3(path);
     if (!stat2.isFile()) {
       throw makeClaudePreflightError("Claude Code executable preflight failed: resolved path is not a file.", {
         code: "EACCES",
@@ -53977,7 +54002,7 @@ function preflightClaudeExecutable(path, cwd) {
       });
     }
     accessSync(path, fsConstants.X_OK);
-    realPath = realpathSync2(path);
+    realPath = realpathSync3(path);
   } catch (err) {
     if (err.name === "ClaudeExecutablePreflightError") throw err;
     throw makeClaudePreflightError("Claude Code executable preflight failed: cannot access resolved executable before spawning Claude Code.", {
@@ -54401,7 +54426,7 @@ import { randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync3, existsSync as existsSync6, rmSync as rmSync2 } from "fs";
 import { dirname as dirname9 } from "path";
 import { readFileSync as readFileSync8 } from "fs";
-import { realpathSync as realpathSync3 } from "fs";
+import { realpathSync as realpathSync4 } from "fs";
 import { homedir as homedir3 } from "os";
 import { join as join12 } from "path";
 function parseJsonl(content) {
@@ -54425,7 +54450,7 @@ function getClaudeDir(claudeDir) {
 }
 function normalizeProjectPath(projectPath) {
   try {
-    return realpathSync3(projectPath).normalize("NFC");
+    return realpathSync4(projectPath).normalize("NFC");
   } catch {
     return projectPath.normalize("NFC");
   }
@@ -54943,11 +54968,11 @@ function readSession(jsonlPath, projectPath) {
 
 // src/session-persistence.ts
 import { createHash as createHash2, randomUUID as randomUUID3 } from "crypto";
-import { appendFileSync as appendFileSync4, readFileSync as readFileSync9, realpathSync as realpathSync4, statSync as statSync4 } from "fs";
+import { appendFileSync as appendFileSync4, readFileSync as readFileSync9, realpathSync as realpathSync5, statSync as statSync5 } from "fs";
 import { resolve as pathResolve } from "path";
 
 // src/session-verify.ts
-import { closeSync as closeSync2, openSync as openSync2, readSync as readSync2, statSync as statSync3 } from "fs";
+import { closeSync as closeSync2, openSync as openSync2, readSync as readSync2, statSync as statSync4 } from "fs";
 import { StringDecoder } from "node:string_decoder";
 function forEachJsonlLine(path, onLine) {
   const fd = openSync2(path, "r");
@@ -54991,7 +55016,7 @@ function verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount)
   const warnings = [];
   let st;
   try {
-    st = statSync3(jsonlPath);
+    st = statSync4(jsonlPath);
   } catch (e) {
     warnings.push(`file missing after save \u2014 path=${jsonlPath} err=${e.message}`);
     return warnings;
@@ -55303,7 +55328,7 @@ function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
 function claudeSessionExists(sessionId, cwd, claudeConfigDir) {
   try {
     const session = openSession({ sessionId, projectPath: cwd, claudeDir: claudeConfigDir });
-    statSync4(session.jsonlPath);
+    statSync5(session.jsonlPath);
     return true;
   } catch {
     return false;
@@ -55312,7 +55337,7 @@ function claudeSessionExists(sessionId, cwd, claudeConfigDir) {
 function canonicalize(p) {
   if (!p) return void 0;
   try {
-    return realpathSync4.native(p);
+    return realpathSync5.native(p);
   } catch {
     return pathResolve(p);
   }
@@ -55443,7 +55468,7 @@ Please copy and paste this message into a new issue at https://github.com/elidic
 }
 function safeRealpath(p) {
   try {
-    return realpathSync4(p);
+    return realpathSync5(p);
   } catch (e) {
     return `<failed: ${e.message}>`;
   }
@@ -55453,7 +55478,7 @@ function debugSessionPaths(label, cwd, jsonlPath, claudeConfigDir) {
   let fileSize = null;
   let fileExists = false;
   try {
-    const st = statSync4(jsonlPath);
+    const st = statSync5(jsonlPath);
     fileExists = true;
     fileSize = st.size;
   } catch {
