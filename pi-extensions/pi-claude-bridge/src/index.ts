@@ -35,7 +35,7 @@ import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
-import { isOneShotSummaryRequest, streamOneShotSummary } from "./one-shot-summary.js";
+import { isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1 } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
@@ -198,6 +198,15 @@ let sdkQueryFactory: SdkQueryFactory = query;
 
 /** Test seam for exercising the real bridge retry/session orchestration without
  *  spending Claude usage. Production never calls this. */
+// System prompt of the last genuine top-level Pi turn: the reference that tells
+// a between-turns extension completion (custom prompt, one user message) apart
+// from a fresh session's first prompt. See isSelfContainedCompletion.
+let lastTopLevelTurnSystemPrompt: string | undefined;
+
+export function __testResetTurnSystemPrompt(): void {
+	lastTopLevelTurnSystemPrompt = undefined;
+}
+
 export function __testSetSdkQueryFactory(factory?: SdkQueryFactory): void {
 	sdkQueryFactory = factory ?? query;
 }
@@ -1108,6 +1117,24 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// would otherwise write the summary prompt into a live tool-use query as a
 	// steer and deadlock it (see one-shot-summary.ts).
 	if (isOneShotSummaryRequest(options)) return streamOneShotSummaryRequest(model, context, options);
+
+	// Extension completions (page answers, search summaries) carry no marker but
+	// have the same self-contained shape; they take the same isolated path. Top
+	// level only: a pushed (subagent) context's first prompt is a lone user
+	// message too, and must stay a turn of that context.
+	if (stackDepth() === 0) {
+		const liveQuery = ctx().activeQuery !== null;
+		if (isSelfContainedCompletion(context, { activeQuery: liveQuery, lastTurnSystemPrompt: lastTopLevelTurnSystemPrompt })) {
+			diagDump("self_contained_completion_one_shot", {
+				activeQuery: liveQuery,
+				waitingToolCalls: ctx().pendingToolCalls.size,
+				promptChars: extractUserPrompt(context.messages)?.length ?? 0,
+				systemChars: (context.systemPrompt ?? "").length,
+			});
+			return streamOneShotSummaryRequest(model, context, options);
+		}
+		lastTopLevelTurnSystemPrompt = context.systemPrompt ?? "";
+	}
 
 	const stream = newAssistantMessageEventStream();
 

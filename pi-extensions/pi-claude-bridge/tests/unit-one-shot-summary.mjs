@@ -8,10 +8,12 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
 	__testGetBridgeIntegrityState,
+	__testResetTurnSystemPrompt,
 	__testSetBridgeIntegrityState,
 	__testSetSdkQueryFactory,
 	streamClaudeAgentSdk,
 } from "../src/index.ts";
+import { isSelfContainedCompletion } from "../src/one-shot-summary.ts";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL } from "../src/account-router.ts";
 import { createQueryInputChannel } from "../src/input-channel.ts";
 import { ctx, resetStack } from "../src/query-state.ts";
@@ -120,6 +122,7 @@ async function collect(stream, timeoutMs = 2000) {
 beforeEach(() => {
 	process.env.CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT = "0";
 	resetStack();
+	__testResetTurnSystemPrompt();
 	__testSetBridgeIntegrityState({ sharedSession: null, ui: null });
 });
 
@@ -268,5 +271,71 @@ describe("one-shot summary requests (cacheRetention: none)", () => {
 		assert.ok(observed.interrupts >= 1, "the child query must be interrupted");
 		assert.equal(ctx().abortRequested, false, "the shared query context must not see the summary's abort");
 		assert.equal(observed.failures.length, 0, "an abort is not an account failure");
+	});
+});
+
+// Extension completions (pi-web-access page answers and search summaries, or
+// any registry.complete() caller) carry no cacheRetention marker: a custom
+// system prompt and one user message. On 2026-09-26 five such page answers were
+// written into a live tool-use query as steers and hung two Daseo sessions for
+// over an hour. They must take the isolated one-shot path like summaries do.
+describe("self-contained extension completions (no cacheRetention marker)", () => {
+	const PAGE_ANSWER_SYSTEM = "Answer the question using only the supplied page content.";
+	const pageAnswerContext = {
+		systemPrompt: PAGE_ANSWER_SYSTEM,
+		messages: [{
+			role: "user",
+			content: [{ type: "text", text: "Question: price?\nSource URL: https://example.com\n\n<untrusted_page_content>...</untrusted_page_content>" }],
+			timestamp: Date.now(),
+		}],
+	};
+
+	it("during a live tool-use query, a lone user message runs one-shot instead of steering into the query", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		const liveChannel = createQueryInputChannel([{ type: "text", text: "main task" }]);
+		const pushes = [];
+		const originalPush = liveChannel.push.bind(liveChannel);
+		liveChannel.push = (blocks) => { pushes.push(blocks); return originalPush(blocks); };
+		const liveCtx = ctx();
+		liveCtx.activeQuery = fakeSdkQuery([], observedState(), { hold: true });
+		liveCtx.inputChannel = liveChannel;
+		liveCtx.currentPiStream = { push() {}, end() {} };
+		liveCtx.pendingToolCalls.set("toolu_fetch", { toolName: "fetch_content", resolve() {} });
+		__testSetBridgeIntegrityState({ sharedSession: { sessionId: "main-session", cursor: 7, cwd: process.cwd() } });
+		__testSetSdkQueryFactory((input) => {
+			observed.queries.push(input);
+			return fakeSdkQuery(summaryMessages("$12 per month"), observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(model, pageAnswerContext, { signal: new AbortController().signal }));
+
+		assert.equal(events.at(-1).type, "done");
+		assert.equal(events.at(-1).message.content.at(-1).text, "$12 per month");
+		assert.equal(observed.queries.length, 1, "the completion must start its own query");
+		assert.equal(observed.queries[0].options.systemPrompt, PAGE_ANSWER_SYSTEM);
+		assert.equal(observed.queries[0].options.resume, undefined);
+		assert.equal(observed.queries[0].options.persistSession, false);
+		assert.equal(pushes.length, 0, "nothing may be written into the live query's input channel");
+		assert.equal(liveChannel.injectedCount, 0);
+		assert.equal(liveCtx.pendingToolCalls.size, 1);
+		assert.deepEqual(__testGetBridgeIntegrityState().sharedSession, { sessionId: "main-session", cursor: 7, cwd: process.cwd() });
+	});
+
+	it("between turns, a lone user message whose system prompt differs from the last turn runs one-shot", () => {
+		const state = { activeQuery: false, lastTurnSystemPrompt: "Pi coding assistant prompt with AGENTS.md" };
+		assert.equal(isSelfContainedCompletion(pageAnswerContext, state), true);
+	});
+
+	it("keeps a fresh session's first prompt and same-prompt turns on the normal path", () => {
+		const piTurn = { ...pageAnswerContext, systemPrompt: "Pi coding assistant prompt with AGENTS.md" };
+		assert.equal(isSelfContainedCompletion(pageAnswerContext, { activeQuery: false, lastTurnSystemPrompt: undefined }), false, "no genuine turn seen yet");
+		assert.equal(isSelfContainedCompletion(piTurn, { activeQuery: false, lastTurnSystemPrompt: piTurn.systemPrompt }), false, "same system prompt as the last turn");
+		const withHistory = { systemPrompt: PAGE_ANSWER_SYSTEM, messages: [
+			{ role: "user", content: "earlier", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 2 },
+			{ role: "user", content: "next", timestamp: 3 },
+		] };
+		assert.equal(isSelfContainedCompletion(withHistory, { activeQuery: true, lastTurnSystemPrompt: undefined }), false, "history means a real turn");
 	});
 });

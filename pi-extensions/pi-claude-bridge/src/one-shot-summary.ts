@@ -41,6 +41,30 @@ export function isOneShotSummaryRequest(options: SimpleStreamOptions | undefined
 	return options?.cacheRetention === "none";
 }
 
+export interface SelfContainedCompletionState {
+	/** A query of this conversation is live (waiting on Pi for tool results). */
+	activeQuery: boolean;
+	/** The system prompt of the last genuine Pi turn seen by this provider, if any. */
+	lastTurnSystemPrompt: string | undefined;
+}
+
+/** Extension completions carry no marker. pi-web-access page answers and search
+ *  summaries, and any other `registry.complete()` caller, reach the provider as a
+ *  custom system prompt plus exactly one user message: never this conversation's
+ *  history. Pi's own calls always carry the history — the tool results the live
+ *  query is waiting for, or the assistant turns of an existing session — so a
+ *  lone user message during a live query is decisive. Between turns the same
+ *  shape is also a fresh session's first prompt, so it counts as self-contained
+ *  only once a genuine turn has been seen and this prompt's system prompt differs
+ *  from it. Measured 2026-09-26: five page-answer completions of 7–72k chars were
+ *  written into a live tool-use query as steers and hung two Daseo sessions for
+ *  over an hour, unabortable, until this gate. */
+export function isSelfContainedCompletion(context: Context, state: SelfContainedCompletionState): boolean {
+	if (context.messages.length !== 1 || context.messages[0].role !== "user") return false;
+	if (state.activeQuery) return true;
+	return state.lastTurnSystemPrompt !== undefined && (context.systemPrompt ?? "") !== state.lastTurnSystemPrompt;
+}
+
 export type OneShotPreparation =
 	| {
 		status: "ready";

@@ -54116,6 +54116,11 @@ function spawnClaudeCodeWithDiagnostics(options) {
 function isOneShotSummaryRequest(options) {
   return options?.cacheRetention === "none";
 }
+function isSelfContainedCompletion(context, state) {
+  if (context.messages.length !== 1 || context.messages[0].role !== "user") return false;
+  if (state.activeQuery) return true;
+  return state.lastTurnSystemPrompt !== void 0 && (context.systemPrompt ?? "") !== state.lastTurnSystemPrompt;
+}
 function lastUserPromptBlocks(context) {
   for (let i = context.messages.length - 1; i >= 0; i--) {
     const message = context.messages[i];
@@ -56378,6 +56383,10 @@ function reserveAutoResumeAccount(router, account, modelId, sessionId) {
 }
 var MODELS = buildModels(getModels("anthropic"));
 var sdkQueryFactory = DQt;
+var lastTopLevelTurnSystemPrompt;
+function __testResetTurnSystemPrompt() {
+  lastTopLevelTurnSystemPrompt = void 0;
+}
 function __testSetSdkQueryFactory(factory) {
   sdkQueryFactory = factory ?? DQt;
 }
@@ -57008,6 +57017,19 @@ function rerunAfterQuerySettlement(settlingCtx, stream, model, context, options)
 }
 function streamWithContext(model, context, options) {
   if (isOneShotSummaryRequest(options)) return streamOneShotSummaryRequest(model, context, options);
+  if (stackDepth() === 0) {
+    const liveQuery = ctx().activeQuery !== null;
+    if (isSelfContainedCompletion(context, { activeQuery: liveQuery, lastTurnSystemPrompt: lastTopLevelTurnSystemPrompt })) {
+      diagDump("self_contained_completion_one_shot", {
+        activeQuery: liveQuery,
+        waitingToolCalls: ctx().pendingToolCalls.size,
+        promptChars: extractUserPrompt(context.messages)?.length ?? 0,
+        systemChars: (context.systemPrompt ?? "").length
+      });
+      return streamOneShotSummaryRequest(model, context, options);
+    }
+    lastTopLevelTurnSystemPrompt = context.systemPrompt ?? "";
+  }
   const stream = newAssistantMessageEventStream();
   const lastMsgRole = context.messages[context.messages.length - 1]?.role;
   const cwd = options?.cwd ?? process.cwd();
@@ -57892,6 +57914,7 @@ export {
   STREAM_IDLE_BACKOFF_HINT_MS,
   STREAM_IDLE_TIMEOUT_ENV,
   __testGetBridgeIntegrityState,
+  __testResetTurnSystemPrompt,
   __testSetBridgeIntegrityState,
   __testSetSdkQueryFactory,
   appendIntegrityEntry,
