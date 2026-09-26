@@ -38390,6 +38390,9 @@ function ctx() {
 function stackDepth() {
   return contextStack.length;
 }
+function rootCtx() {
+  return contextStack.length > 0 ? contextStack[0] : _ctx;
+}
 function pushContext() {
   if (!_ctx.activeQuery) throw new Error("pushContext() called with no active query");
   contextStack.push(_ctx);
@@ -54369,6 +54372,104 @@ function streamOneShotSummary(model, context, options, deps) {
   }
 }
 
+// src/side-question.ts
+var SIDE_QUESTION_HOST_SYMBOL = /* @__PURE__ */ Symbol.for("vstack.pi.claude-bridge.side-question-host.v1");
+var SIDE_QUESTION_HISTORY_LIMIT = 20;
+var recordedBase = null;
+function recordSideQuestionBase(next) {
+  recordedBase = next;
+}
+function clearSideQuestionBase() {
+  recordedBase = null;
+}
+function sideQuestionBase() {
+  return recordedBase;
+}
+function isSideQuestionCapable(value) {
+  return typeof value?.askSideQuestion === "function";
+}
+function normalizeHistory(history) {
+  return (history ?? []).filter((entry) => typeof entry?.question === "string" && typeof entry?.response === "string").slice(-SIDE_QUESTION_HISTORY_LIMIT);
+}
+function toAnswer(result, model, path) {
+  if (!result || !result.response) throw new Error("Claude returned no answer to the side question.");
+  return { text: result.response, synthetic: result.synthetic === true, model, path };
+}
+function abortError() {
+  const error51 = new Error("Side question cancelled");
+  error51.name = "AbortError";
+  return error51;
+}
+function isClosedQueryError(error51) {
+  const message = error51 instanceof Error ? error51.message : String(error51);
+  return /not ready for writing|Query closed|transport.*closed|process exited/i.test(message);
+}
+async function askSideQuestion(input, deps) {
+  const question = input.question.trim();
+  if (!question) throw new Error("Ask a question after /btw.");
+  const history = normalizeHistory(input.history);
+  if (input.signal?.aborted) throw abortError();
+  const live = deps.liveQuery();
+  if (isSideQuestionCapable(live)) {
+    try {
+      const result = await live.askSideQuestion(question, { history, signal: input.signal });
+      return toAnswer(result, deps.base()?.model ?? "claude", "live");
+    } catch (error51) {
+      if (input.signal?.aborted) throw abortError();
+      if (!isClosedQueryError(error51)) throw error51;
+      debug(`side-question: live query closed before answering, resuming instead: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    }
+  }
+  return askResumed(question, history, input.signal, deps);
+}
+async function askResumed(question, history, signal, deps) {
+  const session = deps.session();
+  const base = deps.base();
+  if (!session?.sessionId || !base) {
+    throw new Error("There is no Claude conversation to ask about yet. Send a message first.");
+  }
+  if (session.cwd !== base.cwd || (session.claudeConfigDir ?? void 0) !== (base.claudeConfigDir ?? void 0)) {
+    throw new Error("The Claude conversation moved since the last turn. Send a message first, then ask again.");
+  }
+  let release = () => {
+  };
+  const gate = new Promise((resolve8) => {
+    release = resolve8;
+  });
+  async function* noPrompt() {
+    await gate;
+  }
+  const options = { ...base.buildOptions(), resume: session.sessionId, persistSession: false };
+  const sideQuery = deps.queryFactory({ prompt: noPrompt(), options });
+  if (!isSideQuestionCapable(sideQuery)) {
+    release();
+    throw new Error("This Claude Agent SDK does not support side questions.");
+  }
+  const drained = (async () => {
+    try {
+      for await (const _message of sideQuery) {
+      }
+    } catch (error51) {
+      debug(`side-question: resumed query stream ended: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    }
+  })();
+  debug(`side-question: resumed ${session.sessionId.slice(0, 8)} model=${base.model} history=${history.length}`);
+  try {
+    const result = await sideQuery.askSideQuestion(question, { history, signal });
+    return toAnswer(result, base.model, "resumed");
+  } catch (error51) {
+    if (signal?.aborted) throw abortError();
+    throw error51;
+  } finally {
+    release();
+    try {
+      sideQuery.close?.();
+    } catch {
+    }
+    void drained;
+  }
+}
+
 // src/connector-cache.ts
 import { createHash } from "node:crypto";
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync7, writeFileSync } from "node:fs";
@@ -56364,6 +56465,18 @@ var BRIDGE_ACCOUNT_HOST = {
   version: 1,
   probeProfile: probeClaudeAccountProfile
 };
+var SIDE_QUESTION_HOST = {
+  version: 1,
+  ask: (input) => askSideQuestion(input, {
+    liveQuery: () => {
+      const root = rootCtx();
+      return root.activeQuery && !root.abortRequested ? root.activeQuery : null;
+    },
+    session: () => sharedSession,
+    base: sideQuestionBase,
+    queryFactory: (params) => sdkQueryFactory(params)
+  })
+};
 function extractAllToolResults2(context) {
   const { results, stopIdx } = extractAllToolResults(context.messages);
   debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
@@ -56755,6 +56868,9 @@ function releaseProviderTokens(event) {
   const g = globalThis;
   if (g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] === BRIDGE_ACCOUNT_HOST) {
     g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = void 0;
+  }
+  if (g[SIDE_QUESTION_HOST_SYMBOL] === SIDE_QUESTION_HOST) {
+    g[SIDE_QUESTION_HOST_SYMBOL] = void 0;
   }
   if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
     debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
@@ -57195,6 +57311,23 @@ function streamWithContext(model, context, options) {
     spawnClaudeCodeProcess: spawnClaudeCodeWithDiagnostics,
     ...makeCliDebugOptions("provider")
   };
+  if (stackDepth() === 0) {
+    const sideOptions = queryOptions;
+    recordSideQuestionBase({
+      model: queryModel.id,
+      cwd,
+      claudeConfigDir: account?.configDir,
+      buildOptions: () => {
+        const { debug: _debug, debugFile: _debugFile, stderr: _stderr, resume: _resume, ...rest } = sideOptions;
+        const piServers = buildMcpServers(mcpTools, new QueryContext());
+        return {
+          ...rest,
+          ...piServers || Object.keys(connectorServers).length > 0 ? { mcpServers: { ...piServers ?? {}, ...connectorServers } } : {},
+          ...makeCliDebugOptions("side-question")
+        };
+      }
+    });
+  }
   debug(
     "provider: fresh query",
     `model=${queryModel.id} requested=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
@@ -57713,10 +57846,12 @@ function index_default(pi) {
   if (claimPrimaryInstance()) {
     const host = globalThis;
     host[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = BRIDGE_ACCOUNT_HOST;
+    host[SIDE_QUESTION_HOST_SYMBOL] = SIDE_QUESTION_HOST;
   }
   const clearSession = (event) => {
     debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
     setSharedSession(null);
+    clearSideQuestionBase();
   };
   pi.on("session_start", (event, ctx2) => {
     recordProjectTrust(ctx2);

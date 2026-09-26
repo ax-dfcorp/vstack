@@ -24,7 +24,7 @@ import { createQueryInputChannel, type QueryInputChannel } from "./input-channel
 import { buildModels, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractMemoryBlock, extractSkillsBlock } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
+import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, rootCtx, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, registerExternalConfigResolver, type Config } from "./config.js";
 import { hasClaudeCredentials } from "./auth-presence.js";
@@ -36,6 +36,7 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { isOneShotSummaryRequest, streamOneShotSummary } from "./one-shot-summary.js";
+import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1 } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
 // regenerate their vendored package.json with a CLOSED exports map
@@ -306,6 +307,19 @@ const BRIDGE_ACCOUNT_HOST: ClaudeBridgeAccountHostV1 = {
 // Pi doesn't pass tool results directly — it appends them to the context and calls
 // the provider again. Thin wrapper over extract-tool-results.js that adds per-turn
 // debug logging at the extraction boundary.
+const SIDE_QUESTION_HOST: ClaudeBridgeSideQuestionHostV1 = {
+	version: 1,
+	ask: (input) => askSideQuestion(input, {
+		liveQuery: () => {
+			const root = rootCtx();
+			return root.activeQuery && !root.abortRequested ? root.activeQuery : null;
+		},
+		session: () => sharedSession,
+		base: sideQuestionBase,
+		queryFactory: (params) => sdkQueryFactory(params as Parameters<typeof query>[0]),
+	}),
+};
+
 function extractAllToolResults(context: Context): McpResult[] {
 	const { results, stopIdx } = _extractAllToolResults(context.messages as unknown as Array<{ role: string; [key: string]: unknown }>);
 	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
@@ -915,6 +929,9 @@ function releaseProviderTokens(event: string): void {
 	const g = globalThis as Record<symbol, any>;
 	if (g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] === BRIDGE_ACCOUNT_HOST) {
 		g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = undefined;
+	}
+	if (g[SIDE_QUESTION_HOST_SYMBOL] === SIDE_QUESTION_HOST) {
+		g[SIDE_QUESTION_HOST_SYMBOL] = undefined;
 	}
 	if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
 		debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
@@ -1526,6 +1543,31 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		spawnClaudeCodeProcess: spawnClaudeCodeWithDiagnostics,
 		...makeCliDebugOptions("provider"),
 	};
+
+	// A side question asked while no child is running resumes this session with
+	// exactly these options, so it hits the same prompt cache (side-question.ts).
+	// Subagent queries are not the conversation the user is looking at.
+	if (stackDepth() === 0) {
+		const sideOptions = queryOptions;
+		recordSideQuestionBase({
+			model: queryModel.id,
+			cwd,
+			claudeConfigDir: account?.configDir,
+			buildOptions: () => {
+				const { debug: _debug, debugFile: _debugFile, stderr: _stderr, resume: _resume, ...rest } = sideOptions;
+				// Fresh in-process servers: the declarations must match this turn, and a
+				// side question never calls a tool, so the handlers are never reached.
+				const piServers = buildMcpServers(mcpTools, new QueryContext());
+				return {
+					...rest,
+					...(piServers || Object.keys(connectorServers).length > 0
+						? { mcpServers: { ...(piServers ?? {}), ...connectorServers } as NonNullable<Parameters<typeof query>[0]["options"]>["mcpServers"] }
+						: {}),
+					...makeCliDebugOptions("side-question"),
+				};
+			},
+		});
+	}
 
 	debug("provider: fresh query",
 		`model=${queryModel.id} requested=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
@@ -2167,6 +2209,7 @@ export default function (pi: ExtensionAPI) {
 	if (claimPrimaryInstance()) {
 		const host = globalThis as Record<symbol, any>;
 		host[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = BRIDGE_ACCOUNT_HOST;
+		host[SIDE_QUESTION_HOST_SYMBOL] = SIDE_QUESTION_HOST;
 	}
 
 	// Reset shared (Claude) conversation state on pi session lifecycle events.
@@ -2176,6 +2219,7 @@ export default function (pi: ExtensionAPI) {
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		setSharedSession(null);
+		clearSideQuestionBase();
 	};
 
 	pi.on("session_start", (event, ctx) => {

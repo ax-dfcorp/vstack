@@ -718,6 +718,9 @@ export function ctx(): QueryContext { return _ctx; }
 
 export function stackDepth(): number { return contextStack.length; }
 
+/** The top-level (user-facing) context, below any pushed subagent contexts. */
+export function rootCtx(): QueryContext { return contextStack.length > 0 ? contextStack[0] : _ctx; }
+
 export function pushContext(): void {
 	if (!_ctx.activeQuery) throw new Error("pushContext() called with no active query");
 	contextStack.push(_ctx);
