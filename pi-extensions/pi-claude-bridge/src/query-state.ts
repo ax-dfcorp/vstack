@@ -413,6 +413,12 @@ export class QueryContext {
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
+	// The pi model id this query asked Claude Code for. turnOutput.model is
+	// pinned to it: pi derives the session model from the last assistant
+	// message, so adopting a substituted model id would silently re-model the
+	// whole session (observed 2026-09-27, Opus 5.5 -> Opus 5).
+	requestedModelId: string | null = null;
+	modelSubstitutionNoted = false;
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
@@ -430,6 +436,8 @@ export class QueryContext {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "stop", timestamp: Date.now(),
 		};
+		this.requestedModelId = model.id;
+		this.modelSubstitutionNoted = false;
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;

@@ -68,7 +68,7 @@ import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedule
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
 import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
-import { ensureTurnStarted, finalizeCurrentStream, finalizeToolUseTurnFromMcpInvocation, noteChildExecutedToolResults, processAssistantMessage, processStreamEvent, scheduleToolUseTurnEnd, updateTurnOutputModel } from "./assistant-stream.js";
+import { ensureTurnStarted, finalizeCurrentStream, finalizeToolUseTurnFromMcpInvocation, noteChildExecutedToolResults, noteModelSubstitution, processAssistantMessage, processStreamEvent, scheduleToolUseTurnEnd } from "./assistant-stream.js";
 import {
 	accountSessionScope,
 	classifyClaudeFailure,
@@ -848,15 +848,16 @@ async function consumeQuery(
 				} else if ((message as any).subtype === "model_refusal_fallback") {
 					const originalModel = (message as any).original_model;
 					const fallbackModel = (message as any).fallback_model;
-					updateTurnOutputModel(fallbackModel);
-					debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel }));
-					// The bridge never passes `fallbackModel`, so this only fires if Claude
-					// Code reroutes on its own; surface it rather than hide a model change.
-					if (typeof fallbackModel === "string" && typeof originalModel === "string") {
-						safeNotify(
-							`Pi Claude: Claude Code answered with ${modelDisplayName(fallbackModel)} instead of ${modelDisplayName(originalModel)}.`,
-							"warning",
-						);
+					const scope = (message as any).scope;
+					debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel, scope }));
+					// The bridge never passes `fallbackModel`; Claude Code's own
+					// category refusal fallback (Opus 5.5 -> Opus 5 / Opus 4.8) rerouted
+					// on its own and made the swap persistent for its session. A
+					// "local" scope is a side question or subagent and leaves the
+					// session model alone; anything else is a substitution the pi
+					// session must not inherit.
+					if (scope !== "local" && typeof fallbackModel === "string") {
+						noteModelSubstitution(typeof originalModel === "string" ? originalModel : model.id, fallbackModel, "model_refusal_fallback");
 					}
 				}
 				break;

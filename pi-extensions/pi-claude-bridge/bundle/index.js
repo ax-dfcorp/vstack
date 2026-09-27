@@ -38134,6 +38134,12 @@ var QueryContext = class {
   }
   // Per-turn (reset together)
   turnOutput = null;
+  // The pi model id this query asked Claude Code for. turnOutput.model is
+  // pinned to it: pi derives the session model from the last assistant
+  // message, so adopting a substituted model id would silently re-model the
+  // whole session (observed 2026-09-27, Opus 5.5 -> Opus 5).
+  requestedModelId = null;
+  modelSubstitutionNoted = false;
   turnStarted = false;
   turnSawStreamEvent = false;
   turnSawToolCall = false;
@@ -38159,6 +38165,8 @@ var QueryContext = class {
       stopReason: "stop",
       timestamp: Date.now()
     };
+    this.requestedModelId = model.id;
+    this.modelSubstitutionNoted = false;
     this.turnStarted = false;
     this.turnSawStreamEvent = false;
     this.turnSawToolCall = false;
@@ -56057,12 +56065,32 @@ function reapStaleQueuedResults(c) {
     "warning"
   );
 }
-function updateTurnOutputModel(modelId) {
+function sameBridgeModel(left, right) {
+  const canonical2 = (id) => id.trim().toLowerCase().replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
+  return canonical2(left) === canonical2(right);
+}
+function updateTurnOutputModel(modelId, source = "assistant") {
   const c = ctx();
   if (typeof modelId !== "string" || !modelId || !c.turnOutput) return;
-  if (c.turnOutput.model === modelId) return;
-  debug(`provider: active Claude model changed ${c.turnOutput.model} -> ${modelId}`);
-  c.turnOutput.model = modelId;
+  if (modelId.startsWith("<")) return;
+  const requested = c.requestedModelId ?? c.turnOutput.model;
+  if (sameBridgeModel(requested, modelId)) return;
+  noteModelSubstitution(requested, modelId, source);
+}
+function noteModelSubstitution(requested, reported, source) {
+  const c = ctx();
+  if (c.modelSubstitutionNoted) return;
+  c.modelSubstitutionNoted = true;
+  debug(`provider: Claude answered with ${reported} instead of ${requested} (${source}); keeping ${requested} and restarting the Claude session on the next prompt`);
+  diagDump("model_substituted", { requested, reported, source });
+  appendIntegrityEntry("model_substituted", { requested, reported, source });
+  if (sharedSession) {
+    setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" });
+  }
+  safeNotify(
+    `Pi Claude: Claude Code answered with ${modelDisplayName(reported)} instead of ${modelDisplayName(requested)}. The session stays on ${modelDisplayName(requested)}; the next prompt restarts the Claude session so the substitution does not stick.`,
+    "warning"
+  );
 }
 function finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, toolName, mappedArgs) {
   if (!queryCtx.currentPiStream || !queryCtx.turnOutput) return;
@@ -56808,13 +56836,10 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
         } else if (message.subtype === "model_refusal_fallback") {
           const originalModel = message.original_model;
           const fallbackModel = message.fallback_model;
-          updateTurnOutputModel(fallbackModel);
-          debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel }));
-          if (typeof fallbackModel === "string" && typeof originalModel === "string") {
-            safeNotify(
-              `Pi Claude: Claude Code answered with ${modelDisplayName(fallbackModel)} instead of ${modelDisplayName(originalModel)}.`,
-              "warning"
-            );
+          const scope = message.scope;
+          debug("consumeQuery: model_refusal_fallback", JSON.stringify({ originalModel, fallbackModel, scope }));
+          if (scope !== "local" && typeof fallbackModel === "string") {
+            noteModelSubstitution(typeof originalModel === "string" ? originalModel : model.id, fallbackModel, "model_refusal_fallback");
           }
         }
         break;

@@ -1,6 +1,7 @@
 import { calculateCost, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { appendIntegrityEntry, safeNotify } from "./bridge-state.js";
+import { appendIntegrityEntry, safeNotify, setSharedSession, sharedSession } from "./bridge-state.js";
+import { modelDisplayName } from "./models.js";
 import { connectorResultByteSize, recordConnectorCallResult } from "./connector-audit.js";
 import { isChildExecutedTool } from "./connectors.js";
 import { debug, diagDump } from "./debug.js";
@@ -312,12 +313,46 @@ export function reapStaleQueuedResults(c: QueryContext): void {
 	);
 }
 
-export function updateTurnOutputModel(modelId: unknown): void {
+/** Compare model ids ignoring context-window tags and dated snapshot suffixes. */
+export function sameBridgeModel(left: string, right: string): boolean {
+	const canonical = (id: string) => id.trim().toLowerCase().replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
+	return canonical(left) === canonical(right);
+}
+
+/** Records the model Claude Code reports for the running turn.
+ *
+ *  The pi turn keeps the REQUESTED model id no matter what is reported: pi
+ *  derives the session model from the last assistant message, so adopting a
+ *  substituted id would silently switch the whole session (2026-09-27: one
+ *  refusal-fallback turn on Opus 5 re-modelled an Opus 5.5 session and every
+ *  later prompt ran on Opus 5, with no model_change record). A different
+ *  family is a substitution: it is recorded, surfaced, and the next prompt
+ *  restarts the Claude session so Claude Code's persisted swap does not
+ *  stick. Synthetic frames ("<synthetic>") are ignored. */
+export function updateTurnOutputModel(modelId: unknown, source = "assistant"): void {
 	const c = ctx();
 	if (typeof modelId !== "string" || !modelId || !c.turnOutput) return;
-	if (c.turnOutput.model === modelId) return;
-	debug(`provider: active Claude model changed ${c.turnOutput.model} -> ${modelId}`);
-	c.turnOutput.model = modelId;
+	if (modelId.startsWith("<")) return;
+	const requested = c.requestedModelId ?? c.turnOutput.model;
+	if (sameBridgeModel(requested, modelId)) return;
+	noteModelSubstitution(requested, modelId, source);
+}
+
+export function noteModelSubstitution(requested: string, reported: string, source: string): void {
+	const c = ctx();
+	if (c.modelSubstitutionNoted) return;
+	c.modelSubstitutionNoted = true;
+	debug(`provider: Claude answered with ${reported} instead of ${requested} (${source}); keeping ${requested} and restarting the Claude session on the next prompt`);
+	diagDump("model_substituted", { requested, reported, source });
+	appendIntegrityEntry("model_substituted", { requested, reported, source });
+	if (sharedSession) {
+		setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" });
+	}
+	safeNotify(
+		`Pi Claude: Claude Code answered with ${modelDisplayName(reported)} instead of ${modelDisplayName(requested)}. ` +
+		`The session stays on ${modelDisplayName(requested)}; the next prompt restarts the Claude session so the substitution does not stick.`,
+		"warning",
+	);
 }
 
 /** Force-finalizes the current pi turn as a tool_use boundary when its terminal

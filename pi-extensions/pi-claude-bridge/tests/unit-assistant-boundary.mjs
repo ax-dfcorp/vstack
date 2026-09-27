@@ -225,7 +225,7 @@ describe("assistant tool-use boundary fallback", () => {
 		assert.equal(c.turnBlocks[0].text, "fallback after stale content event");
 	});
 
-	it("updates the Pi assistant model when Claude Code switches models at message_start", () => {
+	it("keeps the requested Pi model and flags a substitution when Claude Code switches models at message_start", () => {
 		const c = ctx();
 		c.resetTurnState({ ...model, id: "claude-fable-5" });
 		installFakeStream();
@@ -241,7 +241,8 @@ describe("assistant tool-use boundary fallback", () => {
 			},
 		}, new Map(), model);
 
-		assert.equal(c.turnOutput.model, "claude-opus-4-8");
+		assert.equal(c.turnOutput.model, "claude-fable-5", "a Fable turn never becomes an Opus turn in the pi session");
+		assert.equal(c.modelSubstitutionNoted, true);
 		assert.equal(c.turnSawStreamEvent, false);
 	});
 
@@ -262,7 +263,8 @@ describe("assistant tool-use boundary fallback", () => {
 			},
 		}, model, new Map());
 
-		assert.equal(c.turnOutput.model, "claude-opus-4-8");
+		assert.equal(c.turnOutput.model, "claude-fable-5");
+		assert.equal(c.modelSubstitutionNoted, true);
 		assert.equal(c.turnBlocks.length, 0);
 	});
 });
