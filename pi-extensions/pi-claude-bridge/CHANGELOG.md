@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Two parallel calls of the same tool pair with their own results
+
+A message with two calls of the same tool (two `mcpScript` or two `read` calls) could lose both results: the bridge could not tell which MCP handler belonged to which call, returned `no matching tool_call id` to the model, and dropped Pi's real results as stale (20 such tool results in 30 days, 16 in turns with two calls of one tool; live repro 2026-09-29 01:17Z). The records and the handler's input now compare through the same tool schema the SDK validates with, so an undeclared key the model added (`timeout` on mcpScript) no longer makes the two differ. A handler that runs before its call's arguments are final waits for them instead of guessing between same-name calls. A lone call of its tool still pairs as before.
+
+Tests: `tests/unit-same-tool-parallel-claims.mjs`.
+
 ### AGENTS.md forwarding matches Pi: global file plus every ancestor
 
 The bridge now forwards the same context files Pi loads for its own system prompt: `<piUserDir>/AGENTS.md` first, then every `AGENTS.md` (or Pi's other candidate names) from the filesystem root down to the working directory, deduped by realpath, each in its own `<project_instructions path="...">` block under `# CLAUDE.md`. Before, only the nearest file was forwarded, so a Claude session inside a repository with its own AGENTS.md never received the rules in `~/AGENTS.md` or the global file, although GPT sessions on Pi did (found 2026-09-24). Live sessions receive the longer append once, as a `<system_prompt_update>` on their next turn. Isolated mode still forwards nothing.

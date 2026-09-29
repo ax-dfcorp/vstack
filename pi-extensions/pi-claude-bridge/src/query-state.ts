@@ -170,7 +170,29 @@ export interface TurnToolCallRecord {
 	id: string;
 	toolName: string;
 	arguments: Record<string, unknown>;
+	/** True once `arguments` holds the call's complete input: content_block_stop
+	 *  parsed it, the SDK's completed assistant message carried it, or a forced
+	 *  turn end sealed it. A record opened at content_block_start holds `{}` until
+	 *  then, and a claim must never judge a call by it. */
+	final: boolean;
 }
+
+export interface ClaimOptions {
+	/** Maps a recorded (raw streamed) input into the form the handler received.
+	 *  The SDK validates handler input with `z.object(shape)`, which strips
+	 *  top-level keys the tool schema does not declare, so a model that adds one
+	 *  (measured: `timeout` on mcpScript, whose schema says `timeoutMs`) makes the
+	 *  raw record and the handler copy differ for a call that is otherwise the
+	 *  same. Returns undefined when the recorded input does not validate. */
+	normalizeRecorded?: (args: Record<string, unknown>) => Record<string, unknown> | undefined;
+}
+
+/** How long a handler waits for its call's arguments to finalize before it
+ *  settles for the best claim available. Matches the tool-use grace period: it
+ *  measures silence, re-arming while the child's stream is still delivering
+ *  events, up to the same 90s backstop an incomplete tool block gets. */
+export const TOOL_CLAIM_GRACE_MS = 1500;
+export const TOOL_CLAIM_MAX_WAITS = 60;
 
 export interface ClaimedToolCall {
 	toolCallId?: string;
@@ -183,6 +205,11 @@ export interface ClaimedToolCall {
 	 *  schema-validated copy, so a benign divergence (stripped unknown key,
 	 *  applied default) must not strand the call — but it is worth a diagnostic. */
 	argsMismatch?: boolean;
+	/** Recorded argument keys at claim time, before the handler's authoritative
+	 *  copy replaces them. Present with `argsMismatch`. */
+	recordedArgKeys?: string[];
+	/** True when the claim had to wait for records to finalize. */
+	waited?: boolean;
 }
 
 export interface ToolResultProgress {
@@ -226,6 +253,12 @@ function sameArgs(left: unknown, right: unknown): boolean {
 
 function hasRecordedArgs(args: Record<string, unknown> | undefined): boolean {
 	return Object.keys(args ?? {}).length > 0;
+}
+
+function recordMatchesHandlerArgs(call: TurnToolCallRecord, args: Record<string, unknown>, options: ClaimOptions | undefined): boolean {
+	if (sameArgs(call.arguments, args)) return true;
+	const normalized = options?.normalizeRecorded?.(call.arguments);
+	return normalized !== undefined && sameArgs(normalized, args);
 }
 
 function unique(values: Iterable<string | undefined>): string[] {
@@ -291,6 +324,9 @@ export class QueryContext {
 	 */
 	queryToolNames = new Map<string, string>();
 	claimedToolCallIds = new Set<string>();
+	/** MCP handlers waiting in claimToolCallWhenSettled; each re-checks its claim
+	 *  whenever a tool-call record is added or finalized. */
+	private toolRecordWaiters = new Set<() => void>();
 	/**
 	 * Tool-call ids Pi has actually been handed for execution — every toolCall
 	 * block of a `done` message pushed to a Pi stream. Query-scoped and never
@@ -504,7 +540,10 @@ export class QueryContext {
 		if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
 	}
 
-	recordToolCall(id: string | undefined, toolName: string, args: Record<string, unknown> = {}): void {
+	/** Record a tool call. `final: false` is for a block that just started
+	 *  streaming: its arguments are not known yet. Every other caller records a
+	 *  complete input. */
+	recordToolCall(id: string | undefined, toolName: string, args: Record<string, unknown> = {}, final = true): void {
 		if (!id) return;
 		this.queryToolNames.set(id, toolName);
 		if (!this.turnToolCallIds.includes(id)) this.turnToolCallIds.push(id);
@@ -512,15 +551,25 @@ export class QueryContext {
 		if (existing) {
 			existing.toolName = toolName;
 			existing.arguments = args;
-			return;
+			existing.final ||= final;
+		} else {
+			this.turnToolCalls.push({ id, toolName, arguments: args, final });
 		}
-		this.turnToolCalls.push({ id, toolName, arguments: args });
+		this.notifyToolRecordsChanged();
 	}
 
+	/** Replace a recorded call's arguments with its complete input. */
 	updateToolCallArgs(id: string | undefined, args: Record<string, unknown>): void {
 		if (!id) return;
 		const existing = this.turnToolCalls.find((call) => call.id === id);
-		if (existing) existing.arguments = args;
+		if (!existing) return;
+		existing.arguments = args;
+		existing.final = true;
+		this.notifyToolRecordsChanged();
+	}
+
+	private notifyToolRecordsChanged(): void {
+		for (const waiter of [...this.toolRecordWaiters]) waiter();
 	}
 
 	hasRecordedToolCall(id: string | undefined): boolean {
@@ -594,29 +643,98 @@ export class QueryContext {
 		try { (this.activeQuery as { close?: () => void } | null)?.close?.(); } catch {}
 	}
 
-	claimToolCall(toolName: string, args: Record<string, unknown> = {}): ClaimedToolCall {
+	/**
+	 * Claim the recorded tool call an MCP handler invocation belongs to, deciding
+	 * now with what is recorded so far. See claimToolCallWhenSettled for the
+	 * handler path, which waits for arguments to finalize first.
+	 */
+	claimToolCall(toolName: string, args: Record<string, unknown> = {}, options?: ClaimOptions): ClaimedToolCall {
+		return this.decideToolCallClaim(toolName, args, options, true)!;
+	}
+
+	/**
+	 * Claim for an MCP handler, waiting until the claim is certain.
+	 *
+	 * The SDK dispatches an MCP call as soon as it reads the control request,
+	 * while the stream events that precede it on the same stdout are still queued
+	 * for the bridge's message loop. So when a handler runs, the records can lag
+	 * the child: its call may still be open (arguments `{}`) or not recorded yet.
+	 * With one same-name call that is harmless, but with two (the model issuing
+	 * two mcpScript or two read calls in one message) nothing recorded so far says
+	 * which call this is, and a guess can cross-pair two live calls — the one
+	 * outcome worse than failing.
+	 *
+	 * So a handler claims immediately only on an exact match against a FINALIZED
+	 * record (after `normalizeRecorded`). Otherwise it waits: every record change
+	 * re-checks, and the grace timer re-arms while the child's stream is still
+	 * producing events. Once the stream has been quiet for a full grace period the
+	 * claim settles on what claimToolCall would decide: the sole same-name call
+	 * (keeps a benign, un-modelled divergence from stranding the call), or none.
+	 * Partial arguments never choose between candidates: a call the bridge has
+	 * not recorded yet could match them just as well.
+	 */
+	claimToolCallWhenSettled(toolName: string, args: Record<string, unknown> = {}, options?: ClaimOptions): Promise<ClaimedToolCall> {
+		const immediate = this.decideToolCallClaim(toolName, args, options, false);
+		if (immediate) return Promise.resolve(immediate);
+		return new Promise<ClaimedToolCall>((resolve) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let seenActivitySeq = this.toolUseActivitySeq;
+			let waits = 0;
+			const finish = (claim: ClaimedToolCall): void => {
+				if (timer) clearTimeout(timer);
+				this.toolRecordWaiters.delete(onRecordsChanged);
+				resolve({ ...claim, waited: true });
+			};
+			const onRecordsChanged = (): void => {
+				const claim = this.decideToolCallClaim(toolName, args, options, false);
+				if (claim) finish(claim);
+			};
+			const arm = (): void => {
+				timer = setTimeout(onTimer, TOOL_CLAIM_GRACE_MS);
+				timer.unref?.();
+			};
+			const onTimer = (): void => {
+				if (this.toolUseActivitySeq !== seenActivitySeq && ++waits < TOOL_CLAIM_MAX_WAITS) {
+					seenActivitySeq = this.toolUseActivitySeq;
+					arm();
+					return;
+				}
+				finish(this.decideToolCallClaim(toolName, args, options, true)!);
+			};
+			this.toolRecordWaiters.add(onRecordsChanged);
+			arm();
+		});
+	}
+
+	/** Returns the claim, or undefined when `settled` is false and only waiting
+	 *  can make the claim certain. A settled decision always returns. */
+	private decideToolCallClaim(toolName: string, args: Record<string, unknown>, options: ClaimOptions | undefined, settled: boolean): ClaimedToolCall | undefined {
 		const unclaimed = this.turnToolCalls.filter((call) => !this.claimedToolCallIds.has(call.id));
 		const byName = unclaimed.filter((call) => call.toolName === toolName);
-		const exact = byName.filter((call) => sameArgs(call.arguments, args));
+		const exact = byName.filter((call) => call.final && recordMatchesHandlerArgs(call, args, options));
 		let chosen: TurnToolCallRecord | undefined;
 		let match: ClaimedToolCall["match"] = "none";
 		let ambiguous = false;
 
 		let argsMismatch = false;
 		if (exact.length > 0) {
+			// Identical-args duplicates are interchangeable: the first unclaimed wins.
 			chosen = exact[0];
 			match = "tool-args";
 			ambiguous = exact.length > 1;
+		} else if (!settled) {
+			return undefined;
 		} else if (byName.length === 1) {
 			// A single unclaimed call of this tool type is the only call this
 			// handler can possibly belong to, so claim it even when the recorded
-			// arguments differ. Two known benign sources of divergence:
+			// arguments differ. Known sources of divergence:
 			//   - the SDK can invoke the handler after content_block_start but
 			//     before input_json_delta/content_block_stop finalizes arguments,
-			//     so the record still holds a partial parse;
+			//     so the record still holds `{}` (the handler path waits for this);
 			//   - the handler receives the MCP server's schema-VALIDATED copy of
-			//     the input (zod may strip unknown keys or apply defaults) while
-			//     the record holds the raw streamed input.
+			//     the input while the record holds the raw streamed input
+			//     (`normalizeRecorded` covers the stripped-key case; anything it
+			//     does not model still lands here).
 			// Refusing here stranded the call outright: the handler errored into
 			// the child while pi's real result sat queued forever (diag log
 			// 2026-07-28, `edit` with argKeys [edits, path] on both sides). A
@@ -625,12 +743,15 @@ export class QueryContext {
 			// cross-pairing two live calls is the one outcome worse than failing.
 			chosen = byName[0];
 			match = "tool-name";
-			argsMismatch = hasRecordedArgs(byName[0].arguments);
+			argsMismatch = byName[0].final && hasRecordedArgs(byName[0].arguments);
 		}
 
 		if (!chosen) return { match: "none", ambiguous: false, available: unclaimed.length };
 		this.claimedToolCallIds.add(chosen.id);
-		return { toolCallId: chosen.id, match, ambiguous, available: unclaimed.length, ...(argsMismatch ? { argsMismatch } : {}) };
+		return {
+			toolCallId: chosen.id, match, ambiguous, available: unclaimed.length,
+			...(argsMismatch ? { argsMismatch, recordedArgKeys: Object.keys(chosen.arguments).sort() } : {}),
+		};
 	}
 
 	/**

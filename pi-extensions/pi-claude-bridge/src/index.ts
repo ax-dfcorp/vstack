@@ -31,7 +31,7 @@ import { hasClaudeCredentials } from "./auth-presence.js";
 import { NATIVE_PROVIDER_UNSUPPORTED_MESSAGE, buildNativeProvider, supportsNativeProvider } from "./native-provider.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
-import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
+import { jsonSchemaToZodShape, validateAgainstShape } from "./typebox-to-zod.js";
 import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
@@ -444,90 +444,101 @@ export function resolveMcpTools(context: Context, excludeToolName?: string): {
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
 // Handlers claim their tool_call id by matching the actual MCP call
-// (tool name + arguments) against the recorded tool_use blocks, then results
-// are matched by ID. Handlers close over the captured `queryCtx`, ensuring they
-// operate on the correct query's state even across pushContext/popContext calls.
+// (tool name + arguments) against the recorded tool_use blocks, waiting for the
+// records to finalize when several same-name calls are in flight (see
+// claimToolCallWhenSettled), then results are matched by ID. Handlers close
+// over the captured `queryCtx`, ensuring they operate on the correct query's
+// state even across pushContext/popContext calls.
 function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
-	const mcpTools = tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: jsonSchemaToZodShape(tool.parameters),
-		handler: async (args?: Record<string, unknown>) => {
-			const mappedArgs = mapToolArgs(tool.name, args);
-			const claim = queryCtx.claimToolCall(tool.name, mappedArgs);
-			const toolCallId = claim.toolCallId;
-			if (!toolCallId) {
-				debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
-				diagDump("tool_handler_unmatched", {
-					toolName: tool.name,
-					argKeys: argKeys(mappedArgs),
-					available: claim.available,
-					turnToolCallIds: queryCtx.turnToolCallIds,
-					turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls),
+	const mcpTools = tools.map((tool) => {
+		const inputSchema = jsonSchemaToZodShape(tool.parameters);
+		// The handler receives the SDK's schema-validated copy of the input; the
+		// record holds the raw streamed one. Compare them in the handler's form.
+		const normalizeRecorded = (recorded: Record<string, unknown>) => {
+			const validated = validateAgainstShape(inputSchema, recorded);
+			return validated ? mapToolArgs(tool.name, validated) : undefined;
+		};
+		return {
+			name: tool.name,
+			description: tool.description,
+			inputSchema,
+			handler: async (args?: Record<string, unknown>) => {
+				const mappedArgs = mapToolArgs(tool.name, args);
+				const claim = await queryCtx.claimToolCallWhenSettled(tool.name, mappedArgs, { normalizeRecorded });
+				const toolCallId = claim.toolCallId;
+				if (!toolCallId) {
+					debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
+					diagDump("tool_handler_unmatched", {
+						toolName: tool.name,
+						argKeys: argKeys(mappedArgs),
+						available: claim.available,
+						turnToolCallIds: queryCtx.turnToolCallIds,
+						turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls),
+					});
+					appendIntegrityEntry("tool_handler_unmatched", {
+						toolName: tool.name,
+						argKeys: argKeys(mappedArgs),
+						available: claim.available,
+						turnToolCallIds: queryCtx.turnToolCallIds,
+					});
+					return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true } satisfies McpResult;
+				}
+				// Reaching this handler proves the SDK accepted the complete input against
+				// the tool schema. Preserve it as the authoritative recovery copy before
+				// any timer can finalize a still-open streamed block.
+				queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
+				if (claim.argsMismatch) {
+					// Claimed anyway (sole same-name candidate) — record the divergence so
+					// a schema/validator drift stays visible without stranding the call.
+					debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
+					diagDump("tool_claim_args_mismatch", {
+						toolName: tool.name,
+						toolCallId,
+						handlerArgKeys: argKeys(mappedArgs),
+						recordedArgKeys: claim.recordedArgKeys ?? [],
+					});
+				} else if (claim.match !== "tool-args" || claim.ambiguous || claim.waited) {
+					debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}${claim.waited ? " after waiting for records to finalize" : ""}`);
+				}
+				if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
+					const result = queryCtx.pendingResults.get(toolCallId)!;
+					queryCtx.pendingResults.delete(toolCallId);
+					queryCtx.markToolResultResolved(toolCallId);
+					debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
+					return result;
+				}
+				if (isUndeliverableToolCall(queryCtx, toolCallId)) {
+					// The pi turn this call belonged to already ended without it (a later
+					// parallel block cut off by a forced turn end). Pi will never execute
+					// it, so waiting here would block the child until a manual abort.
+					debug(`mcp handler: ${tool.name} [${toolCallId}] → undeliverable: pi turn ended without this call; failing fast`);
+					diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
+					appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
+					queryCtx.markToolResultResolved(toolCallId);
+					return undeliveredToolCallResult(tool.name);
+				}
+				debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
+				// Don't end the pi turn here — message_delta (real output tokens) and
+				// message_stop are normally milliseconds behind this invocation. Arm the
+				// grace timer instead; it force-finalizes only if they never arrive.
+				scheduleToolUseTurnEnd(
+					queryCtx,
+					() => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
+					`mcp-invocation:${tool.name}`,
+				);
+				return new Promise<McpResult>((resolve) => {
+					queryCtx.pendingToolCalls.set(toolCallId, {
+						toolName: tool.name,
+						resolve: (result) => {
+							queryCtx.markToolResultResolved(toolCallId);
+							resolve(result);
+						},
+					});
 				});
-				appendIntegrityEntry("tool_handler_unmatched", {
-					toolName: tool.name,
-					argKeys: argKeys(mappedArgs),
-					available: claim.available,
-					turnToolCallIds: queryCtx.turnToolCallIds,
-				});
-				return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true } satisfies McpResult;
-			}
-			// Reaching this handler proves the SDK accepted the complete input against
-			// the tool schema. Preserve it as the authoritative recovery copy before
-			// any timer can finalize a still-open streamed block.
-			queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
-			if (claim.argsMismatch) {
-				// Claimed anyway (sole same-name candidate) — record the divergence so
-				// a schema/validator drift stays visible without stranding the call.
-				debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
-				diagDump("tool_claim_args_mismatch", {
-					toolName: tool.name,
-					toolCallId,
-					handlerArgKeys: argKeys(mappedArgs),
-					recordedArgKeys: argKeys(queryCtx.turnToolCalls.find((call) => call.id === toolCallId)?.arguments),
-				});
-			} else if (claim.match !== "tool-args" || claim.ambiguous) {
-				debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}`);
-			}
-			if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
-				const result = queryCtx.pendingResults.get(toolCallId)!;
-				queryCtx.pendingResults.delete(toolCallId);
-				queryCtx.markToolResultResolved(toolCallId);
-				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
-				return result;
-			}
-			if (isUndeliverableToolCall(queryCtx, toolCallId)) {
-				// The pi turn this call belonged to already ended without it (a later
-				// parallel block cut off by a forced turn end). Pi will never execute
-				// it, so waiting here would block the child until a manual abort.
-				debug(`mcp handler: ${tool.name} [${toolCallId}] → undeliverable: pi turn ended without this call; failing fast`);
-				diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
-				appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
-				queryCtx.markToolResultResolved(toolCallId);
-				return undeliveredToolCallResult(tool.name);
-			}
-			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
-			// Don't end the pi turn here — message_delta (real output tokens) and
-			// message_stop are normally milliseconds behind this invocation. Arm the
-			// grace timer instead; it force-finalizes only if they never arrive.
-			scheduleToolUseTurnEnd(
-				queryCtx,
-				() => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
-				`mcp-invocation:${tool.name}`,
-			);
-			return new Promise<McpResult>((resolve) => {
-				queryCtx.pendingToolCalls.set(toolCallId, {
-					toolName: tool.name,
-					resolve: (result) => {
-						queryCtx.markToolResultResolved(toolCallId);
-						resolve(result);
-					},
-				});
-			});
-		},
-	}));
+			},
+		};
+	});
 	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
 	return { [MCP_SERVER_NAME]: server };
 }

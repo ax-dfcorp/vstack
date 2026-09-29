@@ -459,7 +459,9 @@ export function processStreamEvent(
 		} else if (event.content_block?.type === "tool_use") {
 			c.turnSawToolCall = true;
 			const mappedName = mapToolName(event.content_block.name, customToolNameToPi);
-			c.recordToolCall(event.content_block.id, mappedName, {});
+			// Not final: the arguments stream in as input_json_delta and are only
+			// known at content_block_stop.
+			c.recordToolCall(event.content_block.id, mappedName, {}, false);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
 				name: mappedName,

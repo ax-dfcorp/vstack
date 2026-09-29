@@ -37940,6 +37940,8 @@ function failUndeliveredPendingToolCalls(queryCtx) {
   }
   return failed;
 }
+var TOOL_CLAIM_GRACE_MS = 1500;
+var TOOL_CLAIM_MAX_WAITS = 60;
 function normalizeForCompare(value) {
   if (Array.isArray(value)) return value.map(normalizeForCompare);
   if (value && typeof value === "object") {
@@ -37960,6 +37962,11 @@ function sameArgs(left, right) {
 }
 function hasRecordedArgs(args) {
   return Object.keys(args ?? {}).length > 0;
+}
+function recordMatchesHandlerArgs(call, args, options) {
+  if (sameArgs(call.arguments, args)) return true;
+  const normalized = options?.normalizeRecorded?.(call.arguments);
+  return normalized !== void 0 && sameArgs(normalized, args);
 }
 function unique(values) {
   const out = [];
@@ -38023,6 +38030,9 @@ var QueryContext = class {
    */
   queryToolNames = /* @__PURE__ */ new Map();
   claimedToolCallIds = /* @__PURE__ */ new Set();
+  /** MCP handlers waiting in claimToolCallWhenSettled; each re-checks its claim
+   *  whenever a tool-call record is added or finalized. */
+  toolRecordWaiters = /* @__PURE__ */ new Set();
   /**
    * Tool-call ids Pi has actually been handed for execution — every toolCall
    * block of a `done` message pushed to a Pi stream. Query-scoped and never
@@ -38216,7 +38226,10 @@ var QueryContext = class {
     }
     if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
   }
-  recordToolCall(id, toolName, args = {}) {
+  /** Record a tool call. `final: false` is for a block that just started
+   *  streaming: its arguments are not known yet. Every other caller records a
+   *  complete input. */
+  recordToolCall(id, toolName, args = {}, final = true) {
     if (!id) return;
     this.queryToolNames.set(id, toolName);
     if (!this.turnToolCallIds.includes(id)) this.turnToolCallIds.push(id);
@@ -38224,14 +38237,23 @@ var QueryContext = class {
     if (existing) {
       existing.toolName = toolName;
       existing.arguments = args;
-      return;
+      existing.final ||= final;
+    } else {
+      this.turnToolCalls.push({ id, toolName, arguments: args, final });
     }
-    this.turnToolCalls.push({ id, toolName, arguments: args });
+    this.notifyToolRecordsChanged();
   }
+  /** Replace a recorded call's arguments with its complete input. */
   updateToolCallArgs(id, args) {
     if (!id) return;
     const existing = this.turnToolCalls.find((call) => call.id === id);
-    if (existing) existing.arguments = args;
+    if (!existing) return;
+    existing.arguments = args;
+    existing.final = true;
+    this.notifyToolRecordsChanged();
+  }
+  notifyToolRecordsChanged() {
+    for (const waiter of [...this.toolRecordWaiters]) waiter();
   }
   hasRecordedToolCall(id) {
     return Boolean(id && (this.turnToolCallIds.includes(id) || this.turnToolCalls.some((call) => call.id === id)));
@@ -38296,10 +38318,73 @@ var QueryContext = class {
     } catch {
     }
   }
-  claimToolCall(toolName, args = {}) {
+  /**
+   * Claim the recorded tool call an MCP handler invocation belongs to, deciding
+   * now with what is recorded so far. See claimToolCallWhenSettled for the
+   * handler path, which waits for arguments to finalize first.
+   */
+  claimToolCall(toolName, args = {}, options) {
+    return this.decideToolCallClaim(toolName, args, options, true);
+  }
+  /**
+   * Claim for an MCP handler, waiting until the claim is certain.
+   *
+   * The SDK dispatches an MCP call as soon as it reads the control request,
+   * while the stream events that precede it on the same stdout are still queued
+   * for the bridge's message loop. So when a handler runs, the records can lag
+   * the child: its call may still be open (arguments `{}`) or not recorded yet.
+   * With one same-name call that is harmless, but with two (the model issuing
+   * two mcpScript or two read calls in one message) nothing recorded so far says
+   * which call this is, and a guess can cross-pair two live calls — the one
+   * outcome worse than failing.
+   *
+   * So a handler claims immediately only on an exact match against a FINALIZED
+   * record (after `normalizeRecorded`). Otherwise it waits: every record change
+   * re-checks, and the grace timer re-arms while the child's stream is still
+   * producing events. Once the stream has been quiet for a full grace period the
+   * claim settles on what claimToolCall would decide: the sole same-name call
+   * (keeps a benign, un-modelled divergence from stranding the call), or none.
+   * Partial arguments never choose between candidates: a call the bridge has
+   * not recorded yet could match them just as well.
+   */
+  claimToolCallWhenSettled(toolName, args = {}, options) {
+    const immediate = this.decideToolCallClaim(toolName, args, options, false);
+    if (immediate) return Promise.resolve(immediate);
+    return new Promise((resolve8) => {
+      let timer;
+      let seenActivitySeq = this.toolUseActivitySeq;
+      let waits = 0;
+      const finish = (claim) => {
+        if (timer) clearTimeout(timer);
+        this.toolRecordWaiters.delete(onRecordsChanged);
+        resolve8({ ...claim, waited: true });
+      };
+      const onRecordsChanged = () => {
+        const claim = this.decideToolCallClaim(toolName, args, options, false);
+        if (claim) finish(claim);
+      };
+      const arm = () => {
+        timer = setTimeout(onTimer, TOOL_CLAIM_GRACE_MS);
+        timer.unref?.();
+      };
+      const onTimer = () => {
+        if (this.toolUseActivitySeq !== seenActivitySeq && ++waits < TOOL_CLAIM_MAX_WAITS) {
+          seenActivitySeq = this.toolUseActivitySeq;
+          arm();
+          return;
+        }
+        finish(this.decideToolCallClaim(toolName, args, options, true));
+      };
+      this.toolRecordWaiters.add(onRecordsChanged);
+      arm();
+    });
+  }
+  /** Returns the claim, or undefined when `settled` is false and only waiting
+   *  can make the claim certain. A settled decision always returns. */
+  decideToolCallClaim(toolName, args, options, settled) {
     const unclaimed = this.turnToolCalls.filter((call) => !this.claimedToolCallIds.has(call.id));
     const byName = unclaimed.filter((call) => call.toolName === toolName);
-    const exact = byName.filter((call) => sameArgs(call.arguments, args));
+    const exact = byName.filter((call) => call.final && recordMatchesHandlerArgs(call, args, options));
     let chosen;
     let match = "none";
     let ambiguous = false;
@@ -38308,14 +38393,22 @@ var QueryContext = class {
       chosen = exact[0];
       match = "tool-args";
       ambiguous = exact.length > 1;
+    } else if (!settled) {
+      return void 0;
     } else if (byName.length === 1) {
       chosen = byName[0];
       match = "tool-name";
-      argsMismatch = hasRecordedArgs(byName[0].arguments);
+      argsMismatch = byName[0].final && hasRecordedArgs(byName[0].arguments);
     }
     if (!chosen) return { match: "none", ambiguous: false, available: unclaimed.length };
     this.claimedToolCallIds.add(chosen.id);
-    return { toolCallId: chosen.id, match, ambiguous, available: unclaimed.length, ...argsMismatch ? { argsMismatch } : {} };
+    return {
+      toolCallId: chosen.id,
+      match,
+      ambiguous,
+      available: unclaimed.length,
+      ...argsMismatch ? { argsMismatch, recordedArgKeys: Object.keys(chosen.arguments).sort() } : {}
+    };
   }
   /**
    * Drain results still queued in `pendingResults` and report what was dropped.
@@ -53642,6 +53735,10 @@ function jsonSchemaToZodShape(schema) {
   }
   return shape;
 }
+function validateAgainstShape(shape, input) {
+  const parsed = external_exports.object(shape).safeParse(input);
+  return parsed.success ? parsed.data : void 0;
+}
 
 // src/index.ts
 import { readFileSync as nodeReadFileSync } from "node:fs";
@@ -56151,7 +56248,7 @@ function processStreamEvent(message, customToolNameToPi, model) {
     } else if (event.content_block?.type === "tool_use") {
       c.turnSawToolCall = true;
       const mappedName = mapToolName(event.content_block.name, customToolNameToPi);
-      c.recordToolCall(event.content_block.id, mappedName, {});
+      c.recordToolCall(event.content_block.id, mappedName, {}, false);
       c.turnBlocks.push({
         type: "toolCall",
         id: event.content_block.id,
@@ -56575,74 +56672,81 @@ function resolveMcpTools(context, excludeToolName) {
 }
 function buildMcpServers(tools, queryCtx) {
   if (!tools.length) return void 0;
-  const mcpTools = tools.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: jsonSchemaToZodShape(tool.parameters),
-    handler: async (args) => {
-      const mappedArgs = mapToolArgs(tool.name, args);
-      const claim = queryCtx.claimToolCall(tool.name, mappedArgs);
-      const toolCallId = claim.toolCallId;
-      if (!toolCallId) {
-        debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
-        diagDump("tool_handler_unmatched", {
-          toolName: tool.name,
-          argKeys: argKeys(mappedArgs),
-          available: claim.available,
-          turnToolCallIds: queryCtx.turnToolCallIds,
-          turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls)
+  const mcpTools = tools.map((tool) => {
+    const inputSchema = jsonSchemaToZodShape(tool.parameters);
+    const normalizeRecorded = (recorded) => {
+      const validated = validateAgainstShape(inputSchema, recorded);
+      return validated ? mapToolArgs(tool.name, validated) : void 0;
+    };
+    return {
+      name: tool.name,
+      description: tool.description,
+      inputSchema,
+      handler: async (args) => {
+        const mappedArgs = mapToolArgs(tool.name, args);
+        const claim = await queryCtx.claimToolCallWhenSettled(tool.name, mappedArgs, { normalizeRecorded });
+        const toolCallId = claim.toolCallId;
+        if (!toolCallId) {
+          debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
+          diagDump("tool_handler_unmatched", {
+            toolName: tool.name,
+            argKeys: argKeys(mappedArgs),
+            available: claim.available,
+            turnToolCallIds: queryCtx.turnToolCallIds,
+            turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls)
+          });
+          appendIntegrityEntry("tool_handler_unmatched", {
+            toolName: tool.name,
+            argKeys: argKeys(mappedArgs),
+            available: claim.available,
+            turnToolCallIds: queryCtx.turnToolCallIds
+          });
+          return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true };
+        }
+        queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
+        if (claim.argsMismatch) {
+          debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
+          diagDump("tool_claim_args_mismatch", {
+            toolName: tool.name,
+            toolCallId,
+            handlerArgKeys: argKeys(mappedArgs),
+            recordedArgKeys: claim.recordedArgKeys ?? []
+          });
+        } else if (claim.match !== "tool-args" || claim.ambiguous || claim.waited) {
+          debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}${claim.waited ? " after waiting for records to finalize" : ""}`);
+        }
+        if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
+          const result = queryCtx.pendingResults.get(toolCallId);
+          queryCtx.pendingResults.delete(toolCallId);
+          queryCtx.markToolResultResolved(toolCallId);
+          debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 resolved from queue (${queryCtx.pendingResults.size} remaining)`);
+          return result;
+        }
+        if (isUndeliverableToolCall(queryCtx, toolCallId)) {
+          debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 undeliverable: pi turn ended without this call; failing fast`);
+          diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
+          appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
+          queryCtx.markToolResultResolved(toolCallId);
+          return undeliveredToolCallResult(tool.name);
+        }
+        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 waiting`);
+        scheduleToolUseTurnEnd(
+          queryCtx,
+          () => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
+          `mcp-invocation:${tool.name}`
+        );
+        return new Promise((resolve8) => {
+          queryCtx.pendingToolCalls.set(toolCallId, {
+            toolName: tool.name,
+            resolve: (result) => {
+              queryCtx.markToolResultResolved(toolCallId);
+              resolve8(result);
+            }
+          });
         });
-        appendIntegrityEntry("tool_handler_unmatched", {
-          toolName: tool.name,
-          argKeys: argKeys(mappedArgs),
-          available: claim.available,
-          turnToolCallIds: queryCtx.turnToolCallIds
-        });
-        return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true };
       }
-      queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
-      if (claim.argsMismatch) {
-        debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
-        diagDump("tool_claim_args_mismatch", {
-          toolName: tool.name,
-          toolCallId,
-          handlerArgKeys: argKeys(mappedArgs),
-          recordedArgKeys: argKeys(queryCtx.turnToolCalls.find((call) => call.id === toolCallId)?.arguments)
-        });
-      } else if (claim.match !== "tool-args" || claim.ambiguous) {
-        debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}`);
-      }
-      if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
-        const result = queryCtx.pendingResults.get(toolCallId);
-        queryCtx.pendingResults.delete(toolCallId);
-        queryCtx.markToolResultResolved(toolCallId);
-        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 resolved from queue (${queryCtx.pendingResults.size} remaining)`);
-        return result;
-      }
-      if (isUndeliverableToolCall(queryCtx, toolCallId)) {
-        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 undeliverable: pi turn ended without this call; failing fast`);
-        diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
-        appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
-        queryCtx.markToolResultResolved(toolCallId);
-        return undeliveredToolCallResult(tool.name);
-      }
-      debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 waiting`);
-      scheduleToolUseTurnEnd(
-        queryCtx,
-        () => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
-        `mcp-invocation:${tool.name}`
-      );
-      return new Promise((resolve8) => {
-        queryCtx.pendingToolCalls.set(toolCallId, {
-          toolName: tool.name,
-          resolve: (result) => {
-            queryCtx.markToolResultResolved(toolCallId);
-            resolve8(result);
-          }
-        });
-      });
-    }
-  }));
+    };
+  });
   const server = tXe({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
   return { [MCP_SERVER_NAME]: server };
 }

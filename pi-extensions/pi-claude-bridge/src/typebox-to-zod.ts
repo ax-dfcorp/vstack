@@ -60,3 +60,15 @@ export function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeA
 	}
 	return shape;
 }
+
+/**
+ * Validate an object against a tool's input shape the way the SDK's MCP server
+ * does before it calls the handler: `z.object(shape)`, whose default strips
+ * top-level keys the shape does not declare. Used to compare a raw streamed
+ * tool_use input with the copy the handler received. Returns undefined when
+ * the input does not validate.
+ */
+export function validateAgainstShape(shape: Record<string, z.ZodTypeAny>, input: Record<string, unknown>): Record<string, unknown> | undefined {
+	const parsed = z.object(shape).safeParse(input);
+	return parsed.success ? parsed.data as Record<string, unknown> : undefined;
+}
