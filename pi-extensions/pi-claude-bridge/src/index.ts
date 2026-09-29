@@ -61,7 +61,7 @@ export {
 export { connectorCachePath, connectorCacheScopeKey, readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "./claude-executable.js";
-import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
+import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
@@ -1149,6 +1149,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	}
 
 	const stream = newAssistantMessageEventStream();
+	scopeModelSubstitutionStreak(options?.sessionId);
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1204,6 +1205,53 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		restartCtx.requestCompactionRestart();
 		rerunAfterQuerySettlement(restartCtx, stream, model, context, options);
 		return stream;
+	}
+
+	// --- Model substitution during an active query ---
+	// Claude Code answered this query with another model than requested (its
+	// refusal fallback) and keeps the swap for its session. Delivering the
+	// results would keep every later tool round on the substitute, and steers
+	// and follow-ups keep the query live, so a restart "on the next prompt"
+	// may never come (652 Opus 5 turns in one Opus 5.5 session, 2026-09-29).
+	// Discard the query the way a compaction does; the re-run takes the REBUILD
+	// path (rebuildReason=model-substitution, forceRotate: a fresh session id,
+	// never a resume of the swapped one) from pi's context, which already holds
+	// the substituted turn, its tool results, and any steer. After
+	// MODEL_SUBSTITUTION_RESTART_CAP consecutive restarts that were substituted
+	// again, deliver normally and say so once. Top-level only, as above.
+	const substitution = ctx().pendingModelSubstitution;
+	if (ctx().activeQuery && !ctx().abortRequested && stackDepth() === 0 && substitution) {
+		const restartCtx = ctx();
+		restartCtx.pendingModelSubstitution = null;
+		const diag = {
+			requested: substitution.requested,
+			reported: substitution.reported,
+			sessionId: (sharedSession?.sessionId ?? restartCtx.childSessionId)?.slice(0, 8),
+			contextMessages: context.messages.length,
+			waitingToolCalls: restartCtx.pendingToolCalls.size,
+		};
+		if (modelSubstitutionStreak.restarts < MODEL_SUBSTITUTION_RESTART_CAP) {
+			modelSubstitutionStreak.restarts += 1;
+			debug(`provider: model substitution during active query — restarting on a fresh Claude session (${modelSubstitutionStreak.restarts}/${MODEL_SUBSTITUTION_RESTART_CAP})`);
+			diagDump("model_substitution_restart", { ...diag, restart: modelSubstitutionStreak.restarts });
+			// Report the interrupted delivery as expected now, so teardown's own
+			// report cannot relabel it as a generic query-teardown mismatch.
+			reportToolResultMismatch(restartCtx, "model-substitution", cwd, { expectedInterruption: true });
+			if (sharedSession) setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" });
+			restartCtx.modelSubstitutionRestartRequested = true;
+			restartCtx.requestCompactionRestart();
+			rerunAfterQuerySettlement(restartCtx, stream, model, context, options);
+			return stream;
+		}
+		if (!modelSubstitutionStreak.capNotified) {
+			modelSubstitutionStreak.capNotified = true;
+			diagDump("model_substitution_restart_capped", { ...diag, restarts: modelSubstitutionStreak.restarts });
+			safeNotify(
+				`Pi Claude: Claude Code keeps answering with ${modelDisplayName(substitution.reported)} instead of ${modelDisplayName(substitution.requested)} ` +
+				`after ${modelSubstitutionStreak.restarts} restarts; the session continues on ${modelDisplayName(substitution.reported)} until you restart the agent or switch model.`,
+				"warning",
+			);
+		}
 	}
 
 	// --- Tool result delivery ---
@@ -1881,6 +1929,10 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 					// Recorded only once the model has actually seen it, so an aborted
 					// or replayed attempt delivers it again next turn.
 					...(appendUpdate ? { deliveredAppendDigest: appendUpdate.digest } : {}),
+					// A substitution in the query's last rounds: the next prompt must not
+					// resume the swapped session. noteModelSubstitution already marked an
+					// existing shared session; the first query of a pi session had none.
+					...(abortCtx.pendingModelSubstitution ? { needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" } : {}),
 				});
 			}
 			if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
@@ -1971,23 +2023,27 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 			streamIdleWatchdog?.dispose();
 			activeStreamIdleWatchdogs.delete(abortCtx);
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
-			const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, compactionRestart: abortCtx.compactionRestartRequested, streamIdleTimedOut });
+			const cause = toolCallDrainCause({ wasAborted, signalAborted: options?.signal?.aborted, compactionRestart: abortCtx.compactionRestartRequested, modelSubstitutionRestart: abortCtx.modelSubstitutionRestartRequested, streamIdleTimedOut });
 			try {
 				teardownQuery(abortCtx, sdkQuery, cause, cwd, isReentrant);
 				// The first query of a fresh pi session had no shared session when pi
-				// compacted under it. Record its child session as one due for the
-				// compaction rebuild, so the re-run rebuilds with that reason and can
-				// carry the recorded prompt from the child's jsonl. Without a captured
-				// session id the re-run takes the plain first-turn rebuild instead.
-				if (cause === "compaction-restart" && !sharedSession && abortCtx.pendingHistoryRewrite && abortCtx.childSessionId) {
-					debug(`provider: compaction restart recorded child session ${abortCtx.childSessionId.slice(0, 8)} for ${abortCtx.pendingHistoryRewrite} rebuild`);
+				// compacted under it (or Claude Code substituted its model). Record its
+				// child session as one due for that rebuild, so the re-run rebuilds with
+				// that reason and can carry the recorded prompt from the child's jsonl.
+				// Without a captured session id the re-run takes the plain first-turn
+				// rebuild instead.
+				const restartRebuildReason = cause === "model-substitution-restart" ? "model-substitution"
+					: cause === "compaction-restart" ? abortCtx.pendingHistoryRewrite
+					: null;
+				if (restartRebuildReason && !sharedSession && abortCtx.childSessionId) {
+					debug(`provider: ${cause} recorded child session ${abortCtx.childSessionId.slice(0, 8)} for ${restartRebuildReason} rebuild`);
 					setSharedSession({
 						sessionId: abortCtx.childSessionId,
 						cursor: 0,
 						cwd,
 						...accountSessionScope(account),
 						needsRebuild: true,
-						rebuildReason: abortCtx.pendingHistoryRewrite,
+						rebuildReason: restartRebuildReason,
 						forceRotate: true,
 					});
 				}

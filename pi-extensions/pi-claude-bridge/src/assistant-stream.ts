@@ -1,6 +1,6 @@
 import { calculateCost, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { appendIntegrityEntry, safeNotify, setSharedSession, sharedSession } from "./bridge-state.js";
+import { appendIntegrityEntry, modelSubstitutionStreak, resetModelSubstitutionStreak, safeNotify, setSharedSession, sharedSession } from "./bridge-state.js";
 import { modelDisplayName } from "./models.js";
 import { connectorResultByteSize, recordConnectorCallResult } from "./connector-audit.js";
 import { isChildExecutedTool } from "./connectors.js";
@@ -76,6 +76,7 @@ export function ensureTurnStarted(c: QueryContext = ctx()): void {
 
 export function finalizeCurrentStream(stopReason?: string, c: QueryContext = ctx()): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
+	settleTurnModel(c);
 	debug(`provider: finalizeCurrentStream called, stopReason=${stopReason}, turnOutput=${JSON.stringify({stopReason: c.turnOutput.stopReason, error: c.turnOutput.errorMessage})}`);
 	if (!c.turnStarted) ensureTurnStarted(c);
 	const reason = stopReason === "length" ? "length" : "stop";
@@ -194,6 +195,7 @@ function settleOpenToolBlocks(c: QueryContext): void {
  *  whether waiting for pi's result can ever succeed. */
 export function endToolUseTurn(c: QueryContext): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
+	settleTurnModel(c);
 	cancelScheduledToolUseEnd(c);
 	settleOpenToolBlocks(c);
 	for (const block of c.turnBlocks) {
@@ -326,31 +328,48 @@ export function sameBridgeModel(left: string, right: string): boolean {
  *  substituted id would silently switch the whole session (2026-09-27: one
  *  refusal-fallback turn on Opus 5 re-modelled an Opus 5.5 session and every
  *  later prompt ran on Opus 5, with no model_change record). A different
- *  family is a substitution: it is recorded, surfaced, and the next prompt
- *  restarts the Claude session so Claude Code's persisted swap does not
- *  stick. Synthetic frames ("<synthetic>") are ignored. */
+ *  family is a substitution: it is recorded, surfaced, and the Claude session
+ *  restarts at the next pi callback (next tool round or next prompt) so Claude
+ *  Code's persisted swap does not stick. Synthetic frames ("<synthetic>") are
+ *  ignored. */
 export function updateTurnOutputModel(modelId: unknown, source = "assistant"): void {
 	const c = ctx();
 	if (typeof modelId !== "string" || !modelId || !c.turnOutput) return;
 	if (modelId.startsWith("<")) return;
 	const requested = c.requestedModelId ?? c.turnOutput.model;
-	if (sameBridgeModel(requested, modelId)) return;
+	if (sameBridgeModel(requested, modelId)) {
+		c.requestedModelAnswered = true;
+		return;
+	}
 	noteModelSubstitution(requested, modelId, source);
+}
+
+/** A turn that ended answered by the requested model, with no substitution,
+ *  ends the substitution streak. Decided at the turn end, not at the first
+ *  matching report: a refusal-fallback turn opens on the requested model and
+ *  switches mid-turn, and resetting there would make the restart cap
+ *  unreachable. */
+function settleTurnModel(c: QueryContext): void {
+	if (c.requestedModelAnswered && !c.modelSubstitutionNoted) resetModelSubstitutionStreak();
 }
 
 export function noteModelSubstitution(requested: string, reported: string, source: string): void {
 	const c = ctx();
 	if (c.modelSubstitutionNoted) return;
 	c.modelSubstitutionNoted = true;
-	debug(`provider: Claude answered with ${reported} instead of ${requested} (${source}); keeping ${requested} and restarting the Claude session on the next prompt`);
+	c.pendingModelSubstitution = { requested, reported };
+	debug(`provider: Claude answered with ${reported} instead of ${requested} (${source}); keeping ${requested} and restarting the Claude session at the next tool round or prompt`);
 	diagDump("model_substituted", { requested, reported, source });
 	appendIntegrityEntry("model_substituted", { requested, reported, source });
 	if (sharedSession) {
 		setSharedSession({ ...sharedSession, needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" });
 	}
+	// One warning per streak: a restarted query that is substituted again is
+	// covered by this first notice and, past the cap, by the capped notice.
+	if (modelSubstitutionStreak.restarts > 0 || modelSubstitutionStreak.capNotified) return;
 	safeNotify(
 		`Pi Claude: Claude Code answered with ${modelDisplayName(reported)} instead of ${modelDisplayName(requested)}. ` +
-		`The session stays on ${modelDisplayName(requested)}; the next prompt restarts the Claude session so the substitution does not stick.`,
+		`The session stays on ${modelDisplayName(requested)}; the Claude session restarts at the next step so the substitution does not stick.`,
 		"warning",
 	);
 }

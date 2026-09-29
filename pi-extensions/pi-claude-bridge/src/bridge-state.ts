@@ -89,6 +89,32 @@ export function setSharedSession(next: SessionState | null): void {
 	sharedSession = next;
 }
 
+/** Consecutive in-query restarts after a model substitution (the
+ *  model-substitution branch in index.ts) within one pi session. Module state,
+ *  not query state: each restart starts a new query, and the cap has to count
+ *  across them. A turn answered by the requested model resets it. */
+export interface ModelSubstitutionStreak {
+	piSessionId: string | undefined;
+	restarts: number;
+	capNotified: boolean;
+}
+
+export const MODEL_SUBSTITUTION_RESTART_CAP = 2;
+
+export const modelSubstitutionStreak: ModelSubstitutionStreak = { piSessionId: undefined, restarts: 0, capNotified: false };
+
+export function resetModelSubstitutionStreak(): void {
+	modelSubstitutionStreak.restarts = 0;
+	modelSubstitutionStreak.capNotified = false;
+}
+
+/** Scope the streak to `piSessionId`; another pi session starts from zero. */
+export function scopeModelSubstitutionStreak(piSessionId: string | undefined): void {
+	if (modelSubstitutionStreak.piSessionId === piSessionId) return;
+	resetModelSubstitutionStreak();
+	modelSubstitutionStreak.piSessionId = piSessionId;
+}
+
 export function setExtensionApi(next: ExtensionAPI | undefined): void {
 	extensionApi = next;
 }

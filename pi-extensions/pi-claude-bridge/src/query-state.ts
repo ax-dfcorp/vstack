@@ -25,12 +25,16 @@ export interface PendingToolCall {
 // `compaction-restart` is the bridge discarding a live query on purpose because
 // pi compacted its history mid tool loop (see requestCompactionRestart); pi
 // still wants that turn continued, on the compacted history.
-export type ToolCallDrainCause = "abort" | "stream-idle-timeout" | "compaction-restart" | "query-end";
+// `model-substitution-restart` is the same discard after Claude Code answered
+// the query with another model than requested; the turn goes on in a fresh
+// Claude session.
+export type ToolCallDrainCause = "abort" | "stream-idle-timeout" | "compaction-restart" | "model-substitution-restart" | "query-end";
 
 const DRAIN_CAUSE_TEXT: Record<ToolCallDrainCause, string> = {
 	"abort": "the turn was aborted",
 	"stream-idle-timeout": "the Claude Code stream went idle and the turn timed out",
 	"compaction-restart": "pi compacted the conversation and the query was restarted on the compacted history",
+	"model-substitution-restart": "Claude Code answered with a substituted model and the query was restarted on a fresh Claude session",
 	"query-end": "the query ended",
 };
 
@@ -83,10 +87,12 @@ export function canInjectSteer(queryCtx: QueryContext, lastMsgRole: string | und
 
 // Precedence matches the forceRotate expression at the query-teardown site: an
 // explicit abort (pi's signal or our own abort handler) outranks a deliberate
-// compaction restart, which outranks a stream-idle timeout, which outranks a
-// plain end with stragglers.
-export function toolCallDrainCause(flags: { wasAborted?: boolean; signalAborted?: boolean; compactionRestart?: boolean; streamIdleTimedOut?: boolean }): ToolCallDrainCause {
+// restart (model substitution, then compaction: the substitution restart
+// reuses the compaction discard, so both flags are set), which outranks a
+// stream-idle timeout, which outranks a plain end with stragglers.
+export function toolCallDrainCause(flags: { wasAborted?: boolean; signalAborted?: boolean; compactionRestart?: boolean; modelSubstitutionRestart?: boolean; streamIdleTimedOut?: boolean }): ToolCallDrainCause {
 	if (flags.wasAborted || flags.signalAborted) return "abort";
+	if (flags.modelSubstitutionRestart) return "model-substitution-restart";
 	if (flags.compactionRestart) return "compaction-restart";
 	if (flags.streamIdleTimedOut) return "stream-idle-timeout";
 	return "query-end";
@@ -279,10 +285,11 @@ export class QueryContext {
 	 *  prompt arriving in that narrow window must wait and retry, not be mistaken
 	 *  for tool-result delivery to the dying query. */
 	abortRequested = false;
-	/** True once requestCompactionRestart discarded this query. Its completion
-	 *  handlers then leave the shared session, the account router, and pi's
-	 *  streams alone: the provider call that requested the restart owns the turn
-	 *  from here and re-runs it on the compacted history after settlement. */
+	/** True once requestCompactionRestart discarded this query (for a compaction
+	 *  or, with modelSubstitutionRestartRequested, a model substitution). Its
+	 *  completion handlers then leave the shared session, the account router,
+	 *  and pi's streams alone: the provider call that requested the restart owns
+	 *  the turn from here and re-runs it after settlement. */
 	compactionRestartRequested = false;
 	/** A history rewrite (`session_compact` / `session_tree`) pi reported while
 	 *  this query was live and before any shared session existed — the first
@@ -290,6 +297,15 @@ export class QueryContext {
 	 *  `sharedSession.needsRebuild` so the query is still restarted, and names
 	 *  the rebuild reason of the session created at its teardown. */
 	pendingHistoryRewrite: string | null = null;
+	/** Claude Code answered this query with another model than requested (see
+	 *  noteModelSubstitution). The next pi callback restarts the query on a fresh
+	 *  Claude session instead of delivering into it; a query that ends first
+	 *  hands it to the shared session so the next prompt rebuilds. */
+	pendingModelSubstitution: { requested: string; reported: string } | null = null;
+	/** True once this query was discarded for a model-substitution restart. Set
+	 *  alongside compactionRestartRequested, whose discard it reuses; it only
+	 *  names the drain cause and the rebuild reason. */
+	modelSubstitutionRestartRequested = false;
 	/** Why the last query on this context ended, recorded at teardown and read by
 	 *  the next provider call that arrives with a tool-result tail and no active
 	 *  query. Pi re-enters the provider that way for two very different reasons:
@@ -455,6 +471,9 @@ export class QueryContext {
 	// whole session (observed 2026-09-27, Opus 5.5 -> Opus 5).
 	requestedModelId: string | null = null;
 	modelSubstitutionNoted = false;
+	/** Claude Code reported the requested model in this turn. With no
+	 *  substitution noted, the turn ending resets the substitution streak. */
+	requestedModelAnswered = false;
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
@@ -474,6 +493,7 @@ export class QueryContext {
 		};
 		this.requestedModelId = model.id;
 		this.modelSubstitutionNoted = false;
+		this.requestedModelAnswered = false;
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
@@ -606,6 +626,8 @@ export class QueryContext {
 		this.abortRequested = false;
 		this.compactionRestartRequested = false;
 		this.pendingHistoryRewrite = null;
+		this.pendingModelSubstitution = null;
+		this.modelSubstitutionRestartRequested = false;
 		this.childSessionId = undefined;
 		this.lastQueryEndCause = null;
 		this.querySettledPromise = new Promise<void>((resolve) => {
