@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Agent SDK 0.3.296, verified on pi 1.1.0 and Claude Code 2.1.296
+
+The bundled Claude Agent SDK moves from 0.3.285 to 0.3.296 and the pi dev pins from 0.99.1 to 1.1.0. No bridge source changed: the unit suite (528 pass, 2 environment skips) and typecheck pass on pi 1.1.0, and the peer range stays `>=0.81.0`. Claude Code 2.1.286–2.1.296, which the bridge resolves from `PATH`, has no breaking change for `-p`/SDK sessions; 2.1.296 raises the MCP tool-description length sent up front from 2,048 to 4,096 characters and no longer stops a background command 5 seconds after the final result of a `-p`/SDK run.
+
 ### Agent SDK 0.3.285, verified on pi 0.99.1 and Claude Code 2.1.285
 
 The bundled Claude Agent SDK moves from 0.3.280 to 0.3.285 and the pi dev pins from 0.87.1 to 0.99.1. No bridge source changed: pi 0.99 removed none of the exports the bridge reads (`getCurrentSystemPrompt`/`getCurrentTools` are still pi-ai root exports), the peer range stays `>=0.81.0`, and the unit suite and typecheck pass on 0.99.1. Claude Code 2.1.281–2.1.285, which the bridge resolves from `PATH`, keeps SDK deferred tool calls and completed results across worker restarts and fixes resumed-session prompt-cache and history bugs; Sonnet 5.5 needs 2.1.284 or later.
