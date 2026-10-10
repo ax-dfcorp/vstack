@@ -49,9 +49,11 @@ run "provider: print mode responds" \
   --model "claude-bridge/claude-sonnet-5" \
   -p "Reply with just the word 'yes'"
 
+# pi 1.0 rejects --provider without --model (before, it silently ran the default
+# model of another provider, so this case never reached the bridge).
 run "provider: --provider flag works" \
   pi --no-session -ne -e "$DIR" \
-  --provider claude-bridge \
+  --provider claude-bridge --model claude-sonnet-5 \
   -p "Reply with just the word 'yes'"
 
 run "provider: model list includes provider" \
