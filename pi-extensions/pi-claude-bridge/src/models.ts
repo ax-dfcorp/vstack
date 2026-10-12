@@ -25,6 +25,7 @@ export const MODEL_IDS_IN_ORDER = [
 	"claude-opus-4-6",
 	SONNET_5_MODEL_ID,
 	"claude-sonnet-4-6",
+	"claude-haiku-5-5",
 	"claude-haiku-4-5",
 ];
 
@@ -48,6 +49,7 @@ const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
 	max: "max",
 };
 const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
+	"claude-haiku-5-5",
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
 	OPUS_5_5_MODEL_ID,
@@ -106,6 +108,17 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		name: "Claude Sonnet 5",
 		reasoning: true,
 		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		input: ["text", "image"],
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	// Haiku 5.5 (2026-10-07): first Haiku with an effort setting, 1M window.
+	// Research-worker fallback candidate in pi-local's roster (researchWorker).
+	"claude-haiku-5-5": {
+		id: "claude-haiku-5-5",
+		name: "Claude Haiku 5.5",
+		reasoning: true,
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
