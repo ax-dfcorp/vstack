@@ -23,6 +23,7 @@ export const MODEL_IDS_IN_ORDER = [
 	OPUS_5_MODEL_ID,
 	"claude-opus-4-7",
 	"claude-opus-4-6",
+	"claude-sonnet-5-5",
 	SONNET_5_MODEL_ID,
 	"claude-sonnet-4-6",
 	"claude-haiku-5-5",
@@ -49,6 +50,7 @@ const CLAUDE_FIVE_LEVEL_EFFORT_MAP = {
 	max: "max",
 };
 const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
+	"claude-sonnet-5-5",
 	"claude-haiku-5-5",
 	FABLE_MODEL_ID,
 	FABLE_5_MODEL_ID,
@@ -108,6 +110,16 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 		name: "Claude Sonnet 5",
 		reasoning: true,
 		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		input: ["text", "image"],
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	// Sonnet 5.5 (2026-09-28): effort levels low..max, 1M window, 128k output.
+	"claude-sonnet-5-5": {
+		id: "claude-sonnet-5-5",
+		name: "Claude Sonnet 5.5",
+		reasoning: true,
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],
 		contextWindow: 1000000,
 		maxTokens: 128000,
