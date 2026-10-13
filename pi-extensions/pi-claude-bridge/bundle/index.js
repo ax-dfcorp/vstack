@@ -29184,30 +29184,44 @@ function convertPiMessages(messages, customToolNameToSdk) {
 }
 
 // src/user-prompt.ts
+function trailingUserMessages(messages) {
+  let start = messages.length;
+  while (start > 0 && messages[start - 1]?.role === "user") start--;
+  return messages.slice(start);
+}
+function trailingUserCount(messages) {
+  return trailingUserMessages(messages).length;
+}
 function extractUserPrompt(messages) {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user") return null;
-  if (typeof last.content === "string") return last.content;
-  return messageContentToText(last.content) || "";
+  const tail = trailingUserMessages(messages);
+  if (tail.length === 0) return null;
+  const texts = [];
+  for (const msg of tail) {
+    const text = typeof msg.content === "string" ? msg.content : messageContentToText(msg.content) || "";
+    if (text) texts.push(text);
+  }
+  return texts.join("\n\n");
 }
 function extractUserPromptBlocks(messages) {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user" || !Array.isArray(last.content)) return null;
+  const tail = trailingUserMessages(messages).filter((msg) => Array.isArray(msg.content));
+  if (tail.length === 0) return null;
   let hasImage = false;
   const blocks = [];
-  for (const block of last.content) {
-    if (block.type === "text" && block.text) {
-      blocks.push({ type: "text", text: block.text });
-    } else if (block.type === "image" && block.data && block.mimeType) {
-      hasImage = true;
-      blocks.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: block.mimeType,
-          data: block.data
-        }
-      });
+  for (const msg of tail) {
+    for (const block of msg.content) {
+      if (block.type === "text" && block.text) {
+        blocks.push({ type: "text", text: block.text });
+      } else if (block.type === "image" && block.data && block.mimeType) {
+        hasImage = true;
+        blocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: block.mimeType,
+            data: block.data
+          }
+        });
+      }
     }
   }
   return hasImage ? blocks : null;
@@ -49032,7 +49046,7 @@ function streamWithContext(model, context, options) {
     customToolNameToSdk,
     queryModel.id,
     accountSessionScope(account),
-    isContinuation ? 0 : 1,
+    isContinuation ? 0 : trailingUserCount(context.messages),
     systemPromptAppend
   );
   const initialBlocks = promptBlocks ?? [{ type: "text", text: promptText }];

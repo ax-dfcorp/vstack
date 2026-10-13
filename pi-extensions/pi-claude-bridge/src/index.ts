@@ -17,6 +17,7 @@ import {
 	deferredUserPromptToBlocks,
 	deferredUserPromptToSdkInput,
 	extractDeferredUserPrompt,
+	trailingUserCount,
 	extractUserPrompt,
 	extractUserPromptBlocks,
 } from "./user-prompt.js";
@@ -1561,7 +1562,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		customToolNameToSdk,
 		queryModel.id,
 		accountSessionScope(account),
-		isContinuation ? 0 : 1,
+		isContinuation ? 0 : trailingUserCount(context.messages),
 		systemPromptAppend,
 	);
 	// AGENTS.md, project memory, or a skill changed since the CLI recorded this
