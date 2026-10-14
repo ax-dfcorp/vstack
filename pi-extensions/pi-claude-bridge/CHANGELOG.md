@@ -8,6 +8,10 @@ Pi appends each steer that arrives in the same tool boundary as its own user mes
 
 Tests: `tests/unit-user-prompt.mjs`.
 
+### Agent SDK 0.3.299, verified on pi 1.2.0 and Claude Code 2.1.299
+
+The bundled Claude Agent SDK moves from 0.3.296 to 0.3.299 and the pi dev pins from 1.1.0 to 1.2.0. No bridge source changed: the bridge registers no `before_agent_start` handler, so pi 1.2 firing that event for extension-triggered runs does not reach it; typecheck and the unit suite (529 pass, 2 environment skips) pass on pi 1.2.0. Live on Claude Code 2.1.299: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
+
 ### Agent SDK 0.3.296, verified on pi 1.1.0 and Claude Code 2.1.296
 
 The bundled Claude Agent SDK moves from 0.3.285 to 0.3.296 and the pi dev pins from 0.99.1 to 1.1.0. No bridge source changed: the unit suite (528 pass, 2 environment skips) and typecheck pass on pi 1.1.0, and the peer range stays `>=0.81.0`. Claude Code 2.1.286–2.1.296, which the bridge resolves from `PATH`, has no breaking change for `-p`/SDK sessions; 2.1.296 raises the MCP tool-description length sent up front from 2,048 to 4,096 characters and no longer stops a background command 5 seconds after the final result of a `-p`/SDK run. `tests/int-smoke.sh` now passes `--model` with `--provider claude-bridge`: pi 1.0 rejects `--provider` alone, and before that it silently ran another provider's default model, so the case never reached the bridge.
