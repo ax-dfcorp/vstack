@@ -8,6 +8,10 @@ Pi appends each steer that arrives in the same tool boundary as its own user mes
 
 Tests: `tests/unit-user-prompt.mjs`.
 
+### Agent SDK 0.3.308, verified on pi 1.4.0 and Claude Code 2.1.308
+
+The bundled Claude Agent SDK moves from 0.3.299 to 0.3.308 and the pi dev pins from 1.2.0 to 1.4.0. No bridge source changed: the SDK's type changes are additive (`BUILTIN_TOOL_NAMES`, `LEGACY_TOOL_NAME_ALIASES`, an optional per-tool `tools` policy on SDK MCP servers), and the allowlisted-MCP-tool prompt regression reported for 2.1.302+ (anthropics/claude-code#103919) is a plan-mode permission path the bridge never takes because it runs `bypassPermissions`. Typecheck and the unit suite (529 pass, 2 environment skips) pass on pi 1.4.0. Live on Claude Code 2.1.308: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (4 reuse / 0 rebuild).
+
 ### Agent SDK 0.3.299, verified on pi 1.2.0 and Claude Code 2.1.299
 
 The bundled Claude Agent SDK moves from 0.3.296 to 0.3.299 and the pi dev pins from 1.1.0 to 1.2.0. No bridge source changed: the bridge registers no `before_agent_start` handler, so pi 1.2 firing that event for extension-triggered runs does not reach it; typecheck and the unit suite (529 pass, 2 environment skips) pass on pi 1.2.0. Live on Claude Code 2.1.299: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
