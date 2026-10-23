@@ -1052,8 +1052,88 @@ function applyProviderRegistration(trigger: string): void {
 	}
 }
 
+interface SummarySubstitute {
+	model: Model<any>;
+	effort?: EffortLevel;
+	/** The model of the session being summarized. */
+	sessionModel: Model<any>;
+}
+
+/** The bridge model configured to write this session model's summaries, if any. */
+function resolveSummarySubstitute(model: Model<any>, providerConfig: Config["provider"] | undefined): SummarySubstitute | undefined {
+	const target = normalizeEffortOverrideModelKey(model.id);
+	for (const [key, override] of Object.entries(providerConfig?.summaryModelOverrides ?? {})) {
+		if (normalizeEffortOverrideModelKey(key) !== target) continue;
+		const substituteId = normalizeEffortOverrideModelKey(override.model);
+		if (substituteId === target) return undefined;
+		const entry = MODELS.find((candidate) => candidate.id === substituteId);
+		if (!entry) {
+			debug(`provider: summary model ${override.model} for ${model.id} is not a bridge model; the session model writes the summary`);
+			return undefined;
+		}
+		return {
+			model: { ...model, id: entry.id, name: entry.name, contextWindow: entry.contextWindow, maxTokens: entry.maxTokens, thinkingLevelMap: entry.thinkingLevelMap },
+			effort: override.effort as EffortLevel | undefined,
+			sessionModel: model,
+		};
+	}
+	return undefined;
+}
+
+/** A summary written by a substitute model runs under its own router session
+ *  key: binding the substitute to the conversation's key would move the
+ *  conversation's account affinity to the substitute's model scope, and the
+ *  next turn on the session model would rerank and rewrite its prompt cache. */
+function summaryRouterSessionId(sessionId: string | undefined): string {
+	return `${sessionId?.trim() || "default"}#summary`;
+}
+
+/** Pi's summary request, written by the configured substitute model when there
+ *  is one. Like Aider's weak model, the substitute only ever narrows the cost:
+ *  no eligible account, the session's own account, or a failure before any
+ *  output all fall back to the session model, so a summary is never lost to the
+ *  substitution. */
 function streamOneShotSummaryRequest(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	const substitute = resolveSummarySubstitute(model, loadConfig(cwd).provider);
+	if (!substitute) return runOneShotSummary(model, context, options, cwd);
+
+	const stream = newAssistantMessageEventStream();
+	void (async () => {
+		try {
+			let forwarded = false;
+			for await (const event of runOneShotSummary(substitute.model, context, options, cwd, substitute)) {
+				if (!forwarded && event.type === "error" && event.reason !== "aborted" && !options?.signal?.aborted) {
+					debug(`provider: summary by ${substitute.model.id} not available (${String(event.error.errorMessage ?? "").slice(0, 200)}); ${model.id} writes it`);
+					for await (const fallbackEvent of runOneShotSummary(model, context, options, cwd)) stream.push(fallbackEvent);
+					stream.end();
+					return;
+				}
+				forwarded = true;
+				stream.push(event);
+			}
+			stream.end();
+		} catch (error) {
+			const output: AssistantMessage = {
+				role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "error", timestamp: Date.now(),
+				errorMessage: error instanceof Error ? error.message : String(error),
+			};
+			stream.push({ type: "error", reason: "error", error: output });
+			stream.end();
+		}
+	})();
+	return stream;
+}
+
+function runOneShotSummary(
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+	cwd: string,
+	substitute?: SummarySubstitute,
+): AssistantMessageEventStream {
 	return streamOneShotSummary(model, context, options, {
 		cwd,
 		createStream: newAssistantMessageEventStream,
@@ -1065,12 +1145,20 @@ function streamOneShotSummaryRequest(model: Model<any>, context: Context, option
 			const router = resolveClaudeAccountRouter();
 			let account: ClaudeAccountRoute | undefined;
 			if (router) {
-				const acquisition = acquireRequestAccount(router, model, options?.sessionId, []);
+				const routerSessionId = substitute ? summaryRouterSessionId(options?.sessionId) : options?.sessionId;
+				const acquisition = acquireRequestAccount(router, model, routerSessionId, []);
 				if (acquisition.status === "unavailable") return { ...acquisition, status: "failed" };
 				account = acquisition.account;
+				// The substitute must not spend the window of the account the
+				// conversation itself runs on (for Fable, the 5-hour window Opus has
+				// to stay off); the session model writes the summary instead.
+				const sessionAccount = substitute ? router.current(substitute.sessionModel.id, options?.sessionId) : undefined;
+				if (sessionAccount && account && sessionAccount.profileId === account.profileId) {
+					return { status: "failed", message: `summary model ${model.id} would share the session's account ${account.label ?? account.profileId}` };
+				}
 			}
 			const providerSettings = loadConfig(cwd).provider ?? {};
-			const effort = resolveRequestEffort(model, options?.reasoning, providerSettings);
+			const effort = substitute?.effort ?? resolveRequestEffort(model, options?.reasoning, providerSettings);
 			const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
 			try {
 				if (claudeExecutable) preflightClaudeExecutable(claudeExecutable, cwd);

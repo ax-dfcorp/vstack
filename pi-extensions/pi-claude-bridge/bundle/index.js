@@ -29565,6 +29565,30 @@ function normalizeModelEffortOverrides(value) {
   }
   return Object.keys(out2).length > 0 ? out2 : void 0;
 }
+function normalizeSummaryModelOverrides(value) {
+  let source = value;
+  if (typeof source === "string") {
+    const trimmed = source.trim();
+    if (!trimmed || trimmed === "{}") return void 0;
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return void 0;
+    }
+  }
+  const record2 = asRecord(source);
+  if (!record2) return void 0;
+  const out2 = {};
+  for (const [modelId, rawValue] of Object.entries(record2)) {
+    const key = modelId.trim();
+    const entry = typeof rawValue === "string" ? { model: rawValue } : asRecord(rawValue);
+    const model = typeof entry?.model === "string" ? entry.model.trim() : "";
+    if (!key || !model) continue;
+    const effort = normalizeEffortLevel(entry?.effort);
+    out2[key] = effort ? { model, effort } : { model };
+  }
+  return Object.keys(out2).length > 0 ? out2 : void 0;
+}
 function normalizeProviderConfig(provider) {
   if (!provider) return {};
   const raw = provider;
@@ -29575,6 +29599,9 @@ function normalizeProviderConfig(provider) {
   const modelEffortOverrides = normalizeModelEffortOverrides(raw.modelEffortOverrides);
   if (modelEffortOverrides) out2.modelEffortOverrides = modelEffortOverrides;
   else delete out2.modelEffortOverrides;
+  const summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
+  if (summaryModelOverrides) out2.summaryModelOverrides = summaryModelOverrides;
+  else delete out2.summaryModelOverrides;
   const connectorWriteMode = normalizeConnectorWriteMode(raw.connectorWriteMode);
   if (connectorWriteMode) out2.connectorWriteMode = connectorWriteMode;
   else delete out2.connectorWriteMode;
@@ -29592,6 +29619,9 @@ function managerToConfig(raw) {
   }
   if (hasOwn(raw, "modelEffortOverrides")) {
     provider.modelEffortOverrides = normalizeModelEffortOverrides(raw.modelEffortOverrides);
+  }
+  if (hasOwn(raw, "summaryModelOverrides")) {
+    provider.summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
   }
   const strictMcpConfig = boolFrom(raw, "strictMcpConfig");
   if (strictMcpConfig !== void 0) provider.strictMcpConfig = strictMcpConfig;
@@ -29662,7 +29692,8 @@ var PROVIDER_KEYS = /* @__PURE__ */ new Set([
   "forceEffort",
   "modelEffortOverrides",
   "pathToClaudeCodeExecutable",
-  "strictMcpConfig"
+  "strictMcpConfig",
+  "summaryModelOverrides"
 ]);
 var PROMPT_CONTEXT_KEYS = /* @__PURE__ */ new Set([
   "includeAppendSystemPromptMd",
@@ -49862,8 +49893,66 @@ function applyProviderRegistration(trigger) {
     debug(`${trigger}: registerProvider threw; released stream guard for retry (kept primary):`, err);
   }
 }
+function resolveSummarySubstitute(model, providerConfig) {
+  const target = normalizeEffortOverrideModelKey(model.id);
+  for (const [key, override] of Object.entries(providerConfig?.summaryModelOverrides ?? {})) {
+    if (normalizeEffortOverrideModelKey(key) !== target) continue;
+    const substituteId = normalizeEffortOverrideModelKey(override.model);
+    if (substituteId === target) return void 0;
+    const entry = MODELS.find((candidate) => candidate.id === substituteId);
+    if (!entry) {
+      debug(`provider: summary model ${override.model} for ${model.id} is not a bridge model; the session model writes the summary`);
+      return void 0;
+    }
+    return {
+      model: { ...model, id: entry.id, name: entry.name, contextWindow: entry.contextWindow, maxTokens: entry.maxTokens, thinkingLevelMap: entry.thinkingLevelMap },
+      effort: override.effort,
+      sessionModel: model
+    };
+  }
+  return void 0;
+}
+function summaryRouterSessionId(sessionId) {
+  return `${sessionId?.trim() || "default"}#summary`;
+}
 function streamOneShotSummaryRequest(model, context, options) {
   const cwd = options?.cwd ?? process.cwd();
+  const substitute = resolveSummarySubstitute(model, loadConfig(cwd).provider);
+  if (!substitute) return runOneShotSummary(model, context, options, cwd);
+  const stream = newAssistantMessageEventStream();
+  void (async () => {
+    try {
+      let forwarded = false;
+      for await (const event of runOneShotSummary(substitute.model, context, options, cwd, substitute)) {
+        if (!forwarded && event.type === "error" && event.reason !== "aborted" && !options?.signal?.aborted) {
+          debug(`provider: summary by ${substitute.model.id} not available (${String(event.error.errorMessage ?? "").slice(0, 200)}); ${model.id} writes it`);
+          for await (const fallbackEvent of runOneShotSummary(model, context, options, cwd)) stream.push(fallbackEvent);
+          stream.end();
+          return;
+        }
+        forwarded = true;
+        stream.push(event);
+      }
+      stream.end();
+    } catch (error51) {
+      const output = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "error",
+        timestamp: Date.now(),
+        errorMessage: error51 instanceof Error ? error51.message : String(error51)
+      };
+      stream.push({ type: "error", reason: "error", error: output });
+      stream.end();
+    }
+  })();
+  return stream;
+}
+function runOneShotSummary(model, context, options, cwd, substitute) {
   return streamOneShotSummary(model, context, options, {
     cwd,
     createStream: newAssistantMessageEventStream,
@@ -49875,12 +49964,17 @@ function streamOneShotSummaryRequest(model, context, options) {
       const router = resolveClaudeAccountRouter();
       let account;
       if (router) {
-        const acquisition = acquireRequestAccount(router, model, options?.sessionId, []);
+        const routerSessionId = substitute ? summaryRouterSessionId(options?.sessionId) : options?.sessionId;
+        const acquisition = acquireRequestAccount(router, model, routerSessionId, []);
         if (acquisition.status === "unavailable") return { ...acquisition, status: "failed" };
         account = acquisition.account;
+        const sessionAccount = substitute ? router.current(substitute.sessionModel.id, options?.sessionId) : void 0;
+        if (sessionAccount && account && sessionAccount.profileId === account.profileId) {
+          return { status: "failed", message: `summary model ${model.id} would share the session's account ${account.label ?? account.profileId}` };
+        }
       }
       const providerSettings = loadConfig(cwd).provider ?? {};
-      const effort = resolveRequestEffort(model, options?.reasoning, providerSettings);
+      const effort = substitute?.effort ?? resolveRequestEffort(model, options?.reasoning, providerSettings);
       const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
       try {
         if (claudeExecutable) preflightClaudeExecutable(claudeExecutable, cwd);

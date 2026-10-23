@@ -93,6 +93,7 @@ The bridge also reads `claude-bridge.json` (`~/.pi/agent/claude-bridge.json`, an
 | Fast mode | Enable Claude Code fast mode for bridge requests when the selected model and account support it. |
 | Force Claude effort | Override Pi's thinking-level mapping for every claude-bridge request. `none` keeps Pi's selected level; `max` sends Claude Code `--effort max`. |
 | Model effort overrides | JSON object mapping model IDs to Claude Code efforts, e.g. `{"claude-opus-4-8":"max"}`. Per-model entries beat the global force setting. |
+| Summary model overrides | JSON object naming the model that writes compaction and branch summaries for a session model, e.g. `{"claude-fable-5-1":{"model":"claude-opus-5-5","effort":"high"}}`. Empty keeps every summary on the session model. |
 | Claude executable path | Explicit `claude` binary path; empty auto-detects. |
 
 Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, Opus 5.5, Opus 4.8, and Opus 5 expose Claude's five native effort levels: `low`, `medium`, `high`, `xhigh`, and `max`. Generic Pi aliases such as `off` and `minimal` are excluded for these models. **Force Claude effort** and **Model effort overrides** remain available when one bridge model needs a different fixed effort. For example, to force only Opus 4.8 to `max`:
@@ -102,6 +103,8 @@ Pi 0.80.6 and newer expose native `max` thinking. Fable 5.1, Fable 5, Opus 5.5, 
 ```
 
 Keys may be bare model IDs (`claude-opus-4-8`), canonical `pi-claude/<id>`, legacy `claude-bridge/<id>`, or `*` for all models. Values are `low`, `medium`, `high`, `xhigh`, or `max`.
+
+**Summary model overrides** hand a session model's summaries to a faster model. A summary is written from scratch (the request is uncached), so its time is the time to write it: on 1M-token sessions Opus 5.5 writes the same summary about a third faster than Fable 5.1, and the summary stays off Fable's allowance. The substitute is routed under its own account key, so the session keeps its account and prompt cache. The session model writes the summary instead when the substitute has no eligible account, would run on the session's own account, or fails before any output, so a summary is never lost to the substitution. Keys take the same forms as effort overrides (no `*`); a value is a model ID or `{"model": "…", "effort": "…"}`, and without `effort` the session's thinking level applies.
 
 ### Connectors
 

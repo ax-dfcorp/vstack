@@ -121,6 +121,15 @@
           "apply": "live"
         },
         {
+          "key": "summaryModelOverrides",
+          "label": "Summary model overrides",
+          "description": "Optional JSON object naming the model that writes compaction and branch summaries for a session model, e.g. {\"claude-fable-5-1\":{\"model\":\"claude-opus-5-5\",\"effort\":\"high\"}}. Falls back to the session model when the substitute has no account of its own or fails before any output.",
+          "type": "string",
+          "default": "{}",
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
           "key": "pathToClaudeCodeExecutable",
           "label": "Claude executable path",
           "description": "Optional explicit path to the claude binary. If empty, the bridge auto-detects claude or claude-code on PATH.",

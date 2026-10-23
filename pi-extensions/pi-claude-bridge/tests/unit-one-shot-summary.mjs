@@ -14,6 +14,10 @@ import {
 	streamClaudeAgentSdk,
 } from "../src/index.ts";
 import { isSelfContainedCompletion } from "../src/one-shot-summary.ts";
+import { normalizeSummaryModelOverrides } from "../src/config.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL } from "../src/account-router.ts";
 import { createQueryInputChannel } from "../src/input-channel.ts";
 import { ctx, resetStack } from "../src/query-state.ts";
@@ -271,6 +275,137 @@ describe("one-shot summary requests (cacheRetention: none)", () => {
 		assert.ok(observed.interrupts >= 1, "the child query must be interrupted");
 		assert.equal(ctx().abortRequested, false, "the shared query context must not see the summary's abort");
 		assert.equal(observed.failures.length, 0, "an abort is not an account failure");
+	});
+});
+
+// summaryModelOverrides: a Fable session's compaction summary is written by
+// Opus 5.5 (faster output, Fable allowance untouched) on another account, and
+// falls back to the session model rather than ever losing the summary.
+describe("summary model overrides", () => {
+	const fable = { ...model, id: "claude-fable-5-1", name: "Claude Fable 5.1", contextWindow: 1000000 };
+	let agentDir;
+
+	beforeEach(() => {
+		agentDir = mkdtempSync(join(tmpdir(), "bridge-summary-override-"));
+		writeFileSync(join(agentDir, "claude-bridge.json"), JSON.stringify({
+			provider: { summaryModelOverrides: { "claude-fable-5-1": { model: "claude-opus-5-5", effort: "high" } } },
+		}));
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+	});
+
+	afterEach(() => {
+		delete process.env.PI_CODING_AGENT_DIR;
+		rmSync(agentDir, { recursive: true, force: true });
+	});
+
+	function routerWith(observed, { sessionAccount } = {}) {
+		const router = makeRouter(observed);
+		router.acquire = (input) => {
+			observed.acquires.push(input);
+			return input.modelId === "claude-opus-5-5"
+				? { profileId: "b", label: "account-b", configDir: "/profiles/b" }
+				: { profileId: "a", label: "account-a", configDir: "/profiles/a" };
+		};
+		router.current = (modelId, sessionId) => {
+			observed.currents.push({ modelId, sessionId });
+			return sessionAccount;
+		};
+		return router;
+	}
+
+	it("writes a Fable session's summary with Opus 5.5 at the configured effort under a separate router key", async () => {
+		const observed = { ...observedState(), currents: [] };
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = routerWith(observed, { sessionAccount: { profileId: "a", label: "account-a", configDir: "/profiles/a" } });
+		__testSetSdkQueryFactory((input) => {
+			observed.queries.push(input);
+			return fakeSdkQuery(summaryMessages("## Goal\nby opus"), observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(fable, summaryContext, { cacheRetention: "none", sessionId: "pi-session", reasoning: "medium" }));
+
+		assert.equal(observed.queries.length, 1);
+		assert.equal(observed.queries[0].options.model, "claude-opus-5-5");
+		assert.equal(observed.queries[0].options.effort, "high");
+		assert.equal(observed.queries[0].options.env.CLAUDE_CONFIG_DIR, "/profiles/b");
+		assert.deepEqual(observed.acquires.map((input) => [input.modelId, input.sessionId]), [["claude-opus-5-5", "pi-session#summary"]]);
+		assert.deepEqual(observed.currents, [{ modelId: "claude-fable-5-1", sessionId: "pi-session" }]);
+		const done = events.at(-1);
+		assert.equal(done.type, "done");
+		assert.equal(done.message.model, "claude-opus-5-5");
+		assert.equal(done.message.content.at(-1).text, "## Goal\nby opus");
+		assert.equal(events.filter((event) => event.type === "start").length, 1);
+	});
+
+	it("falls back to the session model when the substitute would land on the session's own account", async () => {
+		const observed = { ...observedState(), currents: [] };
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = routerWith(observed, { sessionAccount: { profileId: "b", label: "account-b", configDir: "/profiles/b" } });
+		__testSetSdkQueryFactory((input) => {
+			observed.queries.push(input);
+			return fakeSdkQuery(summaryMessages("## Goal\nby fable"), observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(fable, summaryContext, { cacheRetention: "none", sessionId: "pi-session", reasoning: "medium" }));
+
+		assert.equal(observed.queries.length, 1, "no Opus query may start on the session's account");
+		assert.equal(observed.queries[0].options.model, "claude-fable-5-1");
+		assert.equal(observed.queries[0].options.effort, "medium");
+		assert.deepEqual(observed.acquires.map((input) => [input.modelId, input.sessionId]), [
+			["claude-opus-5-5", "pi-session#summary"],
+			["claude-fable-5-1", "pi-session"],
+		]);
+		assert.equal(events.filter((event) => event.type === "error").length, 0);
+		assert.equal(events.at(-1).type, "done");
+		assert.equal(events.at(-1).message.model, "claude-fable-5-1");
+	});
+
+	it("falls back to the session model when the substitute fails before any output", async () => {
+		const observed = { ...observedState(), currents: [] };
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = routerWith(observed);
+		__testSetSdkQueryFactory((input) => {
+			observed.queries.push(input);
+			if (input.options.model === "claude-opus-5-5") {
+				return fakeSdkQuery([
+					{ type: "system", subtype: "init", session_id: "one-shot-session" },
+					{ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour" } },
+					{ type: "result", subtype: "error_during_execution", errors: ["five_hour limit"] },
+				], observed);
+			}
+			return fakeSdkQuery(summaryMessages("## Goal\nby fable"), observed);
+		});
+
+		const events = await collect(streamClaudeAgentSdk(fable, summaryContext, { cacheRetention: "none", sessionId: "pi-session" }));
+
+		assert.deepEqual(observed.queries.map((query) => query.options.model), ["claude-opus-5-5", "claude-fable-5-1"]);
+		assert.equal(observed.rateLimits.length, 1, "the substitute's rate limit is still recorded");
+		assert.equal(events.filter((event) => event.type === "error").length, 0);
+		assert.equal(events.at(-1).type, "done");
+		assert.equal(events.at(-1).message.content.at(-1).text, "## Goal\nby fable");
+	});
+
+	it("leaves other session models on their own model", async () => {
+		const observed = { ...observedState(), currents: [] };
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = routerWith(observed);
+		__testSetSdkQueryFactory((input) => {
+			observed.queries.push(input);
+			return fakeSdkQuery(summaryMessages("## Goal\nsummary"), observed);
+		});
+
+		await collect(streamClaudeAgentSdk({ ...model, id: "claude-opus-5-5" }, summaryContext, { cacheRetention: "none", sessionId: "pi-session" }));
+
+		assert.equal(observed.queries[0].options.model, "claude-opus-5-5");
+		assert.deepEqual(observed.acquires.map((input) => input.sessionId), ["pi-session"]);
+		assert.equal(observed.currents.length, 0);
+	});
+
+	it("normalizes override values from objects, model-id strings, and JSON text", () => {
+		assert.deepEqual(normalizeSummaryModelOverrides({ "claude-fable-5-1": "claude-opus-5-5" }), { "claude-fable-5-1": { model: "claude-opus-5-5" } });
+		assert.deepEqual(
+			normalizeSummaryModelOverrides('{"pi-claude/claude-fable-5-1":{"model":"claude-opus-5-5","effort":"high"}}'),
+			{ "pi-claude/claude-fable-5-1": { model: "claude-opus-5-5", effort: "high" } },
+		);
+		assert.deepEqual(normalizeSummaryModelOverrides({ "claude-fable-5-1": { model: "claude-opus-5-5", effort: "turbo" } }), { "claude-fable-5-1": { model: "claude-opus-5-5" } });
+		assert.equal(normalizeSummaryModelOverrides({ "claude-fable-5-1": { effort: "high" } }), undefined);
+		assert.equal(normalizeSummaryModelOverrides("not json"), undefined);
 	});
 });
 

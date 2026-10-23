@@ -20,6 +20,11 @@ const EXTERNAL_CONFIG_RESOLVER_SYMBOL = Symbol.for("vstack.pi.extension-config-r
 
 export type BridgeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
+export interface SummaryModelOverride {
+	model: string;
+	effort?: BridgeEffortLevel;
+}
+
 const VALID_EFFORT_LEVELS = new Set<BridgeEffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 
 /**
@@ -41,6 +46,13 @@ export interface Config {
 		forceEffort?: BridgeEffortLevel;
 		/** Per-model Claude Code effort overrides keyed by model id (e.g. claude-opus-4-8). */
 		modelEffortOverrides?: Record<string, BridgeEffortLevel>;
+		/**
+		 * Compaction and branch summaries of a session on the key model are written
+		 * by another bridge model, e.g. {"claude-fable-5-1":{"model":"claude-opus-5-5","effort":"high"}}.
+		 * The session's own model writes the summary when the substitute has no
+		 * account, would share the session's account, or fails before any output.
+		 */
+		summaryModelOverrides?: Record<string, SummaryModelOverride>;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;
@@ -261,6 +273,33 @@ export function normalizeModelEffortOverrides(value: unknown): Record<string, Br
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Accepts an object or its JSON text; a value is a model id or { model, effort }. */
+export function normalizeSummaryModelOverrides(value: unknown): Record<string, SummaryModelOverride> | undefined {
+	let source: unknown = value;
+	if (typeof source === "string") {
+		const trimmed = source.trim();
+		if (!trimmed || trimmed === "{}") return undefined;
+		try {
+			source = JSON.parse(trimmed);
+		} catch {
+			return undefined;
+		}
+	}
+	const record = asRecord(source);
+	if (!record) return undefined;
+
+	const out: Record<string, SummaryModelOverride> = {};
+	for (const [modelId, rawValue] of Object.entries(record)) {
+		const key = modelId.trim();
+		const entry = typeof rawValue === "string" ? { model: rawValue } : asRecord(rawValue);
+		const model = typeof entry?.model === "string" ? entry.model.trim() : "";
+		if (!key || !model) continue;
+		const effort = normalizeEffortLevel(entry?.effort);
+		out[key] = effort ? { model, effort } : { model };
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeProviderConfig(provider: Config["provider"] | undefined): Config["provider"] {
 	if (!provider) return {};
 	const raw = provider as SettingsRecord;
@@ -271,6 +310,9 @@ function normalizeProviderConfig(provider: Config["provider"] | undefined): Conf
 	const modelEffortOverrides = normalizeModelEffortOverrides(raw.modelEffortOverrides);
 	if (modelEffortOverrides) out.modelEffortOverrides = modelEffortOverrides;
 	else delete out.modelEffortOverrides;
+	const summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
+	if (summaryModelOverrides) out.summaryModelOverrides = summaryModelOverrides;
+	else delete out.summaryModelOverrides;
 	// Fail closed: legacy config files are merged raw, so an unvalidated
 	// connectorWriteMode (e.g. "Deny", "read-only", true) must not slip through as
 	// a truthy non-"allow" value. Drop anything that isn't exactly deny/allow so
@@ -294,6 +336,9 @@ function managerToConfig(raw: SettingsRecord): Partial<Config> {
 	}
 	if (hasOwn(raw, "modelEffortOverrides")) {
 		provider.modelEffortOverrides = normalizeModelEffortOverrides(raw.modelEffortOverrides);
+	}
+	if (hasOwn(raw, "summaryModelOverrides")) {
+		provider.summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
 	}
 	const strictMcpConfig = boolFrom(raw, "strictMcpConfig");
 	if (strictMcpConfig !== undefined) provider.strictMcpConfig = strictMcpConfig;
@@ -384,6 +429,7 @@ const PROVIDER_KEYS = new Set([
 	"modelEffortOverrides",
 	"pathToClaudeCodeExecutable",
 	"strictMcpConfig",
+	"summaryModelOverrides",
 ]);
 
 const PROMPT_CONTEXT_KEYS = new Set([
