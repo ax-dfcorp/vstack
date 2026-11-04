@@ -37,7 +37,7 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
-import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1 } from "./side-question.js";
+import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
 // regenerate their vendored package.json with a CLOSED exports map
@@ -327,8 +327,22 @@ const SIDE_QUESTION_HOST: ClaudeBridgeSideQuestionHostV1 = {
 		session: () => sharedSession,
 		base: sideQuestionBase,
 		queryFactory: (params) => sdkQueryFactory(params as Parameters<typeof query>[0]),
+		sideQuestionModel: (cwd) => resolveSideQuestionModel(loadConfig(cwd).provider),
 	}),
 };
+
+/** provider.sideQuestionModel, when it names a bridge model. */
+function resolveSideQuestionModel(providerConfig: Config["provider"] | undefined): SideQuestionModel | null {
+	const configured = providerConfig?.sideQuestionModel;
+	if (!configured) return null;
+	const id = normalizeEffortOverrideModelKey(configured.model);
+	const entry = MODELS.find((candidate) => candidate.id === id);
+	if (!entry) {
+		debug(`side-question: ${configured.model} is not a bridge model; the session model answers`);
+		return null;
+	}
+	return { model: entry.id, ...(configured.effort ? { effort: configured.effort as EffortLevel } : {}) };
+}
 
 function extractAllToolResults(context: Context): McpResult[] {
 	const { results, stopIdx } = _extractAllToolResults(context.messages as unknown as Array<{ role: string; [key: string]: unknown }>);

@@ -16,6 +16,13 @@
 //     options must match that turn exactly — tool declarations lead every
 //     request, so a different tool list re-caches the whole conversation
 //     (measured: cacheRead 56,233 / cacheCreate 65, session file untouched).
+//
+// A configured side-question model (provider.sideQuestionModel) always takes the
+// resumed path with only `model` and `effort` swapped: a running query answers
+// on its own model. That model has no cache of this conversation, so its first
+// question writes it; the subscription weekly limit counts that write lightly
+// and output heavily, which is what the cheaper model saves. Any failure there
+// falls back to the session model, so a question is never lost to the swap.
 
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionState } from "./bridge-state.js";
@@ -67,12 +74,20 @@ interface SideQuestionCapableQuery {
 	close?(): void;
 }
 
+/** The model that answers side questions instead of the session model. */
+export interface SideQuestionModel {
+	model: string;
+	effort?: Options["effort"];
+}
+
 export interface SideQuestionDeps {
 	/** The top-level query while a Pi run is in flight and not aborting. */
 	liveQuery(): unknown | null;
 	session(): SessionState | null;
 	base(): SideQuestionBase | null;
 	queryFactory(params: { prompt: AsyncIterable<never>; options: Options }): unknown;
+	/** The configured side-question model, if any (already validated as a bridge model). */
+	sideQuestionModel?(cwd: string): SideQuestionModel | null;
 }
 
 let recordedBase: SideQuestionBase | null = null;
@@ -126,6 +141,17 @@ export async function askSideQuestion(input: SideQuestionInput, deps: SideQuesti
 	const history = normalizeHistory(input.history);
 	if (input.signal?.aborted) throw abortError();
 
+	const base = deps.base();
+	const substitute = base ? deps.sideQuestionModel?.(base.cwd) ?? null : null;
+	if (substitute && substitute.model !== base?.model) {
+		try {
+			return await askResumed(question, history, input.signal, deps, substitute);
+		} catch (error) {
+			if (input.signal?.aborted) throw abortError();
+			debug(`side-question: ${substitute.model} could not answer (${error instanceof Error ? error.message : String(error)}); the session model answers`);
+		}
+	}
+
 	const live = deps.liveQuery();
 	if (isSideQuestionCapable(live)) {
 		try {
@@ -145,6 +171,7 @@ async function askResumed(
 	history: SideQuestionExchange[],
 	signal: AbortSignal | undefined,
 	deps: SideQuestionDeps,
+	substitute?: SideQuestionModel,
 ): Promise<SideQuestionAnswer> {
 	const session = deps.session();
 	const base = deps.base();
@@ -161,7 +188,13 @@ async function askResumed(
 	async function* noPrompt(): AsyncGenerator<never> {
 		await gate;
 	}
-	const options: Options = { ...base.buildOptions(), resume: session.sessionId, persistSession: false };
+	const options: Options = {
+		...base.buildOptions(),
+		...(substitute ? { model: substitute.model, ...(substitute.effort ? { effort: substitute.effort } : {}) } : {}),
+		resume: session.sessionId,
+		persistSession: false,
+	};
+	const model = substitute?.model ?? base.model;
 	const sideQuery = deps.queryFactory({ prompt: noPrompt(), options });
 	if (!isSideQuestionCapable(sideQuery)) {
 		release();
@@ -175,10 +208,10 @@ async function askResumed(
 			debug(`side-question: resumed query stream ended: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	})();
-	debug(`side-question: resumed ${session.sessionId.slice(0, 8)} model=${base.model} history=${history.length}`);
+	debug(`side-question: resumed ${session.sessionId.slice(0, 8)} model=${model}${substitute ? ` (session ${base.model})` : ""} history=${history.length}`);
 	try {
 		const result = await sideQuery.askSideQuestion(question, { history, signal });
-		return toAnswer(result, base.model, "resumed");
+		return toAnswer(result, model, "resumed");
 	} catch (error) {
 		if (signal?.aborted) throw abortError();
 		throw error;

@@ -115,4 +115,43 @@ describe("side question", () => {
 		await assert.rejects(askSideQuestion({ question: "q" }, { ...deps, queryFactory: () => query }), /no answer/);
 		assert.equal(calls.closed, true);
 	});
+
+	it("a configured side-question model answers on a resumed child, even mid-turn", async () => {
+		const live = { async askSideQuestion() { assert.fail("the session model's live query is not used"); } };
+		const { query, calls } = fakeResumedQuery({ response: "sonnet answer" });
+		let params;
+		let askedCwd;
+		const answer = await askSideQuestion({ question: "q" }, {
+			liveQuery: () => live,
+			session: () => session,
+			base: () => base,
+			queryFactory: (p) => { params = p; return query; },
+			sideQuestionModel: (cwd) => { askedCwd = cwd; return { model: "claude-sonnet-5-5", effort: "high" }; },
+		});
+		assert.deepEqual(answer, { text: "sonnet answer", synthetic: false, model: "claude-sonnet-5-5", path: "resumed" });
+		assert.equal(askedCwd, "/repo");
+		assert.equal(params.options.model, "claude-sonnet-5-5");
+		assert.equal(params.options.effort, "high");
+		assert.equal(params.options.resume, "sess-1234abcd");
+		assert.equal(params.options.persistSession, false);
+		assert.deepEqual(params.options.mcpServers, { pi: {} });
+		assert.equal(calls.closed, true);
+	});
+
+	it("the session model answers when the configured model is the session model or fails", async () => {
+		const live = { async askSideQuestion() { return { response: "session answer" }; } };
+		const same = await askSideQuestion({ question: "q" }, {
+			liveQuery: () => live, session: () => session, base: () => base,
+			queryFactory: () => assert.fail("no child"),
+			sideQuestionModel: () => ({ model: "claude-opus-5-5" }),
+		});
+		assert.equal(same.path, "live");
+		const { query } = fakeResumedQuery(() => { throw new Error("Sonnet limit reached"); });
+		const failed = await askSideQuestion({ question: "q" }, {
+			liveQuery: () => live, session: () => session, base: () => base,
+			queryFactory: () => query,
+			sideQuestionModel: () => ({ model: "claude-sonnet-5-5" }),
+		});
+		assert.deepEqual(failed, { text: "session answer", synthetic: false, model: "claude-opus-5-5", path: "live" });
+	});
 });

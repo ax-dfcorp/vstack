@@ -53,6 +53,13 @@ export interface Config {
 		 * account, would share the session's account, or fails before any output.
 		 */
 		summaryModelOverrides?: Record<string, SummaryModelOverride>;
+		/**
+		 * Side questions (/btw) are answered by this bridge model whatever the
+		 * session model is, e.g. {"model":"claude-sonnet-5-5","effort":"high"}.
+		 * The session's own model answers when this is unset, names the session
+		 * model, or fails.
+		 */
+		sideQuestionModel?: SummaryModelOverride;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;
@@ -300,6 +307,28 @@ export function normalizeSummaryModelOverrides(value: unknown): Record<string, S
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
+export function normalizeSideQuestionModel(value: unknown): SummaryModelOverride | undefined {
+	let source: unknown = value;
+	if (typeof source === "string") {
+		const trimmed = source.trim();
+		if (!trimmed) return undefined;
+		if (trimmed.startsWith("{")) {
+			try {
+				source = JSON.parse(trimmed);
+			} catch {
+				return undefined;
+			}
+		} else {
+			return { model: trimmed };
+		}
+	}
+	const entry = asRecord(source);
+	const model = typeof entry?.model === "string" ? entry.model.trim() : "";
+	if (!model) return undefined;
+	const effort = normalizeEffortLevel(entry?.effort);
+	return effort ? { model, effort } : { model };
+}
+
 function normalizeProviderConfig(provider: Config["provider"] | undefined): Config["provider"] {
 	if (!provider) return {};
 	const raw = provider as SettingsRecord;
@@ -313,6 +342,9 @@ function normalizeProviderConfig(provider: Config["provider"] | undefined): Conf
 	const summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
 	if (summaryModelOverrides) out.summaryModelOverrides = summaryModelOverrides;
 	else delete out.summaryModelOverrides;
+	const sideQuestionModel = normalizeSideQuestionModel(raw.sideQuestionModel);
+	if (sideQuestionModel) out.sideQuestionModel = sideQuestionModel;
+	else delete out.sideQuestionModel;
 	// Fail closed: legacy config files are merged raw, so an unvalidated
 	// connectorWriteMode (e.g. "Deny", "read-only", true) must not slip through as
 	// a truthy non-"allow" value. Drop anything that isn't exactly deny/allow so
@@ -339,6 +371,9 @@ function managerToConfig(raw: SettingsRecord): Partial<Config> {
 	}
 	if (hasOwn(raw, "summaryModelOverrides")) {
 		provider.summaryModelOverrides = normalizeSummaryModelOverrides(raw.summaryModelOverrides);
+	}
+	if (hasOwn(raw, "sideQuestionModel")) {
+		provider.sideQuestionModel = normalizeSideQuestionModel(raw.sideQuestionModel);
 	}
 	const strictMcpConfig = boolFrom(raw, "strictMcpConfig");
 	if (strictMcpConfig !== undefined) provider.strictMcpConfig = strictMcpConfig;
@@ -428,6 +463,7 @@ const PROVIDER_KEYS = new Set([
 	"forceEffort",
 	"modelEffortOverrides",
 	"pathToClaudeCodeExecutable",
+	"sideQuestionModel",
 	"strictMcpConfig",
 	"summaryModelOverrides",
 ]);
