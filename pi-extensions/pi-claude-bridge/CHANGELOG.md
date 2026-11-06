@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Agent SDK 0.3.318, verified on pi 1.5.0 and Claude Code 2.1.318
+
+The bundled Claude Agent SDK moves from 0.3.308 to 0.3.318 and the pi dev pins from 1.4.0 to 1.5.0. No bridge source changed. pi 1.5.0's one breaking change (tool arguments validated by `@earendil-works/pi-schema`, so TypeBox-only features such as `Type.Refine()` no longer apply) does not reach the bridge, which uses none of them. Typecheck and the unit suite (536 pass, 2 environment skips) pass on pi 1.5.0. Live on Claude Code 2.1.318: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (4 reuse / 0 rebuild). The live tests need a logged-in `CLAUDE_CONFIG_DIR` with weekly room; the default `~/.claude` is logged out on this machine.
+
 ### Every trailing user message is the prompt, not only the last one
 
 Pi appends each steer that arrives in the same tool boundary as its own user message, so a context can end with two or more user messages. The bridge sent only the last one to Claude; the earlier ones were imported into the session file as history and never answered. Observed 2026-10-13: two Daseo `notifyOnFinish` notices for research workers landed 85 ms apart, the parent saw only the second, and the first worker looked unfinished until the user asked. `extractUserPrompt` and `extractUserPromptBlocks` now take the whole trailing run of user messages, joined with a blank line (images from every message kept, in order), and the session sync drops that many trailing messages instead of a fixed one. The live-steer path uses the same extractor, so two steers pushed into an active query arrive together too.
