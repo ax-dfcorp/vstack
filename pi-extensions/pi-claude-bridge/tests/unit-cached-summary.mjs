@@ -11,7 +11,6 @@ import { __testSetBridgeIntegrityState, __testSetSdkQueryFactory, streamClaudeAg
 import { setLastTopLevelRequest } from "../src/bridge-state.ts";
 import {
 	CACHED_SUMMARY_MAX_IDLE_MS,
-	CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE,
 	buildCachedSummaryPrompt,
 	conversationDigestOf,
 	takeCompactionNote,
@@ -249,22 +248,19 @@ describe("summary routing through the provider", () => {
 		});
 	}
 
-	it("leaves a small context to the summary substitute, whose uncached request is cheaper there", async () => {
+	it("keeps the summary substitute's isolated request whatever the context size (the substitute exists to spare the session model's window)", async () => {
 		const configDir = mkdtempSync(join(tmpdir(), "cached-summary-cfg-"));
 		const previous = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = configDir;
 		writeFileSync(join(configDir, "claude-bridge.json"), JSON.stringify({ provider: { summaryModelOverrides: { [model.id]: { model: "claude-opus-5-5", effort: "high" } } } }));
 		try {
-			warmState();
-			setLastTopLevelRequest({ at: Date.now() - 60_000, model: model.id, contextTokens: CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE - 1, accountProfileId: "a", claudeConfigDir: "/profiles/a" });
-			let observed = run([textMessages("## Goal\nx")]);
-			await collect(streamClaudeAgentSdk(model, summaryContext(initialPrompt), { cacheRetention: "none", sessionId: "pi-1" }));
-			assert.equal(observed.queries[0].options.resume, undefined, "small context: the substitute's isolated request");
-			warmState();
-			setLastTopLevelRequest({ at: Date.now() - 60_000, model: model.id, contextTokens: CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE, accountProfileId: "a", claudeConfigDir: "/profiles/a" });
-			observed = run([textMessages("## Goal\nx")]);
-			await collect(streamClaudeAgentSdk(model, summaryContext(initialPrompt), { cacheRetention: "none", sessionId: "pi-1" }));
-			assert.equal(observed.queries[0].options.resume, SESSION.sessionId, "large context: the warm cache");
+			for (const contextTokens of [50_000, 900_000]) {
+				warmState();
+				setLastTopLevelRequest({ at: Date.now() - 60_000, model: model.id, contextTokens, accountProfileId: "a", claudeConfigDir: "/profiles/a" });
+				const observed = run([textMessages("## Goal\nx")]);
+				await collect(streamClaudeAgentSdk(model, summaryContext(initialPrompt), { cacheRetention: "none", sessionId: "pi-1" }));
+				assert.equal(observed.queries[0].options.resume, undefined, `context ${contextTokens}: the substitute's isolated request`);
+			}
 		} finally {
 			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
 			rmSync(configDir, { recursive: true, force: true });

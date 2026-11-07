@@ -10,7 +10,7 @@
 - A warm-up counts, and is reported to the router, only if it read at least half of the last request's context from cache. A cold or mismatched prefix is logged as `cache_keep_warm_failed`, so the router never holds a session on an account for a cache that is gone.
 - A query starting while a warm-up is in flight aborts the warm-up first, so two resumed children of one session never overlap.
 - A warm-up refused because a query was running retries every minute until 58 minutes after the last request. Before, it gave up for that idle stretch.
-- With `summaryModelOverrides` set for the session model (Fable to Opus), the cached summary is used only from 200,000 tokens of context. Below that, the substitute's isolated request costs less on the weekly limit.
+- A session model with a summary substitute (`summaryModelOverrides`, Fable to Opus) always keeps the substitute's isolated summary. The override exists to keep summaries off the Fable window, the scarcest meter (claude-fable-first policy); a cached summary would be written by Fable itself. Cached summaries therefore apply to sessions without a substitute (Opus and others).
 
 Measured live with Pi in RPC mode, 2026-11-07:
 

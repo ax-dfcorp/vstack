@@ -40,14 +40,6 @@ import { debug } from "./debug.js";
 /** A summary takes the cached path only if the conversation's last request started this recently (the cache lives 60 minutes from it). */
 export const CACHED_SUMMARY_MAX_IDLE_MS = 55 * 60 * 1000;
 const SNIPPET_CHARS = 160;
-/**
- * With a summary substitute configured for the session model (Fable -> Opus),
- * the cached path must beat the substitute's isolated request on the weekly
- * limit: Fable at weight 10 reading N tokens at 0.025 and writing S at 5, vs
- * Opus at 2.2 reading N uncached and writing S at 5, i.e. 0.25N + 50S <
- * 2.2N + 11S, N > 20S. With summaries of up to ~10k tokens that is ~200k.
- */
-export const CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE = 200_000;
 
 export interface CompactionNote {
 	/** sha256 of Pi's own serialization of the messages it summarizes: the

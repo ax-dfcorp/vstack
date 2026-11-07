@@ -48290,7 +48290,6 @@ import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { createHash } from "crypto";
 var CACHED_SUMMARY_MAX_IDLE_MS = 55 * 60 * 1e3;
 var SNIPPET_CHARS = 160;
-var CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE = 2e5;
 var pendingCompaction = null;
 function noteCompaction(note) {
   pendingCompaction = note;
@@ -51525,8 +51524,8 @@ function cachedSummaryRun(model, context, options) {
     return void 0;
   }
   const substitute = resolveSummarySubstitute(model, loadConfig(session.cwd).provider);
-  if (substitute && substitute.model.id !== model.id && (lastTopLevelRequest?.contextTokens ?? 0) < CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE) {
-    debug(`provider: compaction summary takes the one-shot path: context ${lastTopLevelRequest?.contextTokens ?? 0} < ${CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE} with summary substitute ${substitute.model.id}`);
+  if (substitute && substitute.model.id !== model.id) {
+    debug(`provider: compaction summary takes the one-shot path: ${model.id} summaries are written by ${substitute.model.id} (summaryModelOverrides)`);
     return void 0;
   }
   const instructions = summaryInstructions(promptText);

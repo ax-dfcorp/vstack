@@ -38,7 +38,7 @@ import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { driveSummaryQuery, isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
 import { KEEP_WARM_MIN_CACHE_READ_SHARE, KEEP_WARM_PROMPT, KeepWarmScheduler, keepWarmSettings, type WarmUsage } from "./keep-warm.js";
-import { CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE, buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
+import { buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
@@ -1239,15 +1239,15 @@ function cachedSummaryRun(model: Model<any>, context: Context, options?: SimpleS
 		debug(`provider: compaction summary takes the one-shot path: ${refusal ?? "missing state"}`);
 		return undefined;
 	}
-	// When another model would write the isolated summary (summaryModelOverrides,
-	// e.g. Fable -> Opus), the cached path is only cheaper on a large context:
-	// on the weekly limit it reads the context at 0.025 but writes the summary at
-	// the session model's weight, while the substitute reads it uncached at its
-	// own, lower weight. Below CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE the
-	// substitute's isolated request is the cheaper one.
+	// A session model with a summary substitute (summaryModelOverrides, e.g.
+	// Fable -> Opus) keeps the substitute's isolated request. David-Daniel set
+	// that override (2026-10-23) to keep summaries off the Fable window, the
+	// scarcest meter (claude-fable-first policy); a cached summary would be
+	// written by the session model itself and spend that window, even though it
+	// costs less on the all-model weekly limit.
 	const substitute = resolveSummarySubstitute(model, loadConfig(session.cwd).provider);
-	if (substitute && substitute.model.id !== model.id && (lastTopLevelRequest?.contextTokens ?? 0) < CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE) {
-		debug(`provider: compaction summary takes the one-shot path: context ${lastTopLevelRequest?.contextTokens ?? 0} < ${CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE} with summary substitute ${substitute.model.id}`);
+	if (substitute && substitute.model.id !== model.id) {
+		debug(`provider: compaction summary takes the one-shot path: ${model.id} summaries are written by ${substitute.model.id} (summaryModelOverrides)`);
 		return undefined;
 	}
 	const instructions = summaryInstructions(promptText)!;
