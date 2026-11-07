@@ -130,6 +130,42 @@
           "apply": "live"
         },
         {
+          "key": "keepWarm.enabled",
+          "label": "Keep cache warm when idle",
+          "description": "Send one small request to a large idle conversation shortly before its prompt cache expires, so the next turn reads the conversation from cache instead of writing it again.",
+          "type": "boolean",
+          "default": true,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
+          "key": "keepWarm.afterMinutes",
+          "label": "Keep-warm after (minutes)",
+          "description": "Silence after the conversation's last request before the warm-up. The cache lives 60 minutes; 1-59.",
+          "type": "number",
+          "default": 53,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
+          "key": "keepWarm.minContextTokens",
+          "label": "Keep-warm minimum context",
+          "description": "Only conversations whose last request carried at least this many tokens are kept warm.",
+          "type": "number",
+          "default": 100000,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
+          "key": "keepWarm.maxWarms",
+          "label": "Keep-warm requests per idle stretch",
+          "description": "How many warm-ups one idle stretch may receive.",
+          "type": "number",
+          "default": 1,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
           "key": "pathToClaudeCodeExecutable",
           "label": "Claude executable path",
           "description": "Optional explicit path to the claude binary. If empty, the bridge auto-detects claude or claude-code on PATH.",

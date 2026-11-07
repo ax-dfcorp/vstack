@@ -30360,6 +30360,23 @@ function normalizeSideQuestionModel(value) {
   const effort = normalizeEffortLevel(entry?.effort);
   return effort ? { model, effort } : { model };
 }
+function boundedNumber(value, min, max) {
+  const number4 = typeof value === "string" && value.trim() ? Number(value) : value;
+  return typeof number4 === "number" && Number.isFinite(number4) ? Math.min(max, Math.max(min, number4)) : void 0;
+}
+function normalizeKeepWarm(value) {
+  const record2 = asRecord(value);
+  if (!record2) return void 0;
+  const out = {};
+  if (typeof record2.enabled === "boolean") out.enabled = record2.enabled;
+  const afterMinutes = boundedNumber(record2.afterMinutes, 1, 59);
+  if (afterMinutes !== void 0) out.afterMinutes = afterMinutes;
+  const minContextTokens = boundedNumber(record2.minContextTokens, 0, 1e7);
+  if (minContextTokens !== void 0) out.minContextTokens = Math.round(minContextTokens);
+  const maxWarms = boundedNumber(record2.maxWarms, 0, 10);
+  if (maxWarms !== void 0) out.maxWarms = Math.floor(maxWarms);
+  return Object.keys(out).length > 0 ? out : void 0;
+}
 function normalizeProviderConfig(provider) {
   if (!provider) return {};
   const raw = provider;
@@ -30379,6 +30396,9 @@ function normalizeProviderConfig(provider) {
   const connectorWriteMode = normalizeConnectorWriteMode(raw.connectorWriteMode);
   if (connectorWriteMode) out.connectorWriteMode = connectorWriteMode;
   else delete out.connectorWriteMode;
+  const keepWarm2 = normalizeKeepWarm(raw.keepWarm);
+  if (keepWarm2) out.keepWarm = keepWarm2;
+  else delete out.keepWarm;
   return out;
 }
 function managerToConfig(raw) {
@@ -30408,6 +30428,13 @@ function managerToConfig(raw) {
   if (connectorWriteMode) provider.connectorWriteMode = connectorWriteMode;
   const claudePath = stringFrom(raw, "pathToClaudeCodeExecutable");
   if (claudePath) provider.pathToClaudeCodeExecutable = claudePath;
+  const keepWarm2 = normalizeKeepWarm({
+    enabled: raw["keepWarm.enabled"],
+    afterMinutes: raw["keepWarm.afterMinutes"],
+    minContextTokens: raw["keepWarm.minContextTokens"],
+    maxWarms: raw["keepWarm.maxWarms"]
+  });
+  if (keepWarm2) provider.keepWarm = keepWarm2;
   const includeAppendSystemPromptMd = boolFrom(raw, "includeAppendSystemPromptMd");
   if (includeAppendSystemPromptMd !== void 0) promptContext.includeAppendSystemPromptMd = includeAppendSystemPromptMd;
   const includeProjectAgentsHook = boolFrom(raw, "includeProjectAgentsHook");
@@ -30442,11 +30469,16 @@ function legacyLayers(cwd) {
   const projectPath = join2(dirname2(projectSettings), "claude-bridge.json");
   return [...layers, { path: projectPath, config: legacyFileConfig(projectPath) }];
 }
+function mergeProvider(base, next) {
+  const merged = { ...base, ...next };
+  if (base?.keepWarm && next?.keepWarm) merged.keepWarm = { ...normalizeKeepWarm(base.keepWarm), ...normalizeKeepWarm(next.keepWarm) };
+  return merged;
+}
 function mergeLayers(layers) {
   const merged = { provider: {}, promptContext: {} };
   for (const layer of layers) {
     if (layer.config.enabled !== void 0) merged.enabled = layer.config.enabled;
-    merged.provider = { ...merged.provider, ...layer.config.provider };
+    merged.provider = mergeProvider(merged.provider, layer.config.provider);
     merged.promptContext = { ...merged.promptContext, ...layer.config.promptContext };
   }
   return merged;
@@ -30454,7 +30486,7 @@ function mergeLayers(layers) {
 function loadConfig(cwd) {
   const legacy = mergeLayers(legacyLayers(cwd));
   const manager = isolatedFromEnv() ? {} : managerToConfig(readManagerConfig(cwd));
-  const provider = normalizeProviderConfig({ ...legacy.provider, ...manager.provider });
+  const provider = normalizeProviderConfig(mergeProvider(legacy.provider, manager.provider));
   return {
     enabled: manager.enabled ?? legacy.enabled ?? true,
     provider,
@@ -30479,8 +30511,10 @@ var PROMPT_CONTEXT_KEYS = /* @__PURE__ */ new Set([
   "includeProjectAgentsHook",
   "includeTaskPanelHook"
 ]);
+var KEEP_WARM_KEYS = /* @__PURE__ */ new Set(["keepWarm.enabled", "keepWarm.afterMinutes", "keepWarm.minContextTokens", "keepWarm.maxWarms"]);
 function configValueForKey(config2, key) {
   if (key === "enabled") return config2.enabled;
+  if (KEEP_WARM_KEYS.has(key)) return normalizeProviderConfig(config2.provider)?.keepWarm?.[key.slice("keepWarm.".length)];
   if (PROVIDER_KEYS.has(key)) return normalizeProviderConfig(config2.provider)?.[key];
   if (PROMPT_CONTEXT_KEYS.has(key)) return config2.promptContext?.[key];
   return void 0;
@@ -48106,6 +48140,124 @@ function driveSummaryQuery(model, options, run) {
   }
 }
 
+// src/keep-warm.ts
+var DEFAULT_KEEP_WARM = { enabled: true, afterMinutes: 53, minContextTokens: 1e5, maxWarms: 1 };
+function keepWarmSettings(config2) {
+  return { ...DEFAULT_KEEP_WARM, ...config2 };
+}
+var KEEP_WARM_PROMPT = [
+  "<cache_keepalive>",
+  "This is an automated keep-alive request from the environment, not a message from the user, and it is not part of the conversation.",
+  "Do not call any tools and do not continue any task. Reply with exactly: ok",
+  "</cache_keepalive>"
+].join("\n");
+function keepWarmRefusal(state) {
+  const { settings, lastRequest, session, base } = state;
+  if (!settings.enabled) return "disabled";
+  if (state.warms >= settings.maxWarms) return `already warmed ${state.warms} time(s)`;
+  if (!lastRequest) return "no request recorded";
+  if (lastRequest.contextTokens < settings.minContextTokens) return `context ${lastRequest.contextTokens} < ${settings.minContextTokens}`;
+  if (state.now - lastRequest.at < settings.afterMinutes * 6e4) return "not idle long enough";
+  if (state.now - lastRequest.at >= 60 * 6e4) return "cache already expired";
+  if (state.liveQuery) return "a query is running";
+  if (!session || session.needsRebuild) return "no reusable shared session";
+  if (!base) return "no recorded turn options";
+  if (base.model !== lastRequest.model) return `last turn ran ${base.model}`;
+  if (base.cwd !== session.cwd || (base.claudeConfigDir ?? void 0) !== (session.claudeConfigDir ?? void 0)) return "the shared session moved since the last turn";
+  if ((lastRequest.accountProfileId ?? void 0) !== (session.accountProfileId ?? void 0)) return "last request on another account";
+  if (state.accountRoutable === false) return "account blocked or session re-routed";
+  return void 0;
+}
+var KeepWarmScheduler = class {
+  constructor(deps) {
+    this.deps = deps;
+  }
+  deps;
+  timer;
+  warms = 0;
+  stretchAt;
+  lastWarmAt;
+  inFlight;
+  now() {
+    return this.deps.now?.() ?? Date.now();
+  }
+  clearTimer() {
+    if (this.timer === void 0) return;
+    if (this.deps.clearTimer) this.deps.clearTimer(this.timer);
+    else clearTimeout(this.timer);
+    this.timer = void 0;
+  }
+  /** A real top-level request started: a new idle stretch begins when it ends. */
+  noteRequest(request) {
+    if (this.stretchAt !== request.at) {
+      this.stretchAt = request.at;
+      this.warms = 0;
+      this.lastWarmAt = void 0;
+    }
+    this.inFlight?.abort();
+    this.inFlight = void 0;
+    this.arm();
+  }
+  /** Stop everything: session switch, shutdown. */
+  cancel() {
+    this.clearTimer();
+    this.inFlight?.abort();
+    this.inFlight = void 0;
+    this.stretchAt = void 0;
+    this.warms = 0;
+    this.lastWarmAt = void 0;
+  }
+  arm() {
+    this.clearTimer();
+    const settings = this.deps.settings();
+    if (!settings.enabled || this.stretchAt === void 0 || this.warms >= settings.maxWarms) return;
+    const from = this.lastWarmAt ?? this.stretchAt;
+    const delay = Math.max(0, from + settings.afterMinutes * 6e4 - this.now());
+    const callback = () => {
+      this.timer = void 0;
+      void this.fire();
+    };
+    if (this.deps.setTimer) {
+      this.timer = this.deps.setTimer(callback, delay);
+    } else {
+      const timer = setTimeout(callback, delay);
+      timer.unref?.();
+      this.timer = timer;
+    }
+  }
+  async fire() {
+    const settings = this.deps.settings();
+    const state = this.deps.state();
+    const lastRequest = state.lastRequest;
+    const ageFrom = this.lastWarmAt !== void 0 && lastRequest ? { ...lastRequest, at: this.lastWarmAt } : lastRequest;
+    const refusal = keepWarmRefusal({ ...state, lastRequest: ageFrom, settings, warms: this.warms, now: this.now() });
+    if (refusal || !lastRequest) {
+      debug(`keep-warm: not sent (${refusal ?? "no request"})`);
+      return;
+    }
+    const controller = new AbortController();
+    this.inFlight = controller;
+    const stretch = this.stretchAt;
+    try {
+      const usage = await this.deps.warm(controller.signal);
+      if (controller.signal.aborted || this.stretchAt !== stretch) return;
+      this.warms += 1;
+      this.lastWarmAt = this.now();
+      this.deps.onWarmed(usage, lastRequest);
+      this.arm();
+    } catch (error51) {
+      if (controller.signal.aborted) return;
+      this.deps.onFailed?.(error51, lastRequest);
+    } finally {
+      if (this.inFlight === controller) this.inFlight = void 0;
+    }
+  }
+  /** For tests and diagnostics. */
+  status() {
+    return { armed: this.timer !== void 0, warms: this.warms, ...this.stretchAt !== void 0 ? { stretchAt: this.stretchAt } : {}, ...this.lastWarmAt !== void 0 ? { lastWarmAt: this.lastWarmAt } : {} };
+  }
+};
+
 // src/cached-summary.ts
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { createHash } from "crypto";
@@ -50951,7 +51103,7 @@ function isClaudeContextLengthFailure(message) {
 function isSdkProgressMessage(message) {
   return !(message.type === "stream_event" && message.event?.type === "ping");
 }
-async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, inputChannel, topLevel = false) {
+async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, inputChannel, topLevel) {
   let capturedSessionId;
   let failure;
   let accountProbe;
@@ -50968,12 +51120,15 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
     if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
     if (topLevel && message.type === "stream_event" && message.event?.type === "message_start") {
       const usage = message.event.message?.usage ?? {};
-      setLastTopLevelRequest({
+      const request = {
         at: Date.now(),
         model: model.id,
         contextTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
-        ...account ? { accountProfileId: account.profileId, claudeConfigDir: account.configDir } : {}
-      });
+        ...account ? { accountProfileId: account.profileId, claudeConfigDir: account.configDir } : {},
+        ...topLevel.routerSessionId ? { routerSessionId: topLevel.routerSessionId } : {}
+      };
+      setLastTopLevelRequest(request);
+      keepWarm.noteRequest(request);
     }
     if (account) {
       debug("consumeQuery: managed message", JSON.stringify({
@@ -51218,6 +51373,86 @@ function streamOneShotSummaryRequest(model, context, options) {
   const stream = newAssistantMessageEventStream();
   withFallback(stream, cached2, () => streamIsolatedSummaryRequest(model, context, options, cwd), options?.signal, "cached summary");
   return stream;
+}
+var keepWarm = new KeepWarmScheduler({
+  settings: () => keepWarmSettings(loadConfig(sharedSession?.cwd ?? process.cwd()).provider?.keepWarm),
+  state: () => {
+    const request = lastTopLevelRequest;
+    const session = sharedSession;
+    const router = resolveClaudeAccountRouter();
+    return {
+      lastRequest: request,
+      liveQuery: stackDepth() !== 0 || ctx().activeQuery !== null,
+      session,
+      base: sideQuestionBase(),
+      accountRoutable: router && request ? router.current(request.model, request.routerSessionId)?.profileId === (session?.accountProfileId ?? null) : void 0
+    };
+  },
+  warm: (signal) => new Promise((resolve5, reject) => {
+    const session = sharedSession;
+    const base = sideQuestionBase();
+    const request = lastTopLevelRequest;
+    if (!session || !base || !request) {
+      reject(new Error("no shared session"));
+      return;
+    }
+    const model = MODELS.find((candidate) => candidate.id === request.model);
+    if (!model) {
+      reject(new Error(`${request.model} is not a bridge model`));
+      return;
+    }
+    const router = resolveClaudeAccountRouter();
+    const account = session.accountProfileId ? { profileId: session.accountProfileId, label: session.accountProfileId, ...session.claudeConfigDir ? { configDir: session.claudeConfigDir } : {} } : void 0;
+    debug(`keep-warm: warming ${session.sessionId.slice(0, 8)} model=${request.model} lastContext=${request.contextTokens} idle=${Math.round((Date.now() - request.at) / 1e3)}s`);
+    const stream = driveSummaryQuery({ ...model, api: "claude-bridge", provider: PROVIDER_ID }, { signal }, {
+      createStream: newAssistantMessageEventStream,
+      queryFactory: sdkQueryFactory,
+      queryOptions: { ...cachedSummaryOptions(base.buildOptions(), session.sessionId), ...makeCliDebugOptions("keep-warm") },
+      blocks: [{ type: "text", text: KEEP_WARM_PROMPT }],
+      account,
+      router,
+      label: "keep-warm",
+      rejectToolUse: true
+    });
+    void (async () => {
+      try {
+        for await (const event of stream) {
+          if (event.type === "done") {
+            const { input, output, cacheRead, cacheWrite } = event.message.usage;
+            resolve5({ input, output, cacheRead, cacheWrite });
+            return;
+          }
+          if (event.type === "error") {
+            reject(new Error(event.error.errorMessage ?? "keep-warm request failed"));
+            return;
+          }
+        }
+        reject(new Error("keep-warm stream ended without a result"));
+      } catch (error51) {
+        reject(error51);
+      }
+    })();
+  }),
+  onWarmed: (usage, request) => {
+    const session = sharedSession;
+    if (session?.accountProfileId) resolveClaudeAccountRouter()?.recordCacheWarm?.(session.accountProfileId, request.routerSessionId, request.model);
+    debug(`keep-warm: done cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} in=${usage.input} out=${usage.output}`);
+    diagDump("cache_keep_warm", {
+      model: request.model,
+      sessionId: session?.sessionId,
+      account: session?.accountProfileId ?? null,
+      lastContextTokens: request.contextTokens,
+      idleMs: Date.now() - request.at,
+      ...usage
+    });
+  },
+  onFailed: (error51, request) => {
+    debug(`keep-warm: failed: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    diagDump("cache_keep_warm_failed", { model: request.model, idleMs: Date.now() - request.at, error: error51 instanceof Error ? error51.message : String(error51) });
+  }
+});
+function __testKeepWarm() {
+  return keepWarm;
 }
 function cachedSummaryRun(model, context, options) {
   const promptText = extractUserPrompt(context.messages);
@@ -51939,7 +52174,7 @@ function streamWithContext(model, context, options) {
     abortCtx.currentPiStream?.end();
     abortCtx.currentPiStream = null;
   };
-  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, !isReentrant).then(async ({ capturedSessionId, failure }) => {
+  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, isReentrant ? void 0 : { routerSessionId: options?.sessionId }).then(async ({ capturedSessionId, failure }) => {
     debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
     if (abortCtx.compactionRestartRequested) {
       debug("provider: query discarded for compaction restart; the re-run owns the turn");
@@ -52007,7 +52242,7 @@ function streamWithContext(model, context, options) {
           `provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`
         );
         try {
-          const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, void 0, !isReentrant);
+          const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, void 0, isReentrant ? void 0 : { routerSessionId: options?.sessionId });
           if (abortCtx.compactionRestartRequested) break;
           if (continuation.failure) {
             recordAttemptFailure(continuation.failure);
@@ -52267,6 +52502,8 @@ function index_default(pi2) {
     debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
     setSharedSession(null);
     clearSideQuestionBase();
+    keepWarm.cancel();
+    setLastTopLevelRequest(null);
   };
   pi2.on("session_start", (event, ctx2) => {
     recordProjectTrust(ctx2);
@@ -52280,6 +52517,7 @@ function index_default(pi2) {
   });
   pi2.on("session_shutdown", () => {
     cancelScheduledSessionPersistence();
+    keepWarm.cancel();
     clearSession("session_shutdown");
     releaseProviderTokens("session_shutdown");
   });
@@ -52323,6 +52561,7 @@ export {
   STREAM_IDLE_BACKOFF_HINT_MS,
   STREAM_IDLE_TIMEOUT_ENV,
   __testGetBridgeIntegrityState,
+  __testKeepWarm,
   __testResetTurnSystemPrompt,
   __testSetBridgeIntegrityState,
   __testSetSdkQueryFactory,

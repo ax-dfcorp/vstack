@@ -33,6 +33,13 @@ export interface ClaudeAccountRouterV1 {
 	recordFailure(profileId: string, kind: ClaudeAccountFailureKind, modelId: string): void;
 	recordSuccess(profileId: string, sessionId?: string): void;
 	current(modelId: string, sessionId?: string): ClaudeAccountRoute | undefined;
+	/**
+	 * Optional: the bridge refreshed this session's prompt cache on `profileId`
+	 * without a user request (keep-warm.ts). A router that moves idle sessions
+	 * once their cache has expired can count the cache as alive from here; this
+	 * is not user activity and must not be recorded as one.
+	 */
+	recordCacheWarm?(profileId: string, sessionId: string | undefined, modelId: string): void;
 }
 
 export interface ClaudeBridgeAccountHostV1 {

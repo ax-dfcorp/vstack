@@ -95,6 +95,8 @@ export interface TopLevelRequest {
 	contextTokens: number;
 	accountProfileId?: string;
 	claudeConfigDir?: string;
+	/** The session id the account router keys this conversation by (Pi's provider `sessionId`). */
+	routerSessionId?: string;
 }
 
 export let lastTopLevelRequest: TopLevelRequest | null = null;

@@ -18,6 +18,17 @@ export const PACKAGE_ID = "@vanillagreen/pi-claude-bridge";
  */
 const EXTERNAL_CONFIG_RESOLVER_SYMBOL = Symbol.for("vstack.pi.extension-config-resolver");
 
+export interface KeepWarmConfig {
+	/** Default true. */
+	enabled?: boolean;
+	/** Minutes of silence after the last real request before the warm-up (default 53; 1-59). */
+	afterMinutes?: number;
+	/** Only conversations whose last request carried at least this many tokens (default 100000). */
+	minContextTokens?: number;
+	/** Warm-ups per idle stretch (default 1). */
+	maxWarms?: number;
+}
+
 export type BridgeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface SummaryModelOverride {
@@ -84,6 +95,12 @@ export interface Config {
 		 * are disabled.
 		 */
 		connectorWriteMode?: ConnectorWriteMode;
+		/**
+		 * One cache-keeping request after a long idle (keep-warm.ts): a large
+		 * conversation's prompt cache expires 60 minutes after its last request,
+		 * and the next turn then re-writes all of it.
+		 */
+		keepWarm?: KeepWarmConfig;
 	};
 	/** Extra Pi context forwarded to Claude Code on top of AGENTS.md + skills. */
 	promptContext?: {
@@ -329,6 +346,25 @@ export function normalizeSideQuestionModel(value: unknown): SummaryModelOverride
 	return effort ? { model, effort } : { model };
 }
 
+function boundedNumber(value: unknown, min: number, max: number): number | undefined {
+	const number = typeof value === "string" && value.trim() ? Number(value) : value;
+	return typeof number === "number" && Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : undefined;
+}
+
+export function normalizeKeepWarm(value: unknown): KeepWarmConfig | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const out: KeepWarmConfig = {};
+	if (typeof record.enabled === "boolean") out.enabled = record.enabled;
+	const afterMinutes = boundedNumber(record.afterMinutes, 1, 59);
+	if (afterMinutes !== undefined) out.afterMinutes = afterMinutes;
+	const minContextTokens = boundedNumber(record.minContextTokens, 0, 10_000_000);
+	if (minContextTokens !== undefined) out.minContextTokens = Math.round(minContextTokens);
+	const maxWarms = boundedNumber(record.maxWarms, 0, 10);
+	if (maxWarms !== undefined) out.maxWarms = Math.floor(maxWarms);
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeProviderConfig(provider: Config["provider"] | undefined): Config["provider"] {
 	if (!provider) return {};
 	const raw = provider as SettingsRecord;
@@ -352,6 +388,9 @@ function normalizeProviderConfig(provider: Config["provider"] | undefined): Conf
 	const connectorWriteMode = normalizeConnectorWriteMode(raw.connectorWriteMode);
 	if (connectorWriteMode) out.connectorWriteMode = connectorWriteMode;
 	else delete out.connectorWriteMode;
+	const keepWarm = normalizeKeepWarm(raw.keepWarm);
+	if (keepWarm) out.keepWarm = keepWarm;
+	else delete out.keepWarm;
 	return out;
 }
 
@@ -383,6 +422,13 @@ function managerToConfig(raw: SettingsRecord): Partial<Config> {
 	if (connectorWriteMode) provider.connectorWriteMode = connectorWriteMode;
 	const claudePath = stringFrom(raw, "pathToClaudeCodeExecutable");
 	if (claudePath) provider.pathToClaudeCodeExecutable = claudePath;
+	const keepWarm = normalizeKeepWarm({
+		enabled: raw["keepWarm.enabled"],
+		afterMinutes: raw["keepWarm.afterMinutes"],
+		minContextTokens: raw["keepWarm.minContextTokens"],
+		maxWarms: raw["keepWarm.maxWarms"],
+	});
+	if (keepWarm) provider.keepWarm = keepWarm;
 
 	const includeAppendSystemPromptMd = boolFrom(raw, "includeAppendSystemPromptMd");
 	if (includeAppendSystemPromptMd !== undefined) promptContext.includeAppendSystemPromptMd = includeAppendSystemPromptMd;
@@ -434,11 +480,18 @@ function legacyLayers(cwd: string): LegacyLayer[] {
 	return [...layers, { path: projectPath, config: legacyFileConfig(projectPath) }];
 }
 
+/** Later provider settings win key by key; `keepWarm` merges field by field, so one layer can change a single knob. */
+function mergeProvider(base: Config["provider"] | undefined, next: Config["provider"] | undefined): Config["provider"] {
+	const merged = { ...base, ...next };
+	if (base?.keepWarm && next?.keepWarm) merged.keepWarm = { ...normalizeKeepWarm(base.keepWarm), ...normalizeKeepWarm(next.keepWarm) };
+	return merged;
+}
+
 function mergeLayers(layers: LegacyLayer[]): Partial<Config> {
 	const merged: Partial<Config> = { provider: {}, promptContext: {} };
 	for (const layer of layers) {
 		if (layer.config.enabled !== undefined) merged.enabled = layer.config.enabled;
-		merged.provider = { ...merged.provider, ...layer.config.provider };
+		merged.provider = mergeProvider(merged.provider, layer.config.provider);
 		merged.promptContext = { ...merged.promptContext, ...layer.config.promptContext };
 	}
 	return merged;
@@ -447,7 +500,7 @@ function mergeLayers(layers: LegacyLayer[]): Partial<Config> {
 export function loadConfig(cwd: string): Config {
 	const legacy = mergeLayers(legacyLayers(cwd));
 	const manager: Partial<Config> = isolatedFromEnv() ? {} : managerToConfig(readManagerConfig(cwd));
-	const provider = normalizeProviderConfig({ ...legacy.provider, ...manager.provider });
+	const provider = normalizeProviderConfig(mergeProvider(legacy.provider, manager.provider));
 	return {
 		enabled: manager.enabled ?? legacy.enabled ?? true,
 		provider,
@@ -475,8 +528,11 @@ const PROMPT_CONTEXT_KEYS = new Set([
 	"includeTaskPanelHook",
 ]);
 
+const KEEP_WARM_KEYS = new Set(["keepWarm.enabled", "keepWarm.afterMinutes", "keepWarm.minContextTokens", "keepWarm.maxWarms"]);
+
 function configValueForKey(config: Partial<Config>, key: string): unknown {
 	if (key === "enabled") return config.enabled;
+	if (KEEP_WARM_KEYS.has(key)) return normalizeProviderConfig(config.provider)?.keepWarm?.[key.slice("keepWarm.".length) as keyof KeepWarmConfig];
 	if (PROVIDER_KEYS.has(key)) return normalizeProviderConfig(config.provider)?.[key as keyof NonNullable<Config["provider"]>];
 	if (PROMPT_CONTEXT_KEYS.has(key)) return config.promptContext?.[key as keyof NonNullable<Config["promptContext"]>];
 	return undefined;

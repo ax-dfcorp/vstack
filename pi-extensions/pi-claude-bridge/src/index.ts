@@ -37,6 +37,7 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { driveSummaryQuery, isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
+import { KEEP_WARM_PROMPT, KeepWarmScheduler, keepWarmSettings, type WarmUsage } from "./keep-warm.js";
 import { buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
@@ -63,7 +64,7 @@ export {
 export { connectorCachePath, connectorCacheScopeKey, readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "./claude-executable.js";
-import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, lastTopLevelRequest, setLastTopLevelRequest, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
+import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, lastTopLevelRequest, setLastTopLevelRequest, setPiUI, setSharedSession, sharedSession, type TopLevelRequest } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, confirmAppendUpdate, piContextLength, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
@@ -742,9 +743,9 @@ async function consumeQuery(
 	 *  the CLI keeps stdin alive past the turn, so nothing else terminates the
 	 *  for-await below. Continuation queries pass nothing and end by themselves. */
 	inputChannel?: QueryInputChannel | null,
-	/** This query is the top-level conversation (not a nested subagent query):
-	 *  its model requests are recorded as `lastTopLevelRequest`. */
-	topLevel = false,
+	/** Set when this query is the top-level conversation (not a nested subagent
+	 *  query): its model requests are recorded as `lastTopLevelRequest`. */
+	topLevel?: { routerSessionId: string | undefined },
 ): Promise<ConsumeQueryResult> {
 	let capturedSessionId: string | undefined;
 	let failure: ClaudeAttemptFailure | undefined;
@@ -771,12 +772,15 @@ async function consumeQuery(
 		if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
 		if (topLevel && message.type === "stream_event" && (message as any).event?.type === "message_start") {
 			const usage = (message as any).event.message?.usage ?? {};
-			setLastTopLevelRequest({
+			const request: TopLevelRequest = {
 				at: Date.now(),
 				model: model.id,
 				contextTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
 				...(account ? { accountProfileId: account.profileId, claudeConfigDir: account.configDir } : {}),
-			});
+				...(topLevel.routerSessionId ? { routerSessionId: topLevel.routerSessionId } : {}),
+			};
+			setLastTopLevelRequest(request);
+			keepWarm.noteRequest(request);
 		}
 		if (account) {
 			debug("consumeQuery: managed message", JSON.stringify({
@@ -1117,6 +1121,87 @@ function streamOneShotSummaryRequest(model: Model<any>, context: Context, option
 	const stream = newAssistantMessageEventStream();
 	withFallback(stream, cached, () => streamIsolatedSummaryRequest(model, context, options, cwd), options?.signal, "cached summary");
 	return stream;
+}
+
+/** One idle cache warm-up per stretch for the top-level conversation (keep-warm.ts). */
+const keepWarm = new KeepWarmScheduler({
+	settings: () => keepWarmSettings(loadConfig(sharedSession?.cwd ?? process.cwd()).provider?.keepWarm),
+	state: () => {
+		const request = lastTopLevelRequest;
+		const session = sharedSession;
+		const router = resolveClaudeAccountRouter();
+		return {
+			lastRequest: request,
+			liveQuery: stackDepth() !== 0 || ctx().activeQuery !== null,
+			session,
+			base: sideQuestionBase(),
+			accountRoutable: router && request
+				? router.current(request.model, request.routerSessionId)?.profileId === (session?.accountProfileId ?? null)
+				: undefined,
+		};
+	},
+	warm: (signal) => new Promise<WarmUsage>((resolve, reject) => {
+		const session = sharedSession;
+		const base = sideQuestionBase();
+		const request = lastTopLevelRequest;
+		if (!session || !base || !request) { reject(new Error("no shared session")); return; }
+		const model = MODELS.find((candidate) => candidate.id === request.model);
+		if (!model) { reject(new Error(`${request.model} is not a bridge model`)); return; }
+		const router = resolveClaudeAccountRouter();
+		const account: ClaudeAccountRoute | undefined = session.accountProfileId
+			? { profileId: session.accountProfileId, label: session.accountProfileId, ...(session.claudeConfigDir ? { configDir: session.claudeConfigDir } : {}) }
+			: undefined;
+		debug(`keep-warm: warming ${session.sessionId.slice(0, 8)} model=${request.model} lastContext=${request.contextTokens} idle=${Math.round((Date.now() - request.at) / 1000)}s`);
+		const stream = driveSummaryQuery({ ...(model as unknown as Model<any>), api: "claude-bridge", provider: PROVIDER_ID }, { signal } as SimpleStreamOptions, {
+			createStream: newAssistantMessageEventStream,
+			queryFactory: sdkQueryFactory,
+			queryOptions: { ...cachedSummaryOptions(base.buildOptions(), session.sessionId), ...makeCliDebugOptions("keep-warm") },
+			blocks: [{ type: "text", text: KEEP_WARM_PROMPT }],
+			account,
+			router,
+			label: "keep-warm",
+			rejectToolUse: true,
+		});
+		void (async () => {
+			try {
+				for await (const event of stream) {
+					if (event.type === "done") {
+						const { input, output, cacheRead, cacheWrite } = event.message.usage;
+						resolve({ input, output, cacheRead, cacheWrite });
+						return;
+					}
+					if (event.type === "error") {
+						reject(new Error(event.error.errorMessage ?? "keep-warm request failed"));
+						return;
+					}
+				}
+				reject(new Error("keep-warm stream ended without a result"));
+			} catch (error) {
+				reject(error);
+			}
+		})();
+	}),
+	onWarmed: (usage, request) => {
+		const session = sharedSession;
+		if (session?.accountProfileId) resolveClaudeAccountRouter()?.recordCacheWarm?.(session.accountProfileId, request.routerSessionId, request.model);
+		debug(`keep-warm: done cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} in=${usage.input} out=${usage.output}`);
+		diagDump("cache_keep_warm", {
+			model: request.model,
+			sessionId: session?.sessionId,
+			account: session?.accountProfileId ?? null,
+			lastContextTokens: request.contextTokens,
+			idleMs: Date.now() - request.at,
+			...usage,
+		});
+	},
+	onFailed: (error, request) => {
+		debug(`keep-warm: failed: ${error instanceof Error ? error.message : String(error)}`);
+		diagDump("cache_keep_warm_failed", { model: request.model, idleMs: Date.now() - request.at, error: error instanceof Error ? error.message : String(error) });
+	},
+});
+
+export function __testKeepWarm(): KeepWarmScheduler {
+	return keepWarm;
 }
 
 /** The summary written by the conversation's own resumed session while its
@@ -2048,7 +2133,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// profile. After output/tool use, replay is forbidden.
 	// The handlers below use the captured abortCtx, never the live ctx(): a
 	// parent query can finish while a reentrant child context is pushed.
-	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, !isReentrant)
+	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, isReentrant ? undefined : { routerSessionId: options?.sessionId })
 		.then(async ({ capturedSessionId, failure }) => {
 			debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
 			if (abortCtx.compactionRestartRequested) {
@@ -2129,7 +2214,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 					);
 
 					try {
-						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, undefined, !isReentrant);
+						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, undefined, isReentrant ? undefined : { routerSessionId: options?.sessionId });
 						if (abortCtx.compactionRestartRequested) break;
 						if (continuation.failure) {
 							recordAttemptFailure(continuation.failure);
@@ -2481,6 +2566,8 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		setSharedSession(null);
 		clearSideQuestionBase();
+		keepWarm.cancel();
+		setLastTopLevelRequest(null);
 	};
 
 	pi.on("session_start", (event, ctx) => {
@@ -2501,6 +2588,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => {
 		cancelScheduledSessionPersistence();
+		keepWarm.cancel();
 		clearSession("session_shutdown");
 		releaseProviderTokens("session_shutdown");
 	});
