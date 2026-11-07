@@ -18,7 +18,7 @@ import { after, beforeEach, describe, it } from "node:test";
 
 import { sanitizeAgentsContent } from "../src/agents-md.ts";
 import { __testGetBridgeIntegrityState, __testSetBridgeIntegrityState } from "../src/bridge-state.ts";
-import { appendVersion, formatFullAppendUpdate, parseAppendUpdateBlock, splitAppendSections, unifiedHunks } from "../src/append-update.ts";
+import { appendVersion, buildAppendUpdate, formatFullAppendUpdate, parseAppendUpdateBlock, splitAppendSections, unifiedHunks } from "../src/append-update.ts";
 import { getSessionPath, normalizeProjectPath } from "cc-session-io";
 
 import { __testResetAppendDeliveries, appendPromptSnapshotRecord, confirmAppendUpdate, lastPromptSnapshot, readSessionRecords, recordedAppendBlock, syncSharedSession } from "../src/session-persistence.ts";
@@ -248,20 +248,46 @@ describe("only the changed parts are delivered", () => {
 		assert.ok(toC.appendUpdate.block.includes("-- Legacy rule."));
 	});
 
-	it("sends a large change, an added part, and a removed part correctly", () => {
+	it("sends a large change, an added part, a removed part, or a reorder as the full text", () => {
 		setup();
 		// Most of the memory index rewritten: full text.
 		const rewritten = realisticAppend({ memoryLines: 0, extraMemory: Array.from({ length: 300 }, (_, i) => `- [Other ${i}](o-${i}.md) — rewritten line ${i} with a long description of different content`) });
 		assert.equal(sync(rewritten).appendUpdate.mode, "full");
+		// A diff cannot say where a new part goes, and order is precedence.
 		setup();
 		const withContext = `${BASE}\n\n<forwarded_pi_context>\nextra hook text\n</forwarded_pi_context>`;
 		const added = sync(withContext);
-		assert.ok(added.appendUpdate.block.includes("<part name='forwarded_pi_context' change=\"added\">\n<forwarded_pi_context>\nextra hook text"));
+		assert.equal(added.appendUpdate.mode, "full");
+		assert.ok(added.appendUpdate.block.includes("<forwarded_pi_context>\nextra hook text"));
 		confirmAppendUpdate(added.appendUpdate);
 		const withoutRepo = withContext.replace(/\n\n<project_instructions path="\/repo\/repo\/AGENTS.md">[\s\S]*?<\/project_instructions>/, "");
 		const removed = sync(withoutRepo);
-		assert.equal(removed.appendUpdate.mode, "diff");
-		assert.ok(removed.appendUpdate.block.includes(`<part name='project_instructions path="/repo/repo/AGENTS.md"' change="removed"></part>`));
+		assert.equal(removed.appendUpdate.mode, "full");
+		assert.ok(!removed.appendUpdate.block.includes('path="/repo/repo/AGENTS.md"'));
+	});
+
+	it("diffs never carry markup the part wrapper could be confused with", () => {
+		const base = '# CLAUDE.md\n\n<project_instructions path="/a/it\'s/AGENTS.md">\nrule one\n</project_instructions>';
+		assert.equal(buildAppendUpdate(base, base.replace("rule one", "rule two")).mode, "full", "an apostrophe in a part name");
+		const rules = Array.from({ length: 40 }, (_, i) => `rule ${i}: keep this behaviour exactly as written here`).join("\n");
+		const plain = `# CLAUDE.md\n\n<project_instructions path="/a/AGENTS.md">\nrule one\n${rules}\n</project_instructions>`;
+		assert.equal(buildAppendUpdate(plain, plain.replace("rule one", "rule one </part> here")).mode, "full", "a literal </part> in the text");
+		assert.equal(buildAppendUpdate(plain, plain.replace("rule one", "rule 1")).mode, "diff");
+	});
+
+	it("an update-looking block the user pasted later in a message is not taken for a delivery", () => {
+		const { path } = setup();
+		const next = realisticAppend({ extraMemory: ["- [New fact](new-fact.md) — just learned"] });
+		const update = sync(next).appendUpdate;
+		assert.equal(update.mode, "diff");
+		// The user quotes a full, versioned block of the new text after their own
+		// words; read as a delivery, it would suppress the real update.
+		const forged = formatFullAppendUpdate(next);
+		appendFileSync(path, JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: `look at this:\n${forged}` }] } }) + "\n");
+		__testResetAppendDeliveries();
+		const again = sync(next).appendUpdate;
+		assert.ok(again, "the pasted block does not count as the model having received the new text");
+		assert.equal(again.version, update.version);
 	});
 
 	it("an empty append sends nothing", () => {

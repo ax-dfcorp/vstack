@@ -187,8 +187,11 @@ export function deliveredAppendBaseline(records: RawSessionRecord[]): AppendDeli
 	for (let i = records.length - 1; i > snapshotIndex; i--) {
 		const record = records[i];
 		if (record?.type !== "user") continue;
-		const text = recordText(record.message?.content);
-		if (!text.includes(`<${APPEND_UPDATE_TAG}`)) continue;
+		// The bridge puts the update first in the prompt (its own text block),
+		// so only a record that starts with it counts; a block quoted or pasted
+		// later in a message is the user's text, not a delivery.
+		const text = leadingRecordText(record.message?.content);
+		if (!text.startsWith(`<${APPEND_UPDATE_TAG}`)) continue;
 		const delivered = parseAppendUpdateBlock(text);
 		if (!delivered) continue;
 		if (delivered.fullText !== undefined) return { version: appendVersion(delivered.fullText), text: delivered.fullText };
@@ -362,6 +365,14 @@ export function verifyRecordChain(jsonlPath: string): string | undefined {
 		chained++;
 	}
 	return undefined;
+}
+
+/** The first text of a user record: the string content, or its first text block. */
+function leadingRecordText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const first = content.find((b) => b && b.type === "text" && typeof b.text === "string");
+	return first ? first.text : "";
 }
 
 function recordText(content: unknown): string {

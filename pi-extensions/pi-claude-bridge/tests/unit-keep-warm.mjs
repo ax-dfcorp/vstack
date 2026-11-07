@@ -68,7 +68,7 @@ describe("KeepWarmScheduler", () => {
 		const scheduler = new KeepWarmScheduler({
 			settings: () => overrides.settings ?? DEFAULT_KEEP_WARM,
 			state: () => current,
-			warm: async () => { calls.warms++; if (overrides.fail) throw new Error("boom"); return { input: 3, output: 2, cacheRead: 250000, cacheWrite: 40 }; },
+			warm: overrides.warm ?? (async () => { calls.warms++; if (overrides.fail) throw new Error("boom"); return { input: 3, output: 2, cacheRead: 250000, cacheWrite: 40 }; }),
 			onWarmed: (usage, request) => calls.warmed.push({ usage, request }),
 			onFailed: (error) => calls.failed.push(error.message),
 			now: () => now,
@@ -114,6 +114,40 @@ describe("KeepWarmScheduler", () => {
 		blocked.scheduler.noteRequest(REQUEST);
 		await blocked.advance(53 * MIN);
 		assert.equal(blocked.calls.warms, 0);
+	});
+
+	it("a query still running when the timer fires is retried every minute until 58 minutes", async () => {
+		const h = harness();
+		h.scheduler.noteRequest(REQUEST);
+		h.setState({ liveQuery: true });
+		await h.advance(53 * MIN);
+		assert.equal(h.calls.warms, 0);
+		await h.advance(MIN);
+		assert.equal(h.calls.warms, 0, "still running at 54");
+		h.setState({ liveQuery: false });
+		await h.advance(MIN);
+		assert.equal(h.calls.warms, 1, "sent at 55, once the query ended");
+		const late = harness();
+		late.scheduler.noteRequest(REQUEST);
+		late.setState({ liveQuery: true });
+		await late.advance(57 * MIN);
+		late.setState({ liveQuery: false });
+		await late.advance(10 * MIN);
+		assert.equal(late.calls.warms, 0, "no attempt after 58 minutes: the cache could expire before it lands");
+	});
+
+	it("a query starting while a warm-up is in flight aborts the warm-up first", async () => {
+		let signal;
+		let release;
+		const h = harness({ warm: (s) => { signal = s; return new Promise((resolve) => { release = resolve; }); } });
+		h.scheduler.noteRequest(REQUEST);
+		await h.advance(53 * MIN);
+		assert.ok(signal && !signal.aborted, "warm-up in flight");
+		h.scheduler.noteActivity();
+		assert.equal(signal.aborted, true);
+		release({ input: 1, output: 1, cacheRead: 250000, cacheWrite: 0 });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(h.calls.warmed.length, 0, "an aborted warm-up is not counted");
 	});
 
 	it("a second warm-up, when allowed, is measured from the first", async () => {

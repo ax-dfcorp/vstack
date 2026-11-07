@@ -30,6 +30,13 @@ export interface KeepWarmSettings {
 	maxWarms: number;
 }
 
+/** Retry interval after a refusal because a query was running. */
+export const KEEP_WARM_RETRY_MS = 60_000;
+/** No warm-up starts later than this after the last request: the cache (60 minutes) must still be there when it arrives. */
+export const KEEP_WARM_LAST_CHANCE_MS = 58 * 60_000;
+/** A warm-up counts only if it read at least this share of the last request's context from cache. */
+export const KEEP_WARM_MIN_CACHE_READ_SHARE = 0.5;
+
 export const DEFAULT_KEEP_WARM: KeepWarmSettings = { enabled: true, afterMinutes: 53, minContextTokens: 100_000, maxWarms: 1 };
 
 export function keepWarmSettings(config: KeepWarmConfig | undefined): KeepWarmSettings {
@@ -127,6 +134,18 @@ export class KeepWarmScheduler {
 		this.arm();
 	}
 
+	/**
+	 * A query of this conversation is about to start. A warm-up still in flight
+	 * is aborted before the new query resumes the same Claude session (two
+	 * resumed children of one session must not overlap). The timer stays: if
+	 * it fires while the query runs, the refusal retries a minute later, and
+	 * the query's own requests re-arm it from their time.
+	 */
+	noteActivity(): void {
+		this.inFlight?.abort();
+		this.inFlight = undefined;
+	}
+
 	/** Stop everything: session switch, shutdown. */
 	cancel(): void {
 		this.clearTimer();
@@ -137,12 +156,12 @@ export class KeepWarmScheduler {
 		this.lastWarmAt = undefined;
 	}
 
-	private arm(): void {
+	private arm(retryInMs?: number): void {
 		this.clearTimer();
 		const settings = this.deps.settings();
 		if (!settings.enabled || this.stretchAt === undefined || this.warms >= settings.maxWarms) return;
 		const from = this.lastWarmAt ?? this.stretchAt;
-		const delay = Math.max(0, from + settings.afterMinutes * 60_000 - this.now());
+		const delay = retryInMs ?? Math.max(0, from + settings.afterMinutes * 60_000 - this.now());
 		const callback = () => { this.timer = undefined; void this.fire(); };
 		if (this.deps.setTimer) {
 			this.timer = this.deps.setTimer(callback, delay);
@@ -164,6 +183,15 @@ export class KeepWarmScheduler {
 		const ageFrom = this.lastWarmAt !== undefined && lastRequest ? { ...lastRequest, at: this.lastWarmAt } : lastRequest;
 		const refusal = keepWarmRefusal({ ...state, lastRequest: ageFrom, settings, warms: this.warms, now: this.now() });
 		if (refusal || !lastRequest) {
+			// A query that is still running when the timer fires (a long tool
+			// call, a compaction) may finish before the cache expires: try again
+			// a minute later while there is still time to refresh it.
+			const from = ageFrom?.at;
+			if (refusal === "a query is running" && from !== undefined && this.now() + KEEP_WARM_RETRY_MS < from + KEEP_WARM_LAST_CHANCE_MS) {
+				debug(`keep-warm: not sent (${refusal}); retrying in ${KEEP_WARM_RETRY_MS / 1000}s`);
+				this.arm(KEEP_WARM_RETRY_MS);
+				return;
+			}
 			debug(`keep-warm: not sent (${refusal ?? "no request"})`);
 			return;
 		}

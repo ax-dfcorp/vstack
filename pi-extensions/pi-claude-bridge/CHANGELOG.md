@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixes to the cache levers after an independent review and live runs (2026-11-07)
+
+- A cached summary or warm-up that ends without a successful result, or with thinking and no text, now fails and takes the isolated path. Before, a resumed summary that produced only thinking was accepted, and Pi would have compacted to an empty summary.
+- A `<system_prompt_update>` diff now goes out only when the parts keep their names and order. An added, removed, or reordered part, a part name with an apostrophe, or a literal `</part>` sends the full text: a diff names parts but not positions, and instruction order is precedence.
+- A delivered update is recognized only when it opens the user record (the bridge always puts it first). A versioned block quoted or pasted later in a message no longer counts as a delivery, so it cannot suppress a real update.
+- A warm-up counts, and is reported to the router, only if it read at least half of the last request's context from cache. A cold or mismatched prefix is logged as `cache_keep_warm_failed`, so the router never holds a session on an account for a cache that is gone.
+- A query starting while a warm-up is in flight aborts the warm-up first, so two resumed children of one session never overlap.
+- A warm-up refused because a query was running retries every minute until 58 minutes after the last request. Before, it gave up for that idle stretch.
+- With `summaryModelOverrides` set for the session model (Fable to Opus), the cached summary is used only from 200,000 tokens of context. Below that, the substitute's isolated request costs less on the weekly limit.
+
+Measured live with Pi in RPC mode, 2026-11-07:
+
+- Opus 5.5 high: an AGENTS.md line added and then reverted reached the model as diff updates of 905 and 860 characters (cache write 492 and 396 tokens). The model applied both, including the reversal. The warm-up after 60 s idle read 51,610 and 73,186 tokens from cache and wrote 312 and 189, with 4 output tokens.
+- Fable 5.1 medium: diff updates of 1,224 and 860 characters, both applied. The warm-up read 54,546, wrote 131, with 4 output tokens.
+- Compaction: 446 of 512 Pi compactions in the 17 days before were split-turn, and 142 of 165 Claude ones ran mid tool loop. Both kinds keep the isolated path, so the cached summary covers only the minority of between-turn, whole-turn compactions.
+
 ### One idle warm-up keeps a large conversation's prompt cache
 
 A conversation's prompt cache expires 60 minutes after its last request, and the next turn then writes the whole conversation again (1.25 per token on the subscription weekly limit, against 0.025 for a read). Now, 53 minutes after the last real request of the top-level conversation, if that request carried at least 100,000 tokens, no request of it is running, and the account router still routes its model to its account, the bridge sends one tiny request through a resumed, non-persisted copy of the conversation's Claude session with the last turn's exact settings (tools denied, one turn), which reads the conversation from cache and extends its lifetime by an hour. At most one per idle stretch; the timer never keeps the process alive, so a host that unloads idle sessions at 60 minutes is unaffected. The router's new optional `recordCacheWarm` lets pi-local's router treat a warmed session's cache as alive for another hour without counting the warm-up as user activity. Settings: `keepWarm.enabled` (default on), `keepWarm.afterMinutes` (53), `keepWarm.minContextTokens` (100000), `keepWarm.maxWarms` (1); each warm-up's usage is logged as `cache_keep_warm` in the diagnostics log. Pi core's own cache warmer cannot fire for bridge models (they declare no prompt-cache lifetime). Measured 2026-11-07 on Haiku 5.5 with `afterMinutes` 1 and the minimum lowered for the test: the warm-up read 5,437 tokens from cache and wrote 437 on a 5,766-token context, the transcript was unchanged, and the next real turn read 5,437 from cache; with the default minimum the same small session got no warm-up.

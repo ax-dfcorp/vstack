@@ -37,8 +37,8 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { driveSummaryQuery, isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
-import { KEEP_WARM_PROMPT, KeepWarmScheduler, keepWarmSettings, type WarmUsage } from "./keep-warm.js";
-import { buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
+import { KEEP_WARM_MIN_CACHE_READ_SHARE, KEEP_WARM_PROMPT, KeepWarmScheduler, keepWarmSettings, type WarmUsage } from "./keep-warm.js";
+import { CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE, buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
@@ -1167,6 +1167,14 @@ const keepWarm = new KeepWarmScheduler({
 				for await (const event of stream) {
 					if (event.type === "done") {
 						const { input, output, cacheRead, cacheWrite } = event.message.usage;
+						// Only a request that read the conversation from cache refreshed
+						// it; a cold or mismatched prefix (low read) must not count as a
+						// warm-up, or the router would keep the session on its account
+						// for a cache that is gone.
+						if (cacheRead < request.contextTokens * KEEP_WARM_MIN_CACHE_READ_SHARE) {
+							reject(new Error(`warm-up read ${cacheRead} of ${request.contextTokens} context tokens from cache (wrote ${cacheWrite}); not counted`));
+							return;
+						}
 						resolve({ input, output, cacheRead, cacheWrite });
 						return;
 					}
@@ -1229,6 +1237,17 @@ function cachedSummaryRun(model: Model<any>, context: Context, options?: SimpleS
 	});
 	if (refusal || !session || !base || !note.boundary || !promptText) {
 		debug(`provider: compaction summary takes the one-shot path: ${refusal ?? "missing state"}`);
+		return undefined;
+	}
+	// When another model would write the isolated summary (summaryModelOverrides,
+	// e.g. Fable -> Opus), the cached path is only cheaper on a large context:
+	// on the weekly limit it reads the context at 0.025 but writes the summary at
+	// the session model's weight, while the substitute reads it uncached at its
+	// own, lower weight. Below CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE the
+	// substitute's isolated request is the cheaper one.
+	const substitute = resolveSummarySubstitute(model, loadConfig(session.cwd).provider);
+	if (substitute && substitute.model.id !== model.id && (lastTopLevelRequest?.contextTokens ?? 0) < CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE) {
+		debug(`provider: compaction summary takes the one-shot path: context ${lastTopLevelRequest?.contextTokens ?? 0} < ${CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE} with summary substitute ${substitute.model.id}`);
 		return undefined;
 	}
 	const instructions = summaryInstructions(promptText)!;
@@ -1918,6 +1937,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	let streamIdleTimedOut = false;
 	let retryRequested = false;
 	let retryFailure: ClaudeAttemptFailure | undefined;
+	keepWarm.noteActivity();
 	const sdkQuery = sdkQueryFactory({ prompt, options: queryOptions });
 	ctx().beginQuerySettlement();
 	ctx().activeQuery = sdkQuery;

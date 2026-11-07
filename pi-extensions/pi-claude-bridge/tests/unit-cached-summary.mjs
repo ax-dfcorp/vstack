@@ -3,11 +3,15 @@
 // and by the isolated one-shot query otherwise or whenever that attempt fails.
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { __testSetBridgeIntegrityState, __testSetSdkQueryFactory, streamClaudeAgentSdk } from "../src/index.ts";
 import { setLastTopLevelRequest } from "../src/bridge-state.ts";
 import {
 	CACHED_SUMMARY_MAX_IDLE_MS,
+	CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE,
 	buildCachedSummaryPrompt,
 	conversationDigestOf,
 	takeCompactionNote,
@@ -221,6 +225,16 @@ describe("summary routing through the provider", () => {
 		["calls a tool", textMessages("", { toolUse: true })],
 		["stops at the length limit", textMessages("## Goal\npartial", { stop: "max_tokens" })],
 		["fails", [{ type: "result", subtype: "error_during_execution", errors: ["boom"] }]],
+		["returns thinking only", [
+			{ type: "system", subtype: "init", session_id: "s" },
+			{ type: "stream_event", event: { type: "message_start", message: { model: model.id, usage: { input_tokens: 5, cache_read_input_tokens: 200000 } } } },
+			{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } } },
+			{ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "let me think" } } },
+			{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+			{ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 10 } } },
+			{ type: "result", subtype: "success", result: "", usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 200000 } },
+		]],
+		["ends without a result", textMessages("## Goal\nhalf").slice(0, -1)],
 	]) {
 		it(`falls back to the one-shot summary when the resumed attempt ${name}`, async () => {
 			warmState();
@@ -234,6 +248,28 @@ describe("summary routing through the provider", () => {
 			assert.equal(visible[0].message.content[0].text, "## Goal\none-shot summary");
 		});
 	}
+
+	it("leaves a small context to the summary substitute, whose uncached request is cheaper there", async () => {
+		const configDir = mkdtempSync(join(tmpdir(), "cached-summary-cfg-"));
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = configDir;
+		writeFileSync(join(configDir, "claude-bridge.json"), JSON.stringify({ provider: { summaryModelOverrides: { [model.id]: { model: "claude-opus-5-5", effort: "high" } } } }));
+		try {
+			warmState();
+			setLastTopLevelRequest({ at: Date.now() - 60_000, model: model.id, contextTokens: CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE - 1, accountProfileId: "a", claudeConfigDir: "/profiles/a" });
+			let observed = run([textMessages("## Goal\nx")]);
+			await collect(streamClaudeAgentSdk(model, summaryContext(initialPrompt), { cacheRetention: "none", sessionId: "pi-1" }));
+			assert.equal(observed.queries[0].options.resume, undefined, "small context: the substitute's isolated request");
+			warmState();
+			setLastTopLevelRequest({ at: Date.now() - 60_000, model: model.id, contextTokens: CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE, accountProfileId: "a", claudeConfigDir: "/profiles/a" });
+			observed = run([textMessages("## Goal\nx")]);
+			await collect(streamClaudeAgentSdk(model, summaryContext(initialPrompt), { cacheRetention: "none", sessionId: "pi-1" }));
+			assert.equal(observed.queries[0].options.resume, SESSION.sessionId, "large context: the warm cache");
+		} finally {
+			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+			rmSync(configDir, { recursive: true, force: true });
+		}
+	});
 
 	it("takes the one-shot path when the cache is cold or the request is not the noted compaction's", async () => {
 		warmState({ idleMs: CACHED_SUMMARY_MAX_IDLE_MS + 60_000 });

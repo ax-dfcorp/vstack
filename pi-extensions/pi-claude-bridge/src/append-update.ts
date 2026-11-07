@@ -202,6 +202,14 @@ export function buildAppendUpdate(baseline: string | undefined, current: string)
 	const before = splitAppendSections(baseline);
 	const after = splitAppendSections(current);
 	if (!before || !after) return full();
+	// A diff names parts but not their positions, so it can only express edits
+	// inside parts that keep their order: an added, removed, or reordered part
+	// (instruction precedence follows order) is sent as the full text. So is a
+	// part whose name or text would collide with the <part> markup.
+	const beforeKeys = before.map((section) => section.key);
+	const afterKeys = after.map((section) => section.key);
+	if (beforeKeys.length !== afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
+	if (afterKeys.some((key) => key.includes("'"))) return full();
 	const previous = new Map(before.map((section) => [section.key, section]));
 	const parts: string[] = [];
 	for (const section of after) {
@@ -214,6 +222,7 @@ export function buildAppendUpdate(baseline: string | undefined, current: string)
 		}
 		if (old.lines.join("\n") === text) continue;
 		const hunks = unifiedHunks(old.lines, section.lines);
+		if (text.includes("</part>") || (hunks !== undefined && hunks.includes("</part>"))) return full();
 		if (hunks === undefined || hunks.length > text.length * SECTION_DIFF_LIMIT) {
 			parts.push(`<part name='${section.key}' change="replaced">\n${text}\n</part>`);
 		} else {

@@ -202,7 +202,11 @@ export interface SummaryQueryRun {
 	/** For debug lines. */
 	label: string;
 	/** A tool_use block fails the request instead of being ignored (a resumed
-	 *  conversation still declares its tools; a summary must never call one). */
+	 *  conversation still declares its tools; a summary must never call one).
+	 *  Such a run (cached summary, keep-warm) also fails unless the CLI reported
+	 *  a successful result and the reply has text: a resumed run that ends with
+	 *  thinking only or without a result must take the fallback, never hand Pi
+	 *  an empty summary. */
 	rejectToolUse?: boolean;
 }
 
@@ -271,6 +275,7 @@ export function driveSummaryQuery(
 		// SDK content-block index -> index in output.content.
 		const blockIndex = new Map<number, number>();
 		let sawStreamContent = false;
+		let sawSuccessResult = false;
 		let resultUsage: Record<string, number | undefined> | undefined;
 		const streamedUsage: Record<string, number | undefined> = {};
 		let failure: OneShotFailure | undefined;
@@ -363,6 +368,7 @@ export function driveSummaryQuery(
 						if (result.usage) resultUsage = result.usage;
 						if (failure) break;
 						if (result.subtype === "success") {
+							sawSuccessResult = true;
 							if (!sawStreamContent) addCompletedText(String(result.result ?? ""));
 						} else if (result.subtype === "error_max_turns") {
 							// Should not happen with every tool disabled; if the model still
@@ -401,6 +407,11 @@ export function driveSummaryQuery(
 			debug(`${label}: aborted`);
 			fail("Operation aborted", "aborted");
 			return;
+		}
+		if (!failure && run.rejectToolUse) {
+			const text = output.content.reduce((all, block) => all + (block.type === "text" ? block.text : ""), "");
+			if (!sawSuccessResult) failure = { message: `${label}: the query ended without a successful result` };
+			else if (!text.trim()) failure = { message: `${label}: the reply has no text` };
 		}
 		if (failure) {
 			debug(`${label}: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);

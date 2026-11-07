@@ -40,6 +40,14 @@ import { debug } from "./debug.js";
 /** A summary takes the cached path only if the conversation's last request started this recently (the cache lives 60 minutes from it). */
 export const CACHED_SUMMARY_MAX_IDLE_MS = 55 * 60 * 1000;
 const SNIPPET_CHARS = 160;
+/**
+ * With a summary substitute configured for the session model (Fable -> Opus),
+ * the cached path must beat the substitute's isolated request on the weekly
+ * limit: Fable at weight 10 reading N tokens at 0.025 and writing S at 5, vs
+ * Opus at 2.2 reading N uncached and writing S at 5, i.e. 0.25N + 50S <
+ * 2.2N + 11S, N > 20S. With summaries of up to ~10k tokens that is ~200k.
+ */
+export const CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE = 200_000;
 
 export interface CompactionNote {
 	/** sha256 of Pi's own serialization of the messages it summarizes: the
@@ -236,10 +244,13 @@ export function withFallback(
 		try {
 			for await (const event of attempt) {
 				buffered.push(event);
-				if (event.type === "done") ok = event.reason !== "length";
+				if (event.type === "done") {
+					const text = event.message.content.reduce((all, block) => all + (block.type === "text" ? block.text : ""), "");
+					ok = event.reason !== "length" && text.trim().length > 0;
+				}
 				if (event.type === "error") aborted = event.reason === "aborted";
 				if (event.type === "done" || event.type === "error") {
-					if (!ok) debug(`${label}: ${event.type === "error" ? String(event.error.errorMessage ?? "error").slice(0, 200) : "stopped at the length limit"}`);
+					if (!ok) debug(`${label}: ${event.type === "error" ? String(event.error.errorMessage ?? "error").slice(0, 200) : event.reason === "length" ? "stopped at the length limit" : "no summary text"}`);
 				}
 			}
 		} catch (error) {

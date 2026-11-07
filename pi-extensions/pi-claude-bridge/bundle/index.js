@@ -47999,6 +47999,7 @@ function driveSummaryQuery(model, options, run) {
   async function consume() {
     const blockIndex = /* @__PURE__ */ new Map();
     let sawStreamContent = false;
+    let sawSuccessResult = false;
     let resultUsage;
     const streamedUsage = {};
     let failure;
@@ -48086,6 +48087,7 @@ function driveSummaryQuery(model, options, run) {
             if (result.usage) resultUsage = result.usage;
             if (failure) break;
             if (result.subtype === "success") {
+              sawSuccessResult = true;
               if (!sawStreamContent) addCompletedText(String(result.result ?? ""));
             } else if (result.subtype === "error_max_turns") {
               if (run.rejectToolUse) failure ??= { message: `${label}: result error_max_turns` };
@@ -48120,6 +48122,11 @@ function driveSummaryQuery(model, options, run) {
       fail("Operation aborted", "aborted");
       return;
     }
+    if (!failure && run.rejectToolUse) {
+      const text = output.content.reduce((all, block) => all + (block.type === "text" ? block.text : ""), "");
+      if (!sawSuccessResult) failure = { message: `${label}: the query ended without a successful result` };
+      else if (!text.trim()) failure = { message: `${label}: the reply has no text` };
+    }
     if (failure) {
       debug(`${label}: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
       if (account && router && failure.kind && !failure.rateLimited) {
@@ -48141,6 +48148,9 @@ function driveSummaryQuery(model, options, run) {
 }
 
 // src/keep-warm.ts
+var KEEP_WARM_RETRY_MS = 6e4;
+var KEEP_WARM_LAST_CHANCE_MS = 58 * 6e4;
+var KEEP_WARM_MIN_CACHE_READ_SHARE = 0.5;
 var DEFAULT_KEEP_WARM = { enabled: true, afterMinutes: 53, minContextTokens: 1e5, maxWarms: 1 };
 function keepWarmSettings(config2) {
   return { ...DEFAULT_KEEP_WARM, ...config2 };
@@ -48198,6 +48208,17 @@ var KeepWarmScheduler = class {
     this.inFlight = void 0;
     this.arm();
   }
+  /**
+   * A query of this conversation is about to start. A warm-up still in flight
+   * is aborted before the new query resumes the same Claude session (two
+   * resumed children of one session must not overlap). The timer stays: if
+   * it fires while the query runs, the refusal retries a minute later, and
+   * the query's own requests re-arm it from their time.
+   */
+  noteActivity() {
+    this.inFlight?.abort();
+    this.inFlight = void 0;
+  }
   /** Stop everything: session switch, shutdown. */
   cancel() {
     this.clearTimer();
@@ -48207,12 +48228,12 @@ var KeepWarmScheduler = class {
     this.warms = 0;
     this.lastWarmAt = void 0;
   }
-  arm() {
+  arm(retryInMs) {
     this.clearTimer();
     const settings = this.deps.settings();
     if (!settings.enabled || this.stretchAt === void 0 || this.warms >= settings.maxWarms) return;
     const from = this.lastWarmAt ?? this.stretchAt;
-    const delay = Math.max(0, from + settings.afterMinutes * 6e4 - this.now());
+    const delay = retryInMs ?? Math.max(0, from + settings.afterMinutes * 6e4 - this.now());
     const callback = () => {
       this.timer = void 0;
       void this.fire();
@@ -48232,6 +48253,12 @@ var KeepWarmScheduler = class {
     const ageFrom = this.lastWarmAt !== void 0 && lastRequest ? { ...lastRequest, at: this.lastWarmAt } : lastRequest;
     const refusal = keepWarmRefusal({ ...state, lastRequest: ageFrom, settings, warms: this.warms, now: this.now() });
     if (refusal || !lastRequest) {
+      const from = ageFrom?.at;
+      if (refusal === "a query is running" && from !== void 0 && this.now() + KEEP_WARM_RETRY_MS < from + KEEP_WARM_LAST_CHANCE_MS) {
+        debug(`keep-warm: not sent (${refusal}); retrying in ${KEEP_WARM_RETRY_MS / 1e3}s`);
+        this.arm(KEEP_WARM_RETRY_MS);
+        return;
+      }
       debug(`keep-warm: not sent (${refusal ?? "no request"})`);
       return;
     }
@@ -48263,6 +48290,7 @@ import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { createHash } from "crypto";
 var CACHED_SUMMARY_MAX_IDLE_MS = 55 * 60 * 1e3;
 var SNIPPET_CHARS = 160;
+var CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE = 2e5;
 var pendingCompaction = null;
 function noteCompaction(note) {
   pendingCompaction = note;
@@ -48392,10 +48420,13 @@ function withFallback(stream, attempt, fallback, signal, label) {
     try {
       for await (const event of attempt) {
         buffered.push(event);
-        if (event.type === "done") ok = event.reason !== "length";
+        if (event.type === "done") {
+          const text = event.message.content.reduce((all, block) => all + (block.type === "text" ? block.text : ""), "");
+          ok = event.reason !== "length" && text.trim().length > 0;
+        }
         if (event.type === "error") aborted2 = event.reason === "aborted";
         if (event.type === "done" || event.type === "error") {
-          if (!ok) debug(`${label}: ${event.type === "error" ? String(event.error.errorMessage ?? "error").slice(0, 200) : "stopped at the length limit"}`);
+          if (!ok) debug(`${label}: ${event.type === "error" ? String(event.error.errorMessage ?? "error").slice(0, 200) : event.reason === "length" ? "stopped at the length limit" : "no summary text"}`);
         }
       }
     } catch (error51) {
@@ -49268,6 +49299,10 @@ function buildAppendUpdate(baseline, current) {
   const before = splitAppendSections(baseline);
   const after = splitAppendSections(current);
   if (!before || !after) return full();
+  const beforeKeys = before.map((section) => section.key);
+  const afterKeys = after.map((section) => section.key);
+  if (beforeKeys.length !== afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
+  if (afterKeys.some((key) => key.includes("'"))) return full();
   const previous = new Map(before.map((section) => [section.key, section]));
   const parts = [];
   for (const section of after) {
@@ -49282,6 +49317,7 @@ ${text}
     }
     if (old.lines.join("\n") === text) continue;
     const hunks = unifiedHunks(old.lines, section.lines);
+    if (text.includes("</part>") || hunks !== void 0 && hunks.includes("</part>")) return full();
     if (hunks === void 0 || hunks.length > text.length * SECTION_DIFF_LIMIT) {
       parts.push(`<part name='${section.key}' change="replaced">
 ${text}
@@ -49550,8 +49586,8 @@ function deliveredAppendBaseline(records) {
   for (let i = records.length - 1; i > snapshotIndex; i--) {
     const record2 = records[i];
     if (record2?.type !== "user") continue;
-    const text = recordText(record2.message?.content);
-    if (!text.includes(`<${APPEND_UPDATE_TAG}`)) continue;
+    const text = leadingRecordText(record2.message?.content);
+    if (!text.startsWith(`<${APPEND_UPDATE_TAG}`)) continue;
     const delivered = parseAppendUpdateBlock(text);
     if (!delivered) continue;
     if (delivered.fullText !== void 0) return { version: appendVersion(delivered.fullText), text: delivered.fullText };
@@ -49657,6 +49693,12 @@ function verifyRecordChain(jsonlPath) {
     chained++;
   }
   return void 0;
+}
+function leadingRecordText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const first = content.find((b) => b && b.type === "text" && typeof b.text === "string");
+  return first ? first.text : "";
 }
 function recordText(content) {
   if (typeof content === "string") return content;
@@ -51419,6 +51461,10 @@ var keepWarm = new KeepWarmScheduler({
         for await (const event of stream) {
           if (event.type === "done") {
             const { input, output, cacheRead, cacheWrite } = event.message.usage;
+            if (cacheRead < request.contextTokens * KEEP_WARM_MIN_CACHE_READ_SHARE) {
+              reject(new Error(`warm-up read ${cacheRead} of ${request.contextTokens} context tokens from cache (wrote ${cacheWrite}); not counted`));
+              return;
+            }
             resolve5({ input, output, cacheRead, cacheWrite });
             return;
           }
@@ -51476,6 +51522,11 @@ function cachedSummaryRun(model, context, options) {
   });
   if (refusal || !session || !base || !note.boundary || !promptText) {
     debug(`provider: compaction summary takes the one-shot path: ${refusal ?? "missing state"}`);
+    return void 0;
+  }
+  const substitute = resolveSummarySubstitute(model, loadConfig(session.cwd).provider);
+  if (substitute && substitute.model.id !== model.id && (lastTopLevelRequest?.contextTokens ?? 0) < CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE) {
+    debug(`provider: compaction summary takes the one-shot path: context ${lastTopLevelRequest?.contextTokens ?? 0} < ${CACHED_SUMMARY_MIN_CONTEXT_WITH_SUBSTITUTE} with summary substitute ${substitute.model.id}`);
     return void 0;
   }
   const instructions = summaryInstructions(promptText);
@@ -51987,6 +52038,7 @@ function streamWithContext(model, context, options) {
   let streamIdleTimedOut = false;
   let retryRequested = false;
   let retryFailure;
+  keepWarm.noteActivity();
   const sdkQuery = sdkQueryFactory({ prompt, options: queryOptions });
   ctx().beginQuerySettlement();
   ctx().activeQuery = sdkQuery;
