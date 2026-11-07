@@ -48782,12 +48782,244 @@ function readSession(jsonlPath, projectPath) {
 }
 
 // src/session-persistence.ts
-import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
-import { appendFileSync as appendFileSync4, readFileSync as readFileSync9, realpathSync as realpathSync5, statSync as statSync5 } from "fs";
+import { createHash as createHash3, randomUUID as randomUUID3 } from "crypto";
+import { appendFileSync as appendFileSync4, readFileSync as readFileSync10, realpathSync as realpathSync5, statSync as statSync6 } from "fs";
 import { resolve as pathResolve } from "path";
 
+// src/append-update.ts
+import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
+import { mkdirSync as mkdirSync5, readdirSync as readdirSync2, readFileSync as readFileSync9, renameSync as renameSync2, statSync as statSync4, unlinkSync as unlinkSync2, utimesSync, writeFileSync as writeFileSync3 } from "fs";
+import { join as join10 } from "path";
+var APPEND_UPDATE_TAG = "system_prompt_update";
+var VERSION_HEX = 16;
+var SECTION_DIFF_LIMIT = 0.4;
+var UPDATE_DIFF_LIMIT = 0.5;
+var MAX_DIFF_CELLS = 4e6;
+var STORE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1e3;
+function appendVersion(text) {
+  return createHash2("sha256").update(text).digest("hex").slice(0, VERSION_HEX);
+}
+var FULL_HEADER = "The project instructions, project memory index, and skills appended to the system prompt have changed on disk. The current full text follows. It replaces the copy in the system prompt and every earlier system_prompt_update.";
+var DIFF_HEADER = "Parts of the project instructions, project memory index, or skills appended to the system prompt have changed on disk. Below are only the changes, relative to the text as you last received it: the system prompt with every earlier system_prompt_update applied. Apply them to that text. Every part not listed below is unchanged. A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text; a `removed` part no longer exists.";
+function formatFullAppendUpdate(text) {
+  return [`<${APPEND_UPDATE_TAG} version="${appendVersion(text)}">`, FULL_HEADER, "", text, `</${APPEND_UPDATE_TAG}>`].join("\n");
+}
+var PROJECT_INSTRUCTIONS_OPEN = /^<project_instructions path="([^"]*)">$/;
+var SKILLS_START = "The following skills provide specialized instructions";
+function splitAppendSections(text) {
+  const lines = text.split("\n");
+  const sections = [];
+  const startsSection = (line) => PROJECT_INSTRUCTIONS_OPEN.test(line) || line === "# Project memory" || line.startsWith(SKILLS_START) || line.startsWith("<forwarded_pi_context");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let key;
+    let end = -1;
+    const open = PROJECT_INSTRUCTIONS_OPEN.exec(line);
+    if (open) {
+      key = `project_instructions path="${open[1]}"`;
+      end = lines.indexOf("</project_instructions>", i + 1);
+    } else if (line === "# Project memory") {
+      key = "project_memory";
+      end = i;
+      while (end + 1 < lines.length && !startsSection(lines[end + 1])) end++;
+    } else if (line.startsWith(SKILLS_START)) {
+      key = "skills";
+      end = lines.findIndex((candidate, index) => index > i && candidate.trimEnd().endsWith("</available_skills>"));
+    } else if (line.startsWith("<forwarded_pi_context")) {
+      key = "forwarded_pi_context";
+      end = lines.indexOf("</forwarded_pi_context>", i + 1);
+    }
+    if (key === void 0) {
+      if (sections.length === 0) sections.push({ key: "preamble", lines: [] });
+      sections[sections.length - 1].lines.push(line);
+      i++;
+      continue;
+    }
+    if (end < 0) return void 0;
+    if (sections.some((section) => section.key === key)) return void 0;
+    sections.push({ key, lines: lines.slice(i, end + 1) });
+    i = end + 1;
+  }
+  if (sections.map((section) => section.lines.join("\n")).join("\n") !== text) return void 0;
+  return sections;
+}
+function diffLines(oldLines, newLines) {
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < oldLines.length - prefix && suffix < newLines.length - prefix && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]) suffix++;
+  const a = oldLines.slice(prefix, oldLines.length - suffix);
+  const b = newLines.slice(prefix, newLines.length - suffix);
+  if ((a.length + 1) * (b.length + 1) > MAX_DIFF_CELLS) return void 0;
+  const width = b.length + 1;
+  const table = new Uint32Array((a.length + 1) * width);
+  for (let x6 = a.length - 1; x6 >= 0; x6--) {
+    for (let y6 = b.length - 1; y6 >= 0; y6--) {
+      table[x6 * width + y6] = a[x6] === b[y6] ? table[(x6 + 1) * width + y6 + 1] + 1 : Math.max(table[(x6 + 1) * width + y6], table[x6 * width + y6 + 1]);
+    }
+  }
+  const ops = [];
+  for (let k2 = 0; k2 < prefix; k2++) ops.push({ kind: " ", line: oldLines[k2], oldIndex: k2, newIndex: k2 });
+  let x2 = 0;
+  let y = 0;
+  while (x2 < a.length || y < b.length) {
+    if (x2 < a.length && y < b.length && a[x2] === b[y]) {
+      ops.push({ kind: " ", line: a[x2], oldIndex: prefix + x2, newIndex: prefix + y });
+      x2++;
+      y++;
+    } else if (x2 < a.length && (y === b.length || table[(x2 + 1) * width + y] >= table[x2 * width + y + 1])) {
+      ops.push({ kind: "-", line: a[x2], oldIndex: prefix + x2, newIndex: prefix + y });
+      x2++;
+    } else {
+      ops.push({ kind: "+", line: b[y], oldIndex: prefix + x2, newIndex: prefix + y });
+      y++;
+    }
+  }
+  for (let k2 = 0; k2 < suffix; k2++) {
+    ops.push({ kind: " ", line: oldLines[oldLines.length - suffix + k2], oldIndex: oldLines.length - suffix + k2, newIndex: newLines.length - suffix + k2 });
+  }
+  return ops;
+}
+var HEADING = /^#{1,6} \S/;
+function unifiedHunks(oldLines, newLines, context = 1) {
+  const ops = diffLines(oldLines, newLines);
+  if (!ops) return void 0;
+  const changed = ops.map((op, index) => op.kind === " " ? -1 : index).filter((index) => index >= 0);
+  if (changed.length === 0) return "";
+  const hunks = [];
+  for (const index of changed) {
+    const start = Math.max(0, index - context);
+    const end = Math.min(ops.length - 1, index + context);
+    const last = hunks[hunks.length - 1];
+    if (last && start <= last[1] + 1) last[1] = Math.max(last[1], end);
+    else hunks.push([start, end]);
+  }
+  const out = [];
+  for (const [start, end] of hunks) {
+    const slice = ops.slice(start, end + 1);
+    const oldCount = slice.filter((op) => op.kind !== "+").length;
+    const newCount = slice.filter((op) => op.kind !== "-").length;
+    const oldStart = slice[0].oldIndex + (oldCount > 0 ? 1 : 0);
+    const newStart = slice[0].newIndex + (newCount > 0 ? 1 : 0);
+    let heading = "";
+    for (let k2 = slice[0].oldIndex - 1; k2 >= 0; k2--) {
+      if (HEADING.test(oldLines[k2])) {
+        heading = ` ${oldLines[k2]}`;
+        break;
+      }
+    }
+    out.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${heading}`);
+    for (const op of slice) out.push(`${op.kind}${op.line}`);
+  }
+  return out.join("\n");
+}
+function buildAppendUpdate(baseline, current) {
+  const full = () => ({ block: formatFullAppendUpdate(current), mode: "full" });
+  if (baseline === void 0) return full();
+  const before = splitAppendSections(baseline);
+  const after = splitAppendSections(current);
+  if (!before || !after) return full();
+  const previous = new Map(before.map((section) => [section.key, section]));
+  const parts = [];
+  for (const section of after) {
+    const old = previous.get(section.key);
+    previous.delete(section.key);
+    const text = section.lines.join("\n");
+    if (!old) {
+      parts.push(`<part name='${section.key}' change="added">
+${text}
+</part>`);
+      continue;
+    }
+    if (old.lines.join("\n") === text) continue;
+    const hunks = unifiedHunks(old.lines, section.lines);
+    if (hunks === void 0 || hunks.length > text.length * SECTION_DIFF_LIMIT) {
+      parts.push(`<part name='${section.key}' change="replaced">
+${text}
+</part>`);
+    } else {
+      parts.push(`<part name='${section.key}' change="modified">
+${hunks}
+</part>`);
+    }
+  }
+  for (const key of previous.keys()) parts.push(`<part name='${key}' change="removed"></part>`);
+  if (parts.length === 0) return full();
+  const body = parts.join("\n\n");
+  if (body.length > current.length * UPDATE_DIFF_LIMIT) return full();
+  return {
+    block: [`<${APPEND_UPDATE_TAG} version="${appendVersion(current)}">`, DIFF_HEADER, "", body, `</${APPEND_UPDATE_TAG}>`].join("\n"),
+    mode: "diff"
+  };
+}
+function parseAppendUpdateBlock(text) {
+  const open = text.lastIndexOf(`<${APPEND_UPDATE_TAG}`);
+  if (open < 0) return void 0;
+  const headerEnd = text.indexOf(">", open);
+  const close = text.indexOf(`
+</${APPEND_UPDATE_TAG}>`, headerEnd);
+  if (headerEnd < 0 || close < 0) return void 0;
+  const version2 = /version="([0-9a-f]+)"/.exec(text.slice(open, headerEnd))?.[1];
+  const body = text.slice(headerEnd + 2, close);
+  const split2 = body.indexOf("\n\n");
+  if (split2 < 0) return { ...version2 ? { version: version2 } : {} };
+  const header = body.slice(0, split2);
+  if (header === FULL_HEADER || !version2 && /current full text follows/.test(header)) {
+    const fullText = body.slice(split2 + 2);
+    if (version2 && appendVersion(fullText) !== version2) return { version: version2 };
+    return { ...version2 ? { version: version2 } : {}, fullText };
+  }
+  return { ...version2 ? { version: version2 } : {} };
+}
+function appendBaselineDir() {
+  return join10(piUserDir(), "claude-bridge-append-versions");
+}
+function storeAppendVersion(text, dir = appendBaselineDir()) {
+  const version2 = appendVersion(text);
+  const path = join10(dir, `${version2}.txt`);
+  try {
+    mkdirSync5(dir, { recursive: true });
+    try {
+      statSync4(path);
+      const now = /* @__PURE__ */ new Date();
+      utimesSync(path, now, now);
+      return;
+    } catch {
+    }
+    const temporary = `${path}.${process.pid}.${randomUUID2()}.tmp`;
+    writeFileSync3(temporary, text, "utf8");
+    renameSync2(temporary, path);
+    const cutoff = Date.now() - STORE_MAX_AGE_MS;
+    for (const name of readdirSync2(dir)) {
+      const entry = join10(dir, name);
+      try {
+        if (statSync4(entry).mtimeMs < cutoff) unlinkSync2(entry);
+      } catch {
+      }
+    }
+  } catch (error51) {
+    debug("storeAppendVersion failed:", error51);
+  }
+}
+function loadAppendVersion(version2, dir = appendBaselineDir()) {
+  const path = join10(dir, `${version2}.txt`);
+  try {
+    const text = readFileSync9(path, "utf8");
+    if (appendVersion(text) !== version2) return void 0;
+    const now = /* @__PURE__ */ new Date();
+    try {
+      utimesSync(path, now, now);
+    } catch {
+    }
+    return text;
+  } catch {
+    return void 0;
+  }
+}
+
 // src/session-verify.ts
-import { closeSync as closeSync2, openSync as openSync2, readSync as readSync2, statSync as statSync4 } from "fs";
+import { closeSync as closeSync2, openSync as openSync2, readSync as readSync2, statSync as statSync5 } from "fs";
 import { StringDecoder } from "node:string_decoder";
 function forEachJsonlLine(path, onLine) {
   const fd2 = openSync2(path, "r");
@@ -48831,7 +49063,7 @@ function verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount)
   const warnings = [];
   let st2;
   try {
-    st2 = statSync4(jsonlPath);
+    st2 = statSync5(jsonlPath);
   } catch (e10) {
     warnings.push(`file missing after save \u2014 path=${jsonlPath} err=${e10.message}`);
     return warnings;
@@ -48873,7 +49105,7 @@ function fingerprintMessages(messages) {
     }
     return message;
   });
-  return createHash2("sha256").update(JSON.stringify(normalized)).digest("hex");
+  return createHash3("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 function readBuiltSessionContext(sessionManager) {
   const built = typeof sessionManager?.buildSessionContext === "function" ? sessionManager.buildSessionContext() : void 0;
@@ -48895,7 +49127,7 @@ var PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
 function readSessionRecords(jsonlPath) {
   let text;
   try {
-    text = readFileSync9(jsonlPath, "utf8");
+    text = readFileSync10(jsonlPath, "utf8");
   } catch {
     return void 0;
   }
@@ -48951,24 +49183,54 @@ function sessionHasNativeInstructions(jsonlPath, records) {
   nativeInstructionsBySession.set(jsonlPath, present);
   return present;
 }
-function appendDigest(text) {
-  return createHash2("sha256").update(text).digest("hex");
-}
-var recordedAppendDigests = /* @__PURE__ */ new Map();
-function pendingAppendUpdate(jsonlPath, appendText, deliveredDigest) {
-  if (!appendText) return void 0;
-  let recorded = recordedAppendDigests.get(jsonlPath);
-  if (recorded === void 0) {
-    const records = readSessionRecords(jsonlPath);
-    const block = records ? recordedAppendBlock(lastPromptSnapshot(records)) : void 0;
-    recorded = block === void 0 ? null : appendDigest(block);
-    recordedAppendDigests.set(jsonlPath, recorded);
+var appendDeliveries = /* @__PURE__ */ new Map();
+function deliveredAppendBaseline(records) {
+  let snapshotIndex = -1;
+  for (let i = records.length - 1; i >= 0; i--) {
+    const record2 = records[i];
+    if (record2?.type === "attachment" && record2.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) {
+      snapshotIndex = i;
+      break;
+    }
   }
-  if (recorded === null) return void 0;
-  const digest = appendDigest(appendText);
-  if (digest === recorded || digest === deliveredDigest) return void 0;
-  debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the recorded prompt; delivering the update in the prompt instead of rewriting the snapshot`);
-  return { text: appendText, digest };
+  if (snapshotIndex < 0) return null;
+  const block = recordedAppendBlock(records[snapshotIndex].attachment);
+  if (block === void 0) return null;
+  for (let i = records.length - 1; i > snapshotIndex; i--) {
+    const record2 = records[i];
+    if (record2?.type !== "user") continue;
+    const text = recordText(record2.message?.content);
+    if (!text.includes(`<${APPEND_UPDATE_TAG}`)) continue;
+    const delivered = parseAppendUpdateBlock(text);
+    if (!delivered) continue;
+    if (delivered.fullText !== void 0) return { version: appendVersion(delivered.fullText), text: delivered.fullText };
+    if (delivered.version) return { version: delivered.version, text: loadAppendVersion(delivered.version) };
+    return { version: void 0, text: void 0 };
+  }
+  return { version: appendVersion(block), text: block };
+}
+function pendingAppendUpdate(jsonlPath, appendText) {
+  if (!appendText) return void 0;
+  let state = appendDeliveries.get(jsonlPath);
+  if (!state || state.pending) {
+    const records = readSessionRecords(jsonlPath);
+    state = { baseline: records ? deliveredAppendBaseline(records) : null };
+    appendDeliveries.set(jsonlPath, state);
+  }
+  if (!state.baseline) return void 0;
+  const version2 = appendVersion(appendText);
+  if (state.baseline.version === version2) return void 0;
+  const { block, mode } = buildAppendUpdate(state.baseline.text, appendText);
+  if (mode === "diff") storeAppendVersion(appendText);
+  state.pending = { version: version2, text: appendText };
+  debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the model last received them; delivering a ${mode} update (${block.length} of ${appendText.length} chars) in the prompt`);
+  return { block, mode, version: version2, jsonlPath };
+}
+function confirmAppendUpdate(update) {
+  const state = appendDeliveries.get(update.jsonlPath);
+  if (!state?.pending || state.pending.version !== update.version) return;
+  state.baseline = { version: state.pending.version, text: state.pending.text };
+  state.pending = void 0;
 }
 function refreshSnapshotAppend(snapshot, appendText) {
   const blocks = snapshot.systemPrompt;
@@ -49001,14 +49263,14 @@ function syncAudit(path, detail, customToolNameToSdk, systemPromptAppend) {
     path,
     ...detail,
     ...tools !== void 0 ? { tools } : {},
-    ...systemPromptAppend ? { appendDigest: createHash2("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {},
+    ...systemPromptAppend ? { appendDigest: createHash3("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {},
     at: (/* @__PURE__ */ new Date()).toISOString()
   };
 }
 function ensurePromptSnapshotAppend(jsonlPath, sessionId, appendText) {
   if (!appendText) return;
   const key = `${jsonlPath}`;
-  const digest = createHash2("sha256").update(appendText).digest("hex");
+  const digest = createHash3("sha256").update(appendText).digest("hex");
   if (ensuredAppend.get(key) === digest) return;
   const records = readSessionRecords(jsonlPath);
   if (!records) return;
@@ -49129,7 +49391,7 @@ function alignNativePrefix(records, messages) {
 }
 function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
   try {
-    const text = readFileSync9(jsonlPath, "utf8");
+    const text = readFileSync10(jsonlPath, "utf8");
     const lines = text.split("\n").filter((line) => line.trim().length > 0);
     let parentUuid = null;
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -49153,7 +49415,7 @@ function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
       isSidechain: false,
       attachment,
       type: "attachment",
-      uuid: randomUUID2(),
+      uuid: randomUUID3(),
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       sessionId
     };
@@ -49168,7 +49430,7 @@ function appendPromptSnapshotRecord(jsonlPath, sessionId, attachment) {
 function claudeSessionExists(sessionId, cwd, claudeConfigDir) {
   try {
     const session = openSession({ sessionId, projectPath: cwd, claudeDir: claudeConfigDir });
-    statSync5(session.jsonlPath);
+    statSync6(session.jsonlPath);
     return true;
   } catch {
     return false;
@@ -49318,7 +49580,7 @@ function debugSessionPaths(label, cwd, jsonlPath, claudeConfigDir) {
   let fileSize = null;
   let fileExists = false;
   try {
-    const st2 = statSync5(jsonlPath);
+    const st2 = statSync6(jsonlPath);
     fileExists = true;
     fileSize = st2.size;
   } catch {
@@ -49341,11 +49603,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     const trailingAssistantOnly = missed.length === 1 && missed[0].role === "assistant";
     if (missed.length === 0 || trailingAssistantOnly) {
       const jsonlPath = getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir);
-      const appendUpdate2 = pendingAppendUpdate(
-        jsonlPath,
-        systemPromptAppend,
-        sharedSession.deliveredAppendDigest
-      );
+      const appendUpdate2 = pendingAppendUpdate(jsonlPath, systemPromptAppend);
       const nativeInstructions2 = sessionHasNativeInstructions(jsonlPath);
       setSharedSession({
         ...sharedSession,
@@ -49428,13 +49686,13 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
   }
   ensuredAppend.delete(session.jsonlPath);
-  recordedAppendDigests.delete(session.jsonlPath);
+  appendDeliveries.delete(session.jsonlPath);
   const nativeInstructions = coveredMessages > 0 && nativeInstructionFiles(carriedRecords).size > 0;
   nativeInstructionsBySession.set(session.jsonlPath, nativeInstructions);
   const carriedPrefix = coveredMessages > 0;
   let appendUpdate;
   if (carriedPrefix) {
-    appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend, sameAccount ? sharedSession?.deliveredAppendDigest : void 0);
+    appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend);
   } else {
     ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
   }
@@ -49444,7 +49702,6 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     cwd,
     ...accountProfileId ? { accountProfileId } : {},
     ...claudeConfigDir ? { claudeConfigDir } : {},
-    ...carriedPrefix && sameAccount && sharedSession?.deliveredAppendDigest ? { deliveredAppendDigest: sharedSession.deliveredAppendDigest } : {},
     lastSync: syncAudit("rebuild", {
       reason: rebuildReason,
       priors: priorMessages.length,
@@ -50276,15 +50533,6 @@ function extractAllToolResults2(context) {
   return results;
 }
 var pinnedToolDescriptions = /* @__PURE__ */ new Map();
-function formatAppendUpdate(text) {
-  return [
-    "<system_prompt_update>",
-    "The project instructions, project memory index, and skills that were appended to the system prompt when this conversation started have changed on disk. The current full text follows and supersedes the earlier copy in the system prompt.",
-    "",
-    text,
-    "</system_prompt_update>"
-  ].join("\n");
-}
 function resetPinnedToolDescriptions() {
   pinnedToolDescriptions.clear();
 }
@@ -51157,8 +51405,8 @@ function streamWithContext(model, context, options) {
   );
   const initialBlocks = promptBlocks ?? [{ type: "text", text: promptText }];
   if (appendUpdate) {
-    initialBlocks.unshift({ type: "text", text: formatAppendUpdate(appendUpdate.text) });
-    debug(`provider: delivering the changed system-prompt append (${appendUpdate.text.length} chars) in the prompt`);
+    initialBlocks.unshift({ type: "text", text: appendUpdate.block });
+    debug(`provider: delivering the changed system-prompt append as a ${appendUpdate.mode} update (${appendUpdate.block.length} chars) in the prompt`);
   }
   const inputChannel = createQueryInputChannel(initialBlocks);
   ctx().inputChannel = inputChannel;
@@ -51469,15 +51717,13 @@ function streamWithContext(model, context, options) {
         cwd,
         ...accountSessionScope(account),
         ...cleanStartAudit ? { lastSync: cleanStartAudit } : {},
-        // Recorded only once the model has actually seen it, so an aborted
-        // or replayed attempt delivers it again next turn.
-        ...appendUpdate ? { deliveredAppendDigest: appendUpdate.digest } : {},
         // A substitution in the query's last rounds: the next prompt must not
         // resume the swapped session. noteModelSubstitution already marked an
         // existing shared session; the first query of a pi session had none.
         ...abortCtx.pendingModelSubstitution ? { needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" } : {}
       });
     }
+    if (appendUpdate) confirmAppendUpdate(appendUpdate);
     if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
     try {
       while (abortCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
@@ -51836,7 +52082,6 @@ export {
   finalizeToolUseTurnFromMcpInvocation,
   flushConnectorCallAudit,
   formatAllowedRateLimitWarning,
-  formatAppendUpdate,
   formatResetTimestamp,
   isChildExecutedTool,
   isConnectorWriteTool,

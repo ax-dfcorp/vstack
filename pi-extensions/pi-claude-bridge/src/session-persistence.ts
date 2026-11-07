@@ -7,6 +7,7 @@ import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, 
 import { convertPiMessages, sanitizeToolId } from "./convert.js";
 import { withoutSystemMessages } from "./transcript-context.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
+import { APPEND_UPDATE_TAG, appendVersion, buildAppendUpdate, loadAppendVersion, parseAppendUpdateBlock, storeAppendVersion } from "./append-update.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import {
 	findUnpairedToolUses,
@@ -149,46 +150,106 @@ export function sessionHasNativeInstructions(jsonlPath: string, records?: RawSes
 	return present;
 }
 
-export function appendDigest(text: string): string {
-	return createHash("sha256").update(text).digest("hex");
+/** What the model of one session file has last received as the append, and an update sent but not yet confirmed. */
+interface AppendDeliveryState {
+	/** null: the transcript has no recognizable recorded append, so no update is ever sent. */
+	baseline: { version: string | undefined; text: string | undefined } | null;
+	pending?: { version: string; text: string };
 }
 
-// Digest of the append block frozen in each session file's recorded snapshot,
-// read once per process per file: the block only changes when this bridge
-// rewrites the file (full rebuild), which invalidates the entry below.
-const recordedAppendDigests = new Map<string, string | null>();
+// Per session file, read once per process: the transcript only changes under
+// this bridge's control (a delivered update the provider confirms, or a
+// rebuild, which drops the entry).
+const appendDeliveries = new Map<string, AppendDeliveryState>();
+
+/**
+ * The append the model of this transcript last received: the block frozen in
+ * the last recorded prompt snapshot, superseded by the last
+ * <system_prompt_update> after it. A full update carries its text; a diff
+ * update names the version whose text the content store keeps. `text`
+ * undefined means the version is known but not its text, so the next update
+ * is a full one.
+ */
+export function deliveredAppendBaseline(records: RawSessionRecord[]): AppendDeliveryState["baseline"] {
+	let snapshotIndex = -1;
+	for (let i = records.length - 1; i >= 0; i--) {
+		const record = records[i];
+		if (record?.type === "attachment" && record.attachment?.type === PROMPT_SNAPSHOT_ATTACHMENT) { snapshotIndex = i; break; }
+	}
+	if (snapshotIndex < 0) return null;
+	const block = recordedAppendBlock(records[snapshotIndex].attachment);
+	if (block === undefined) return null;
+	for (let i = records.length - 1; i > snapshotIndex; i--) {
+		const record = records[i];
+		if (record?.type !== "user") continue;
+		const text = recordText(record.message?.content);
+		if (!text.includes(`<${APPEND_UPDATE_TAG}`)) continue;
+		const delivered = parseAppendUpdateBlock(text);
+		if (!delivered) continue;
+		if (delivered.fullText !== undefined) return { version: appendVersion(delivered.fullText), text: delivered.fullText };
+		if (delivered.version) return { version: delivered.version, text: loadAppendVersion(delivered.version) };
+		return { version: undefined, text: undefined };
+	}
+	return { version: appendVersion(block), text: block };
+}
+
+export interface PendingAppendUpdate {
+	/** The <system_prompt_update> block to prepend to the prompt. */
+	block: string;
+	mode: "diff" | "full";
+	/** Version of the full append the block leaves the model with. */
+	version: string;
+	/** Session file the update is for; the provider confirms delivery against it. */
+	jsonlPath: string;
+}
 
 /**
  * The system-prompt append is frozen in the CLI's recorded snapshot for the
  * lifetime of a Claude session. The snapshot is the FIRST thing in every API
  * request after the tool declarations, so rewriting it (as this bridge did
  * until 2026-09-22 whenever AGENTS.md or a skill changed) invalidated the
- * prompt cache for the entire conversation: every AGENTS.md commit in a
- * repository cost a 100-500k re-write on the next turn of every Claude session
- * in that repository. The CLI itself never rewrites the snapshot; it delivers
- * environment changes as an appended message. This does the same: when the
- * current append differs from the recorded block and has not been delivered
- * yet, it is returned so the caller can prepend it to the user prompt, where it
- * costs only its own tokens.
+ * prompt cache for the entire conversation. The CLI itself never rewrites the
+ * snapshot; it delivers environment changes as an appended message. This does
+ * the same: when the current append differs from what the model last
+ * received, the returned block brings it up to date, as a diff of the changed
+ * parts where that is smaller (append-update.ts).
+ *
+ * The comparison is against what the model last received, never against the
+ * original snapshot alone: after A → B → A the model holds B, so A is sent
+ * back. An update counts as received only once the provider confirms the
+ * query completed (confirmAppendUpdate); an unconfirmed one is re-read from
+ * the transcript, which records whatever the CLI actually sent.
  */
-export function pendingAppendUpdate(
-	jsonlPath: string,
-	appendText: string | undefined,
-	deliveredDigest: string | undefined,
-): { text: string; digest: string } | undefined {
+export function pendingAppendUpdate(jsonlPath: string, appendText: string | undefined): PendingAppendUpdate | undefined {
 	if (!appendText) return undefined;
-	let recorded = recordedAppendDigests.get(jsonlPath);
-	if (recorded === undefined) {
+	let state = appendDeliveries.get(jsonlPath);
+	if (!state || state.pending) {
 		const records = readSessionRecords(jsonlPath);
-		const block = records ? recordedAppendBlock(lastPromptSnapshot(records)) : undefined;
-		recorded = block === undefined ? null : appendDigest(block);
-		recordedAppendDigests.set(jsonlPath, recorded);
+		state = { baseline: records ? deliveredAppendBaseline(records) : null };
+		appendDeliveries.set(jsonlPath, state);
 	}
-	if (recorded === null) return undefined;
-	const digest = appendDigest(appendText);
-	if (digest === recorded || digest === deliveredDigest) return undefined;
-	debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the recorded prompt; delivering the update in the prompt instead of rewriting the snapshot`);
-	return { text: appendText, digest };
+	if (!state.baseline) return undefined;
+	const version = appendVersion(appendText);
+	if (state.baseline.version === version) return undefined;
+	const { block, mode } = buildAppendUpdate(state.baseline.text, appendText);
+	// A diff names only its version; keep the text behind it before it is sent,
+	// so a later process can resolve the version even if this one dies first.
+	if (mode === "diff") storeAppendVersion(appendText);
+	state.pending = { version, text: appendText };
+	debug(`pendingAppendUpdate: AGENTS.md, project memory, or skills changed since the model last received them; delivering a ${mode} update (${block.length} of ${appendText.length} chars) in the prompt`);
+	return { block, mode, version, jsonlPath };
+}
+
+export function __testResetAppendDeliveries(): void {
+	appendDeliveries.clear();
+}
+
+/** The query that carried `update` completed: the model now holds that version. */
+export function confirmAppendUpdate(update: Pick<PendingAppendUpdate, "jsonlPath" | "version">): void {
+	const state = appendDeliveries.get(update.jsonlPath);
+	if (!state?.pending || state.pending.version !== update.version) return;
+	state.baseline = { version: state.pending.version, text: state.pending.text };
+	state.pending = undefined;
 }
 
 /**
@@ -613,8 +674,8 @@ function convertAndImportMessages(
 
 interface SyncResult {
 	sessionId: string | null;
-	/** Current system-prompt append to deliver in this turn's prompt, because it differs from the recorded snapshot (see pendingAppendUpdate). */
-	appendUpdate?: { text: string; digest: string };
+	/** Update to deliver in this turn's prompt, because the append differs from what the model last received (see pendingAppendUpdate). */
+	appendUpdate?: PendingAppendUpdate;
 	/** The resumed transcript already carries AGENTS.md attached by the CLI's own loader (see sessionHasNativeInstructions). */
 	nativeInstructions: boolean;
 }
@@ -729,11 +790,7 @@ export function syncSharedSession(
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 			const jsonlPath = getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir);
-			const appendUpdate = pendingAppendUpdate(
-				jsonlPath,
-				systemPromptAppend,
-				sharedSession.deliveredAppendDigest,
-			);
+			const appendUpdate = pendingAppendUpdate(jsonlPath, systemPromptAppend);
 			const nativeInstructions = sessionHasNativeInstructions(jsonlPath);
 			setSharedSession({
 				...sharedSession,
@@ -843,7 +900,7 @@ export function syncSharedSession(
 		debug(`Case 4: ${carried ? "carried" : "FAILED to carry"} the CLI prompt_snapshot record into rebuilt session ${session.sessionId.slice(0, 8)}`);
 	}
 	ensuredAppend.delete(session.jsonlPath);
-	recordedAppendDigests.delete(session.jsonlPath);
+	appendDeliveries.delete(session.jsonlPath);
 	// Only carried native records can hold the CLI's instruction attachments; a
 	// tail converted from pi history never does.
 	const nativeInstructions = coveredMessages > 0 && nativeInstructionFiles(carriedRecords).size > 0;
@@ -855,7 +912,7 @@ export function syncSharedSession(
 	const carriedPrefix = coveredMessages > 0;
 	let appendUpdate: SyncResult["appendUpdate"];
 	if (carriedPrefix) {
-		appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend, sameAccount ? sharedSession?.deliveredAppendDigest : undefined);
+		appendUpdate = pendingAppendUpdate(session.jsonlPath, systemPromptAppend);
 	} else {
 		ensurePromptSnapshotAppend(session.jsonlPath, session.sessionId, systemPromptAppend);
 	}
@@ -865,7 +922,6 @@ export function syncSharedSession(
 		cwd,
 		...(accountProfileId ? { accountProfileId } : {}),
 		...(claudeConfigDir ? { claudeConfigDir } : {}),
-		...(carriedPrefix && sameAccount && sharedSession?.deliveredAppendDigest ? { deliveredAppendDigest: sharedSession.deliveredAppendDigest } : {}),
 		lastSync: syncAudit("rebuild", {
 			reason: rebuildReason,
 			priors: priorMessages.length,

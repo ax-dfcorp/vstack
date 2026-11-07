@@ -65,7 +65,7 @@ import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWith
 import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
-import { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
+import { cancelScheduledSessionPersistence, confirmAppendUpdate, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
 import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
@@ -378,16 +378,6 @@ function extractAllToolResults(context: Context): McpResult[] {
 // parameter schema is unchanged. A schema change is a real redefinition and
 // takes the miss; a new or removed tool necessarily does too.
 const pinnedToolDescriptions = new Map<string, { schema: string; description: string }>();
-
-export function formatAppendUpdate(text: string): string {
-	return [
-		"<system_prompt_update>",
-		"The project instructions, project memory index, and skills that were appended to the system prompt when this conversation started have changed on disk. The current full text follows and supersedes the earlier copy in the system prompt.",
-		"",
-		text,
-		"</system_prompt_update>",
-	].join("\n");
-}
 
 export function resetPinnedToolDescriptions(): void {
 	pinnedToolDescriptions.clear();
@@ -1672,8 +1662,8 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// in this prompt instead, the same way the CLI delivers environment updates.
 	const initialBlocks: ContentBlockParam[] = promptBlocks ?? [{ type: "text", text: promptText }];
 	if (appendUpdate) {
-		initialBlocks.unshift({ type: "text", text: formatAppendUpdate(appendUpdate.text) });
-		debug(`provider: delivering the changed system-prompt append (${appendUpdate.text.length} chars) in the prompt`);
+		initialBlocks.unshift({ type: "text", text: appendUpdate.block });
+		debug(`provider: delivering the changed system-prompt append as a ${appendUpdate.mode} update (${appendUpdate.block.length} chars) in the prompt`);
 	}
 	// Held open for the whole query so a steer arriving mid-run can be written
 	// straight into it (see the tool-result delivery path). consumeQuery closes
@@ -2032,15 +2022,16 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 					cwd,
 					...accountSessionScope(account),
 					...(cleanStartAudit ? { lastSync: cleanStartAudit } : {}),
-					// Recorded only once the model has actually seen it, so an aborted
-					// or replayed attempt delivers it again next turn.
-					...(appendUpdate ? { deliveredAppendDigest: appendUpdate.digest } : {}),
 					// A substitution in the query's last rounds: the next prompt must not
 					// resume the swapped session. noteModelSubstitution already marked an
 					// existing shared session; the first query of a pi session had none.
 					...(abortCtx.pendingModelSubstitution ? { needsRebuild: true, forceRotate: true, rebuildReason: "model-substitution" } : {}),
 				});
 			}
+			// The model has now received this turn's system-prompt update. Until
+			// here it stays unconfirmed, so an aborted or failed attempt re-reads
+			// the transcript for what the CLI actually sent.
+			if (appendUpdate) confirmAppendUpdate(appendUpdate);
 			if (account && router) router.recordSuccess(account.profileId, options?.sessionId);
 
 			try {
