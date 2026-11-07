@@ -36,7 +36,8 @@ import { jsonSchemaToZodShape, validateAgainstShape } from "./typebox-to-zod.js"
 import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
-import { isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
+import { driveSummaryQuery, isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
+import { buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
 import { listAccountConnectors, resolveClaudeOAuth } from "./connector-inventory.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
@@ -62,10 +63,10 @@ export {
 export { connectorCachePath, connectorCacheScopeKey, readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "./claude-executable.js";
-import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
+import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, lastTopLevelRequest, setLastTopLevelRequest, setPiUI, setSharedSession, sharedSession } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
-import { cancelScheduledSessionPersistence, confirmAppendUpdate, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
+import { cancelScheduledSessionPersistence, confirmAppendUpdate, piContextLength, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
 import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
@@ -741,6 +742,9 @@ async function consumeQuery(
 	 *  the CLI keeps stdin alive past the turn, so nothing else terminates the
 	 *  for-await below. Continuation queries pass nothing and end by themselves. */
 	inputChannel?: QueryInputChannel | null,
+	/** This query is the top-level conversation (not a nested subagent query):
+	 *  its model requests are recorded as `lastTopLevelRequest`. */
+	topLevel = false,
 ): Promise<ConsumeQueryResult> {
 	let capturedSessionId: string | undefined;
 	let failure: ClaudeAttemptFailure | undefined;
@@ -765,6 +769,15 @@ async function consumeQuery(
 		// and let a half-written parallel tool call wait for 47 minutes. Only actual
 		// SDK/message progress refreshes the watchdog.
 		if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
+		if (topLevel && message.type === "stream_event" && (message as any).event?.type === "message_start") {
+			const usage = (message as any).event.message?.usage ?? {};
+			setLastTopLevelRequest({
+				at: Date.now(),
+				model: model.id,
+				contextTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
+				...(account ? { accountProfileId: account.profileId, claudeConfigDir: account.configDir } : {}),
+			});
+		}
 		if (account) {
 			debug("consumeQuery: managed message", JSON.stringify({
 				type: message.type,
@@ -1099,6 +1112,62 @@ function summaryRouterSessionId(sessionId: string | undefined): string {
  *  substitution. */
 function streamOneShotSummaryRequest(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	const cached = cachedSummaryRun(model, context, options);
+	if (!cached) return streamIsolatedSummaryRequest(model, context, options, cwd);
+	const stream = newAssistantMessageEventStream();
+	withFallback(stream, cached, () => streamIsolatedSummaryRequest(model, context, options, cwd), options?.signal, "cached summary");
+	return stream;
+}
+
+/** The summary written by the conversation's own resumed session while its
+ *  prompt cache is warm (cached-summary.ts), or undefined when any condition
+ *  for that fails. */
+function cachedSummaryRun(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream | undefined {
+	const promptText = extractUserPrompt(context.messages);
+	const note = takeCompactionNote(promptText);
+	if (!note) {
+		debug("provider: summary request matches no noted compaction; one-shot path");
+		return undefined;
+	}
+	const base = sideQuestionBase();
+	const session = sharedSession;
+	const refusal = cachedSummaryRefusal({
+		note,
+		promptText,
+		liveQuery: ctx().activeQuery !== null,
+		nested: stackDepth() !== 0,
+		session,
+		base,
+		lastRequest: lastTopLevelRequest,
+		model: model.id,
+		now: Date.now(),
+	});
+	if (refusal || !session || !base || !note.boundary || !promptText) {
+		debug(`provider: compaction summary takes the one-shot path: ${refusal ?? "missing state"}`);
+		return undefined;
+	}
+	const instructions = summaryInstructions(promptText)!;
+	const prompt = buildCachedSummaryPrompt(context.systemPrompt, instructions, note.boundary);
+	const router = resolveClaudeAccountRouter();
+	const account: ClaudeAccountRoute | undefined = session.accountProfileId
+		? { profileId: session.accountProfileId, label: session.accountProfileId, ...(session.claudeConfigDir ? { configDir: session.claudeConfigDir } : {}) }
+		: undefined;
+	debug("provider: compaction summary from the warm session cache",
+		`model=${model.id} session=${session.sessionId.slice(0, 8)} idle=${Math.round((Date.now() - lastTopLevelRequest!.at) / 1000)}s`,
+		`lastContext=${lastTopLevelRequest!.contextTokens} promptChars=${prompt.length} (one-shot prompt ${promptText.length})`);
+	return driveSummaryQuery(model, options, {
+		createStream: newAssistantMessageEventStream,
+		queryFactory: sdkQueryFactory,
+		queryOptions: { ...cachedSummaryOptions(base.buildOptions(), session.sessionId), ...makeCliDebugOptions("cached-summary") },
+		blocks: [{ type: "text", text: prompt }],
+		account,
+		router,
+		label: "cached summary",
+		rejectToolUse: true,
+	});
+}
+
+function streamIsolatedSummaryRequest(model: Model<any>, context: Context, options: SimpleStreamOptions | undefined, cwd: string): AssistantMessageEventStream {
 	const substitute = resolveSummarySubstitute(model, loadConfig(cwd).provider);
 	if (!substitute) return runOneShotSummary(model, context, options, cwd);
 
@@ -1979,7 +2048,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	// profile. After output/tool use, replay is forbidden.
 	// The handlers below use the captured abortCtx, never the live ctx(): a
 	// parent query can finish while a reentrant child context is pushed.
-	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel)
+	consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, !isReentrant)
 		.then(async ({ capturedSessionId, failure }) => {
 			debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
 			if (abortCtx.compactionRestartRequested) {
@@ -2060,7 +2129,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 					);
 
 					try {
-						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+						const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, undefined, !isReentrant);
 						if (abortCtx.compactionRestartRequested) break;
 						if (continuation.failure) {
 							recordAttemptFailure(continuation.failure);
@@ -2440,6 +2509,24 @@ export default function (pi: ExtensionAPI) {
 		if (message?.role === "assistant" && isClaudeProvider(message.provider)) schedulePersistSharedSession(ctx);
 	});
 
+	// Which messages a compaction summarizes is known only here; the summary
+	// request that follows carries just the serialized text. See cached-summary.ts.
+	pi.on("session_before_compact", (event, ctx) => {
+		const contextLength = piContextLength(ctx.sessionManager as unknown);
+		const session = sharedSession;
+		const summarized = event.preparation.messagesToSummarize;
+		noteCompaction({
+			conversationDigest: conversationDigestOf(summarized),
+			reason: event.reason,
+			isSplitTurn: event.preparation.isSplitTurn,
+			boundary: describeBoundaryMessage(summarized[summarized.length - 1]),
+			// Pi appends a turn's final assistant message after the provider
+			// returns, so a cursor one short of Pi's context is still in sync.
+			inSync: Boolean(session && !session.needsRebuild && contextLength !== undefined && session.cursor >= contextLength - 1),
+			at: Date.now(),
+		});
+		debug(`session_before_compact: reason=${event.reason} split=${event.preparation.isSplitTurn} summarize=${summarized.length} contextLength=${contextLength ?? "?"} cursor=${session?.cursor ?? "none"}`);
+	});
 	pi.on("session_compact", () => markHistoryRewrite("session_compact"));
 	pi.on("session_tree", () => markHistoryRewrite("session_tree"));
 

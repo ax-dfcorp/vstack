@@ -84,6 +84,25 @@ export function setSharedSession(next: SessionState | null): void {
 	sharedSession = next;
 }
 
+/** The last model request the top-level conversation sent: when it started
+ *  (the prompt cache's lifetime runs from there), on which model and account,
+ *  and how large its context was. Read by the cache-aware summary and the
+ *  idle cache warm-up. */
+export interface TopLevelRequest {
+	at: number;
+	model: string;
+	/** input + cache read + cache write of the request, in tokens. */
+	contextTokens: number;
+	accountProfileId?: string;
+	claudeConfigDir?: string;
+}
+
+export let lastTopLevelRequest: TopLevelRequest | null = null;
+
+export function setLastTopLevelRequest(next: TopLevelRequest | null): void {
+	lastTopLevelRequest = next;
+}
+
 /** Consecutive in-query restarts after a model substitution (the
  *  model-substitution branch in index.ts) within one pi session. Module state,
  *  not query state: each restart starts a new query, and the cap has to count

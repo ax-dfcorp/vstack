@@ -47,6 +47,11 @@ function readBuiltSessionContext(sessionManager: unknown): { messages: Context["
 	return Array.isArray(built?.messages) ? { messages: withoutSystemMessages(built.messages as Context["messages"]) } : undefined;
 }
 
+/** Number of provider-visible messages in Pi's current context, or undefined when the session manager cannot build it. */
+export function piContextLength(sessionManager: unknown): number | undefined {
+	return readBuiltSessionContext(sessionManager)?.messages.length;
+}
+
 function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeSessionState | undefined {
 	const entries = typeof (sessionManager as any)?.getEntries === "function" ? (sessionManager as any).getEntries() : [];
 	if (!Array.isArray(entries)) return undefined;

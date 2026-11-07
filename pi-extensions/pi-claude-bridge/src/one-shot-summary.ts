@@ -122,52 +122,23 @@ export function streamOneShotSummary(
 	options: SimpleStreamOptions | undefined,
 	deps: OneShotSummaryDeps,
 ): AssistantMessageEventStream {
-	const stream = deps.createStream();
-	const output: AssistantMessage = {
-		role: "assistant", content: [],
-		api: model.api, provider: model.provider, model: model.id,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason: "stop", timestamp: Date.now(),
-	};
-	let ended = false;
-	let started = false;
-	const start = () => {
-		if (started) return;
-		started = true;
-		stream.push({ type: "start", partial: output });
-	};
-	const fail = (message: string, reason: "error" | "aborted" = "error", extra?: Record<string, unknown>) => {
-		if (ended) return;
-		ended = true;
-		output.stopReason = reason;
-		output.errorMessage = message;
-		if (extra) Object.assign(output as AssistantMessage & Record<string, unknown>, extra);
-		stream.push({ type: "error", reason, error: output });
-		stream.end();
-	};
-	const finish = () => {
-		if (ended) return;
-		ended = true;
-		start();
-		stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
-		stream.end();
-	};
-
 	const prepared = deps.prepare();
 	if (prepared.status === "failed") {
 		debug(`provider: one-shot summary not started: ${prepared.message}`);
-		queueMicrotask(() => fail(prepared.message, "error", Number.isFinite(prepared.resetAtMs)
-			? { resetAtMs: prepared.resetAtMs, rateLimitType: prepared.rateLimitType }
-			: undefined));
+		const stream = deps.createStream();
+		const output = emptySummaryOutput(model);
+		output.stopReason = "error";
+		output.errorMessage = prepared.message;
+		if (Number.isFinite(prepared.resetAtMs)) Object.assign(output as AssistantMessage & Record<string, unknown>, { resetAtMs: prepared.resetAtMs, rateLimitType: prepared.rateLimitType });
+		queueMicrotask(() => {
+			stream.push({ type: "error", reason: "error", error: output });
+			stream.end();
+		});
 		return stream;
 	}
 	const { account, router } = prepared;
 
 	const blocks = lastUserPromptBlocks(context);
-	// Input held open until `result`, like ordinary queries; closing it there is
-	// what ends the child. (A string prompt would work for text, but images need
-	// structured content and one code path is simpler to reason about.)
-	const inputChannel = createQueryInputChannel(blocks);
 	const queryOptions: Options = {
 		cwd: deps.cwd,
 		model: model.id,
@@ -201,14 +172,90 @@ export function streamOneShotSummary(
 		`systemChars=${(context.systemPrompt ?? "").length} effort=${prepared.effort ?? "default"} account=${account?.label ?? "legacy"}`,
 		`activeQuery=${deps.activeQuery} resume=none mcpTools=0`);
 
-	const sdkQuery = deps.queryFactory({ prompt: inputChannel.stream, options: queryOptions });
+	return driveSummaryQuery(model, options, {
+		createStream: deps.createStream,
+		queryFactory: deps.queryFactory,
+		queryOptions,
+		blocks,
+		account,
+		router,
+		label: "one-shot summary",
+	});
+}
+
+function emptySummaryOutput(model: Model<any>): AssistantMessage {
+	return {
+		role: "assistant", content: [],
+		api: model.api, provider: model.provider, model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop", timestamp: Date.now(),
+	};
+}
+
+export interface SummaryQueryRun {
+	createStream: () => AssistantMessageEventStream;
+	queryFactory: typeof query;
+	queryOptions: Options;
+	blocks: ContentBlockParam[];
+	account?: ClaudeAccountRoute;
+	router?: ClaudeAccountRouterV1;
+	/** For debug lines. */
+	label: string;
+	/** A tool_use block fails the request instead of being ignored (a resumed
+	 *  conversation still declares its tools; a summary must never call one). */
+	rejectToolUse?: boolean;
+}
+
+/** Runs one summary query and maps its output onto a Pi assistant stream. */
+export function driveSummaryQuery(
+	model: Model<any>,
+	options: SimpleStreamOptions | undefined,
+	run: SummaryQueryRun,
+): AssistantMessageEventStream {
+	const stream = run.createStream();
+	const output = emptySummaryOutput(model);
+	const { account, router, label } = run;
+	let ended = false;
+	let started = false;
+	const start = () => {
+		if (started) return;
+		started = true;
+		stream.push({ type: "start", partial: output });
+	};
+	const fail = (message: string, reason: "error" | "aborted" = "error", extra?: Record<string, unknown>) => {
+		if (ended) return;
+		ended = true;
+		output.stopReason = reason;
+		output.errorMessage = message;
+		if (extra) Object.assign(output as AssistantMessage & Record<string, unknown>, extra);
+		stream.push({ type: "error", reason, error: output });
+		stream.end();
+	};
+	const finish = () => {
+		if (ended) return;
+		ended = true;
+		start();
+		stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
+		stream.end();
+	};
+
+	// Input held open until `result`, like ordinary queries; closing it there is
+	// what ends the child. (A string prompt would work for text, but images need
+	// structured content and one code path is simpler to reason about.)
+	const inputChannel = createQueryInputChannel(run.blocks);
+	const sdkQuery = run.queryFactory({ prompt: inputChannel.stream, options: run.queryOptions });
 	let aborted = false;
-	const onAbort = () => {
-		aborted = true;
+	let stopped = false;
+	const stopQuery = () => {
+		stopped = true;
 		inputChannel.close();
 		// interrupt() asks the CLI to stop; close() kills it. Both, as elsewhere.
 		void sdkQuery.interrupt().catch(() => {});
 		try { sdkQuery.close(); } catch {}
+	};
+	const onAbort = () => {
+		aborted = true;
+		stopQuery();
 	};
 	if (options?.signal?.aborted) onAbort();
 	else options?.signal?.addEventListener("abort", onAbort, { once: true });
@@ -243,7 +290,7 @@ export function streamOneShotSummary(
 
 		try {
 			for await (const message of sdkQuery as AsyncIterable<SDKMessage>) {
-				if (aborted) break;
+				if (aborted || stopped) break;
 				switch (message.type) {
 					case "stream_event": {
 						const event = (message as any).event;
@@ -261,8 +308,12 @@ export function streamOneShotSummary(
 								const index = addBlock({ type: "thinking", thinking: "", thinkingSignature: "" });
 								blockIndex.set(event.index, index);
 								stream.push({ type: "thinking_start", contentIndex: index, partial: output });
+							} else if (type === "tool_use" && run.rejectToolUse) {
+								// Stopped at the block's start, before the CLI could run it.
+								failure ??= { message: `${label}: the model called a tool (${event.content_block?.name ?? "unknown"}) instead of writing the summary` };
+								stopQuery();
 							} else {
-								debug(`one-shot summary: ignoring ${type} content block`);
+								debug(`${label}: ignoring ${type} content block`);
 							}
 						} else if (event?.type === "content_block_delta") {
 							const index = blockIndex.get(event.index);
@@ -316,7 +367,8 @@ export function streamOneShotSummary(
 						} else if (result.subtype === "error_max_turns") {
 							// Should not happen with every tool disabled; if the model still
 							// tried one, the text it produced is the summary.
-							debug("one-shot summary: result error_max_turns; delivering the text received");
+							if (run.rejectToolUse) failure ??= { message: `${label}: result error_max_turns` };
+							else debug(`${label}: result error_max_turns; delivering the text received`);
 						} else {
 							const lines = Array.isArray(result.errors) ? uniqueNonEmptyLines(result.errors) : [];
 							const text = lines.length > 0 ? lines.join("\n") : String(result.result || result.subtype || "Claude Code request failed");
@@ -346,12 +398,12 @@ export function streamOneShotSummary(
 		}
 
 		if (aborted || options?.signal?.aborted) {
-			debug("one-shot summary: aborted");
+			debug(`${label}: aborted`);
 			fail("Operation aborted", "aborted");
 			return;
 		}
 		if (failure) {
-			debug(`one-shot summary: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
+			debug(`${label}: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
 			// Rate limits were recorded from the event itself. Pi retries the
 			// summarization on its own (retryAssistantCall); no rotation here.
 			if (account && router && failure.kind && !failure.rateLimited) {
@@ -368,7 +420,7 @@ export function streamOneShotSummary(
 		output.usage.cacheWrite = usage.cache_creation_input_tokens ?? 0;
 		output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 		calculateCost(model, output.usage);
-		debug(`one-shot summary: done, chars=${output.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)} in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} stop=${output.stopReason}`);
+		debug(`${label}: done, chars=${output.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)} in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} stop=${output.stopReason}`);
 		finish();
 	}
 }

@@ -32270,6 +32270,10 @@ var piUI;
 function setSharedSession(next) {
   sharedSession = next;
 }
+var lastTopLevelRequest = null;
+function setLastTopLevelRequest(next) {
+  lastTopLevelRequest = next;
+}
 var MODEL_SUBSTITUTION_RESTART_CAP = 2;
 var modelSubstitutionStreak = { piSessionId: void 0, restarts: 0, capNotified: false };
 function resetModelSubstitutionStreak() {
@@ -47831,49 +47835,22 @@ function mapStopReason(reason) {
   return reason === "max_tokens" ? "length" : "stop";
 }
 function streamOneShotSummary(model, context, options, deps) {
-  const stream = deps.createStream();
-  const output = {
-    role: "assistant",
-    content: [],
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    stopReason: "stop",
-    timestamp: Date.now()
-  };
-  let ended = false;
-  let started = false;
-  const start = () => {
-    if (started) return;
-    started = true;
-    stream.push({ type: "start", partial: output });
-  };
-  const fail = (message, reason = "error", extra) => {
-    if (ended) return;
-    ended = true;
-    output.stopReason = reason;
-    output.errorMessage = message;
-    if (extra) Object.assign(output, extra);
-    stream.push({ type: "error", reason, error: output });
-    stream.end();
-  };
-  const finish = () => {
-    if (ended) return;
-    ended = true;
-    start();
-    stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
-    stream.end();
-  };
   const prepared = deps.prepare();
   if (prepared.status === "failed") {
     debug(`provider: one-shot summary not started: ${prepared.message}`);
-    queueMicrotask(() => fail(prepared.message, "error", Number.isFinite(prepared.resetAtMs) ? { resetAtMs: prepared.resetAtMs, rateLimitType: prepared.rateLimitType } : void 0));
+    const stream = deps.createStream();
+    const output = emptySummaryOutput(model);
+    output.stopReason = "error";
+    output.errorMessage = prepared.message;
+    if (Number.isFinite(prepared.resetAtMs)) Object.assign(output, { resetAtMs: prepared.resetAtMs, rateLimitType: prepared.rateLimitType });
+    queueMicrotask(() => {
+      stream.push({ type: "error", reason: "error", error: output });
+      stream.end();
+    });
     return stream;
   }
   const { account, router } = prepared;
   const blocks = lastUserPromptBlocks(context);
-  const inputChannel = createQueryInputChannel(blocks);
   const queryOptions = {
     cwd: deps.cwd,
     model: model.id,
@@ -47907,10 +47884,61 @@ function streamOneShotSummary(model, context, options, deps) {
     `systemChars=${(context.systemPrompt ?? "").length} effort=${prepared.effort ?? "default"} account=${account?.label ?? "legacy"}`,
     `activeQuery=${deps.activeQuery} resume=none mcpTools=0`
   );
-  const sdkQuery = deps.queryFactory({ prompt: inputChannel.stream, options: queryOptions });
+  return driveSummaryQuery(model, options, {
+    createStream: deps.createStream,
+    queryFactory: deps.queryFactory,
+    queryOptions,
+    blocks,
+    account,
+    router,
+    label: "one-shot summary"
+  });
+}
+function emptySummaryOutput(model) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now()
+  };
+}
+function driveSummaryQuery(model, options, run) {
+  const stream = run.createStream();
+  const output = emptySummaryOutput(model);
+  const { account, router, label } = run;
+  let ended = false;
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    stream.push({ type: "start", partial: output });
+  };
+  const fail = (message, reason = "error", extra) => {
+    if (ended) return;
+    ended = true;
+    output.stopReason = reason;
+    output.errorMessage = message;
+    if (extra) Object.assign(output, extra);
+    stream.push({ type: "error", reason, error: output });
+    stream.end();
+  };
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    start();
+    stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
+    stream.end();
+  };
+  const inputChannel = createQueryInputChannel(run.blocks);
+  const sdkQuery = run.queryFactory({ prompt: inputChannel.stream, options: run.queryOptions });
   let aborted2 = false;
-  const onAbort = () => {
-    aborted2 = true;
+  let stopped = false;
+  const stopQuery = () => {
+    stopped = true;
     inputChannel.close();
     void sdkQuery.interrupt().catch(() => {
     });
@@ -47918,6 +47946,10 @@ function streamOneShotSummary(model, context, options, deps) {
       sdkQuery.close();
     } catch {
     }
+  };
+  const onAbort = () => {
+    aborted2 = true;
+    stopQuery();
   };
   if (options?.signal?.aborted) onAbort();
   else options?.signal?.addEventListener("abort", onAbort, { once: true });
@@ -47950,7 +47982,7 @@ function streamOneShotSummary(model, context, options, deps) {
     };
     try {
       for await (const message of sdkQuery) {
-        if (aborted2) break;
+        if (aborted2 || stopped) break;
         switch (message.type) {
           case "stream_event": {
             const event = message.event;
@@ -47968,8 +48000,11 @@ function streamOneShotSummary(model, context, options, deps) {
                 const index = addBlock({ type: "thinking", thinking: "", thinkingSignature: "" });
                 blockIndex.set(event.index, index);
                 stream.push({ type: "thinking_start", contentIndex: index, partial: output });
+              } else if (type === "tool_use" && run.rejectToolUse) {
+                failure ??= { message: `${label}: the model called a tool (${event.content_block?.name ?? "unknown"}) instead of writing the summary` };
+                stopQuery();
               } else {
-                debug(`one-shot summary: ignoring ${type} content block`);
+                debug(`${label}: ignoring ${type} content block`);
               }
             } else if (event?.type === "content_block_delta") {
               const index = blockIndex.get(event.index);
@@ -48019,7 +48054,8 @@ function streamOneShotSummary(model, context, options, deps) {
             if (result.subtype === "success") {
               if (!sawStreamContent) addCompletedText(String(result.result ?? ""));
             } else if (result.subtype === "error_max_turns") {
-              debug("one-shot summary: result error_max_turns; delivering the text received");
+              if (run.rejectToolUse) failure ??= { message: `${label}: result error_max_turns` };
+              else debug(`${label}: result error_max_turns; delivering the text received`);
             } else {
               const lines = Array.isArray(result.errors) ? uniqueNonEmptyLines(result.errors) : [];
               const text = lines.length > 0 ? lines.join("\n") : String(result.result || result.subtype || "Claude Code request failed");
@@ -48046,12 +48082,12 @@ function streamOneShotSummary(model, context, options, deps) {
       }
     }
     if (aborted2 || options?.signal?.aborted) {
-      debug("one-shot summary: aborted");
+      debug(`${label}: aborted`);
       fail("Operation aborted", "aborted");
       return;
     }
     if (failure) {
-      debug(`one-shot summary: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
+      debug(`${label}: failed (${failure.kind ?? "unclassified"}): ${failure.message.slice(0, 200)}`);
       if (account && router && failure.kind && !failure.rateLimited) {
         router.recordFailure(account.profileId, failure.kind, model.id);
       }
@@ -48065,9 +48101,169 @@ function streamOneShotSummary(model, context, options, deps) {
     output.usage.cacheWrite = usage.cache_creation_input_tokens ?? 0;
     output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
     calculateCost(model, output.usage);
-    debug(`one-shot summary: done, chars=${output.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)} in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} stop=${output.stopReason}`);
+    debug(`${label}: done, chars=${output.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)} in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} stop=${output.stopReason}`);
     finish();
   }
+}
+
+// src/cached-summary.ts
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
+import { createHash } from "crypto";
+var CACHED_SUMMARY_MAX_IDLE_MS = 55 * 60 * 1e3;
+var SNIPPET_CHARS = 160;
+var pendingCompaction = null;
+function noteCompaction(note) {
+  pendingCompaction = note;
+}
+function takeCompactionNote(promptText) {
+  const note = pendingCompaction;
+  pendingCompaction = null;
+  if (!note?.conversationDigest || !promptText) return null;
+  const conversation = serializedConversation(promptText);
+  if (conversation === void 0 || digest(conversation) !== note.conversationDigest) return null;
+  return note;
+}
+function digest(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+function conversationDigestOf(messages) {
+  const api = piCodingAgent;
+  if (typeof api.convertToLlm !== "function" || typeof api.serializeConversation !== "function") return void 0;
+  try {
+    return digest(api.serializeConversation(api.convertToLlm(messages)));
+  } catch (error51) {
+    debug("conversationDigestOf failed:", error51);
+    return void 0;
+  }
+}
+var CONVERSATION_ENDS = ["\n</conversation>\n\n<previous-summary>\n", "\n</conversation>\n\nThe messages above are a conversation to summarize."];
+function conversationEnd(promptText) {
+  if (!promptText.startsWith("<conversation>\n")) return -1;
+  let end = -1;
+  for (const marker of CONVERSATION_ENDS) end = Math.max(end, promptText.lastIndexOf(marker));
+  return end;
+}
+function serializedConversation(promptText) {
+  const end = conversationEnd(promptText);
+  return end < 0 ? void 0 : promptText.slice("<conversation>\n".length, end);
+}
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join(" ");
+}
+function snippet(text) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (!flat) return void 0;
+  return flat.length > SNIPPET_CHARS ? `${flat.slice(0, SNIPPET_CHARS)}\u2026` : flat;
+}
+function describeBoundaryMessage(message) {
+  const msg = message;
+  if (!msg) return void 0;
+  if (msg.role === "assistant") {
+    const text2 = snippet(textOf(msg.content));
+    if (text2) return `your reply that begins "${text2}"`;
+    const calls = Array.isArray(msg.content) ? msg.content.filter((block) => block?.type === "toolCall").map((block) => `\`${block.name}\``) : [];
+    return calls.length > 0 ? `your call to ${calls.join(", ")}` : void 0;
+  }
+  if (msg.role === "toolResult") {
+    const text2 = snippet(textOf(msg.content));
+    return msg.toolName ? `the result of your \`${msg.toolName}\` call${text2 ? ` that begins "${text2}"` : ""}` : void 0;
+  }
+  const text = snippet(textOf(msg.content) || (typeof msg.summary === "string" ? msg.summary : ""));
+  return text ? `the user message that begins "${text}"` : void 0;
+}
+function summaryInstructions(promptText) {
+  const end = conversationEnd(promptText);
+  if (end < 0) return void 0;
+  const rest = promptText.slice(end + "\n</conversation>\n\n".length);
+  if (!rest.includes("## Critical Context") || !/The messages above are (a conversation to summarize|NEW conversation messages)/.test(rest)) return void 0;
+  return rest;
+}
+function buildCachedSummaryPrompt(systemPrompt, instructions, boundary) {
+  return [
+    "<summary_request>",
+    "This request is not a turn of the conversation. Answer only this request, and do not call any tools.",
+    "",
+    ...systemPrompt?.trim() ? ["Instructions for this request:", systemPrompt.trim(), ""] : [],
+    `Scope: "the messages above" means this conversation before this request, from its start through ${boundary}. Everything after that message stays in the context verbatim after your summary, so leave it out of the summary.`,
+    "",
+    instructions,
+    "</summary_request>"
+  ].join("\n");
+}
+function cachedSummaryRefusal(c) {
+  if (!c.note) return "no compaction noted for this request";
+  if (c.note.isSplitTurn) return "split-turn compaction";
+  if (c.note.reason === "overflow") return "overflow compaction";
+  if (!c.note.boundary) return "boundary message cannot be named";
+  if (!c.note.inSync) return "shared session behind Pi history";
+  if (!c.promptText || !summaryInstructions(c.promptText)) return "not an ordinary compaction summary prompt";
+  if (c.nested) return "nested query context";
+  if (c.liveQuery) return "a query of the conversation is live";
+  if (!c.session || c.session.needsRebuild) return "no reusable shared session";
+  if (!c.base) return "no recorded turn options";
+  if (c.base.model !== c.model) return `last turn ran ${c.base.model}`;
+  if (c.base.cwd !== c.session.cwd || (c.base.claudeConfigDir ?? void 0) !== (c.session.claudeConfigDir ?? void 0)) return "the shared session moved since the last turn";
+  if (!c.lastRequest) return "no request recorded";
+  if (c.lastRequest.model !== c.model || (c.lastRequest.accountProfileId ?? void 0) !== (c.session.accountProfileId ?? void 0)) return "last request on another model or account";
+  const idle = c.now - c.lastRequest.at;
+  if (idle > CACHED_SUMMARY_MAX_IDLE_MS) return `cache cold (${Math.round(idle / 6e4)} min idle)`;
+  return void 0;
+}
+function denyAllToolsHook() {
+  return {
+    hooks: [async () => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "Writing a summary: tools are not available."
+      }
+    })]
+  };
+}
+function cachedSummaryOptions(baseOptions, sessionId) {
+  const hooks = baseOptions.hooks ?? {};
+  return {
+    ...baseOptions,
+    resume: sessionId,
+    persistSession: false,
+    maxTurns: 1,
+    hooks: { ...hooks, PreToolUse: [...hooks.PreToolUse ?? [], denyAllToolsHook()] }
+  };
+}
+function withFallback(stream, attempt, fallback, signal, label) {
+  void (async () => {
+    const buffered = [];
+    let ok = false;
+    let aborted2 = false;
+    try {
+      for await (const event of attempt) {
+        buffered.push(event);
+        if (event.type === "done") ok = event.reason !== "length";
+        if (event.type === "error") aborted2 = event.reason === "aborted";
+        if (event.type === "done" || event.type === "error") {
+          if (!ok) debug(`${label}: ${event.type === "error" ? String(event.error.errorMessage ?? "error").slice(0, 200) : "stopped at the length limit"}`);
+        }
+      }
+    } catch (error51) {
+      debug(`${label}: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    }
+    if (ok) {
+      for (const event of buffered) stream.push(event);
+      stream.end();
+      return;
+    }
+    if (aborted2 || signal?.aborted) {
+      const last = buffered[buffered.length - 1];
+      if (last) stream.push(last);
+      stream.end();
+      return;
+    }
+    debug(`${label}: falling back to the one-shot summary`);
+    for await (const event of fallback()) stream.push(event);
+    stream.end();
+  })();
 }
 
 // src/side-question.ts
@@ -48185,7 +48381,7 @@ async function askResumed(question, history, signal, deps, substitute) {
 }
 
 // src/connector-cache.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync7, writeFileSync } from "node:fs";
 import { dirname as dirname6, join as join8 } from "node:path";
 var CACHE_VERSION = 1;
@@ -48194,8 +48390,8 @@ function connectorCacheScopeKey(env = process.env) {
   return env.CLAUDE_CONFIG_DIR?.trim() || "<default>";
 }
 function connectorCachePath(scopeKey = connectorCacheScopeKey()) {
-  const digest = createHash("sha256").update(scopeKey).digest("hex").slice(0, 16);
-  return join8(piUserDir(), "connector-cache", `${digest}.json`);
+  const digest2 = createHash2("sha256").update(scopeKey).digest("hex").slice(0, 16);
+  return join8(piUserDir(), "connector-cache", `${digest2}.json`);
 }
 function readCachedConnectors(scopeKey = connectorCacheScopeKey(), now = Date.now()) {
   let raw;
@@ -48782,12 +48978,12 @@ function readSession(jsonlPath, projectPath) {
 }
 
 // src/session-persistence.ts
-import { createHash as createHash3, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash4, randomUUID as randomUUID3 } from "crypto";
 import { appendFileSync as appendFileSync4, readFileSync as readFileSync10, realpathSync as realpathSync5, statSync as statSync6 } from "fs";
 import { resolve as pathResolve } from "path";
 
 // src/append-update.ts
-import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash3, randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync5, readdirSync as readdirSync2, readFileSync as readFileSync9, renameSync as renameSync2, statSync as statSync4, unlinkSync as unlinkSync2, utimesSync, writeFileSync as writeFileSync3 } from "fs";
 import { join as join10 } from "path";
 var APPEND_UPDATE_TAG = "system_prompt_update";
@@ -48797,7 +48993,7 @@ var UPDATE_DIFF_LIMIT = 0.5;
 var MAX_DIFF_CELLS = 4e6;
 var STORE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1e3;
 function appendVersion(text) {
-  return createHash2("sha256").update(text).digest("hex").slice(0, VERSION_HEX);
+  return createHash3("sha256").update(text).digest("hex").slice(0, VERSION_HEX);
 }
 var FULL_HEADER = "The project instructions, project memory index, and skills appended to the system prompt have changed on disk. The current full text follows. It replaces the copy in the system prompt and every earlier system_prompt_update.";
 var DIFF_HEADER = "Parts of the project instructions, project memory index, or skills appended to the system prompt have changed on disk. Below are only the changes, relative to the text as you last received it: the system prompt with every earlier system_prompt_update applied. Apply them to that text. Every part not listed below is unchanged. A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text; a `removed` part no longer exists.";
@@ -49105,11 +49301,14 @@ function fingerprintMessages(messages) {
     }
     return message;
   });
-  return createHash3("sha256").update(JSON.stringify(normalized)).digest("hex");
+  return createHash4("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 function readBuiltSessionContext(sessionManager) {
   const built = typeof sessionManager?.buildSessionContext === "function" ? sessionManager.buildSessionContext() : void 0;
   return Array.isArray(built?.messages) ? { messages: withoutSystemMessages(built.messages) } : void 0;
+}
+function piContextLength(sessionManager) {
+  return readBuiltSessionContext(sessionManager)?.messages.length;
 }
 function latestPersistedBridgeSession(sessionManager) {
   const entries = typeof sessionManager?.getEntries === "function" ? sessionManager.getEntries() : [];
@@ -49263,20 +49462,20 @@ function syncAudit(path, detail, customToolNameToSdk, systemPromptAppend) {
     path,
     ...detail,
     ...tools !== void 0 ? { tools } : {},
-    ...systemPromptAppend ? { appendDigest: createHash3("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {},
+    ...systemPromptAppend ? { appendDigest: createHash4("sha256").update(systemPromptAppend).digest("hex").slice(0, 12) } : {},
     at: (/* @__PURE__ */ new Date()).toISOString()
   };
 }
 function ensurePromptSnapshotAppend(jsonlPath, sessionId, appendText) {
   if (!appendText) return;
   const key = `${jsonlPath}`;
-  const digest = createHash3("sha256").update(appendText).digest("hex");
-  if (ensuredAppend.get(key) === digest) return;
+  const digest2 = createHash4("sha256").update(appendText).digest("hex");
+  if (ensuredAppend.get(key) === digest2) return;
   const records = readSessionRecords(jsonlPath);
   if (!records) return;
   const snapshot = lastPromptSnapshot(records);
   if (!snapshot) {
-    ensuredAppend.set(key, digest);
+    ensuredAppend.set(key, digest2);
     return;
   }
   const refreshed = refreshSnapshotAppend(snapshot, appendText);
@@ -49285,7 +49484,7 @@ function ensurePromptSnapshotAppend(jsonlPath, sessionId, appendText) {
     debug(`ensurePromptSnapshotAppend: ${ok ? "refreshed" : "FAILED to refresh"} the recorded append block for ${sessionId.slice(0, 8)} (AGENTS.md or skills changed)`);
     if (!ok) return;
   }
-  ensuredAppend.set(key, digest);
+  ensuredAppend.set(key, digest2);
 }
 function verifyRecordChain(jsonlPath) {
   const records = readSessionRecords(jsonlPath);
@@ -50752,7 +50951,7 @@ function isClaudeContextLengthFailure(message) {
 function isSdkProgressMessage(message) {
   return !(message.type === "stream_event" && message.event?.type === "ping");
 }
-async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, inputChannel) {
+async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, inputChannel, topLevel = false) {
   let capturedSessionId;
   let failure;
   let accountProbe;
@@ -50767,6 +50966,15 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, bridgeConfig, w
     if (wasAborted()) break;
     const queryCtx = ctx();
     if (isSdkProgressMessage(message)) activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
+    if (topLevel && message.type === "stream_event" && message.event?.type === "message_start") {
+      const usage = message.event.message?.usage ?? {};
+      setLastTopLevelRequest({
+        at: Date.now(),
+        model: model.id,
+        contextTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
+        ...account ? { accountProfileId: account.profileId, claudeConfigDir: account.configDir } : {}
+      });
+    }
     if (account) {
       debug("consumeQuery: managed message", JSON.stringify({
         type: message.type,
@@ -51005,6 +51213,57 @@ function summaryRouterSessionId(sessionId) {
 }
 function streamOneShotSummaryRequest(model, context, options) {
   const cwd = options?.cwd ?? process.cwd();
+  const cached2 = cachedSummaryRun(model, context, options);
+  if (!cached2) return streamIsolatedSummaryRequest(model, context, options, cwd);
+  const stream = newAssistantMessageEventStream();
+  withFallback(stream, cached2, () => streamIsolatedSummaryRequest(model, context, options, cwd), options?.signal, "cached summary");
+  return stream;
+}
+function cachedSummaryRun(model, context, options) {
+  const promptText = extractUserPrompt(context.messages);
+  const note = takeCompactionNote(promptText);
+  if (!note) {
+    debug("provider: summary request matches no noted compaction; one-shot path");
+    return void 0;
+  }
+  const base = sideQuestionBase();
+  const session = sharedSession;
+  const refusal = cachedSummaryRefusal({
+    note,
+    promptText,
+    liveQuery: ctx().activeQuery !== null,
+    nested: stackDepth() !== 0,
+    session,
+    base,
+    lastRequest: lastTopLevelRequest,
+    model: model.id,
+    now: Date.now()
+  });
+  if (refusal || !session || !base || !note.boundary || !promptText) {
+    debug(`provider: compaction summary takes the one-shot path: ${refusal ?? "missing state"}`);
+    return void 0;
+  }
+  const instructions = summaryInstructions(promptText);
+  const prompt = buildCachedSummaryPrompt(context.systemPrompt, instructions, note.boundary);
+  const router = resolveClaudeAccountRouter();
+  const account = session.accountProfileId ? { profileId: session.accountProfileId, label: session.accountProfileId, ...session.claudeConfigDir ? { configDir: session.claudeConfigDir } : {} } : void 0;
+  debug(
+    "provider: compaction summary from the warm session cache",
+    `model=${model.id} session=${session.sessionId.slice(0, 8)} idle=${Math.round((Date.now() - lastTopLevelRequest.at) / 1e3)}s`,
+    `lastContext=${lastTopLevelRequest.contextTokens} promptChars=${prompt.length} (one-shot prompt ${promptText.length})`
+  );
+  return driveSummaryQuery(model, options, {
+    createStream: newAssistantMessageEventStream,
+    queryFactory: sdkQueryFactory,
+    queryOptions: { ...cachedSummaryOptions(base.buildOptions(), session.sessionId), ...makeCliDebugOptions("cached-summary") },
+    blocks: [{ type: "text", text: prompt }],
+    account,
+    router,
+    label: "cached summary",
+    rejectToolUse: true
+  });
+}
+function streamIsolatedSummaryRequest(model, context, options, cwd) {
   const substitute = resolveSummarySubstitute(model, loadConfig(cwd).provider);
   if (!substitute) return runOneShotSummary(model, context, options, cwd);
   const stream = newAssistantMessageEventStream();
@@ -51680,7 +51939,7 @@ function streamWithContext(model, context, options) {
     abortCtx.currentPiStream?.end();
     abortCtx.currentPiStream = null;
   };
-  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel).then(async ({ capturedSessionId, failure }) => {
+  consumeQuery(sdkQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, inputChannel, !isReentrant).then(async ({ capturedSessionId, failure }) => {
     debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
     if (abortCtx.compactionRestartRequested) {
       debug("provider: query discarded for compaction restart; the re-run owns the turn");
@@ -51748,7 +52007,7 @@ function streamWithContext(model, context, options) {
           `provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${deferredText.slice(0, 60)}${hasDeferredImages ? " [+images]" : ""}`
         );
         try {
-          const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+          const continuation = await consumeQuery(contQuery, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, void 0, !isReentrant);
           if (abortCtx.compactionRestartRequested) break;
           if (continuation.failure) {
             recordAttemptFailure(continuation.failure);
@@ -52027,6 +52286,22 @@ function index_default(pi2) {
   pi2.on("message_end", (event, ctx2) => {
     const message = event.message;
     if (message?.role === "assistant" && isClaudeProvider(message.provider)) schedulePersistSharedSession(ctx2);
+  });
+  pi2.on("session_before_compact", (event, ctx2) => {
+    const contextLength = piContextLength(ctx2.sessionManager);
+    const session = sharedSession;
+    const summarized = event.preparation.messagesToSummarize;
+    noteCompaction({
+      conversationDigest: conversationDigestOf(summarized),
+      reason: event.reason,
+      isSplitTurn: event.preparation.isSplitTurn,
+      boundary: describeBoundaryMessage(summarized[summarized.length - 1]),
+      // Pi appends a turn's final assistant message after the provider
+      // returns, so a cursor one short of Pi's context is still in sync.
+      inSync: Boolean(session && !session.needsRebuild && contextLength !== void 0 && session.cursor >= contextLength - 1),
+      at: Date.now()
+    });
+    debug(`session_before_compact: reason=${event.reason} split=${event.preparation.isSplitTurn} summarize=${summarized.length} contextLength=${contextLength ?? "?"} cursor=${session?.cursor ?? "none"}`);
   });
   pi2.on("session_compact", () => markHistoryRewrite("session_compact"));
   pi2.on("session_tree", () => markHistoryRewrite("session_tree"));
