@@ -83,6 +83,25 @@ export function extractAgentsAppend(): string | undefined {
 	return blocks.length > 0 ? `# CLAUDE.md\n\n${blocks.join("\n\n")}` : undefined;
 }
 
+// Claude Code 2.1.277+ also reads AGENTS.md on its own, through the built-in
+// plugin `cc-plugin-agents-md@builtin`, and attaches the files it finds to the
+// conversation as an `instructions` attachment. With the bridge forwarding the
+// same chain in the system prompt, every Claude session carried the project's
+// AGENTS.md twice (HYM, 2026-11-07: ~/AGENTS.md 18.5k and ws/hym/AGENTS.md
+// 40.7k characters in both the recorded snapshot and the attachment). While the
+// bridge forwards the chain, the plugin is limited to CLAUDE.md files, which
+// the bridge only forwards for directories without an AGENTS file. The plugin
+// reads this option only from user settings, a `--settings` file, or managed
+// settings; the SDK's `settings` option is the `--settings` flag.
+export const NATIVE_AGENTS_MD_PLUGIN = "cc-plugin-agents-md@builtin";
+
+export function nativeInstructionSettings(appendSystemPrompt: boolean): {
+	pluginConfigs?: Record<string, { options: { instructionFiles: "claude-md" } }>;
+} {
+	if (!appendSystemPrompt || isolatedFromEnv()) return {};
+	return { pluginConfigs: { [NATIVE_AGENTS_MD_PLUGIN]: { options: { instructionFiles: "claude-md" } } } };
+}
+
 // Only the harness NAME is rewritten. Paths and identifiers that merely
 // contain "pi" are real things on disk that the model's tools must reach:
 // until 2026-09-22 this also turned `~/.pi/agent/sessions` into

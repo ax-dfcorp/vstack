@@ -102,6 +102,53 @@ export function recordedAppendBlock(snapshot: Record<string, unknown> | undefine
 	return undefined;
 }
 
+/**
+ * Instruction files the CLI's own AGENTS.md/CLAUDE.md loader has attached to
+ * this transcript and not withdrawn since. The first `instructions` attachment
+ * lists every file; later ones are deltas (`changed: true`) naming changed
+ * files in `files` and dropped ones in `removed`.
+ */
+export function nativeInstructionFiles(records: RawSessionRecord[]): Set<string> {
+	const loaded = new Set<string>();
+	for (const record of records) {
+		if (record?.type !== "attachment" || record.attachment?.type !== "instructions") continue;
+		const attachment = record.attachment as { files?: Array<{ path?: unknown }>; removed?: unknown[]; changed?: unknown };
+		if (attachment.changed !== true) loaded.clear();
+		for (const file of Array.isArray(attachment.files) ? attachment.files : []) {
+			if (typeof file?.path === "string") loaded.add(file.path);
+		}
+		for (const path of Array.isArray(attachment.removed) ? attachment.removed : []) {
+			if (typeof path === "string") loaded.delete(path);
+		}
+	}
+	return loaded;
+}
+
+// Whether each session file carries native instruction files, read once per
+// process per file. A session that started without them never gains any while
+// the bridge keeps the native loader limited, and one that has them keeps the
+// loader as it was, so the answer only changes when this bridge rewrites the
+// file (rebuild), which invalidates the entry.
+const nativeInstructionsBySession = new Map<string, boolean>();
+
+/**
+ * Switching the CLI's AGENTS.md loader off for a session that already has
+ * AGENTS.md attached makes the CLI announce on resume "Instructions no longer
+ * present: <path>", and the model then treats rules that are still in its
+ * system prompt as withdrawn (measured 2026-11-07, Haiku 5.5 answered "NO
+ * INSTRUCTIONS" with the file still in the snapshot). Such a session keeps
+ * native loading until a full rebuild drops the native records.
+ */
+export function sessionHasNativeInstructions(jsonlPath: string, records?: RawSessionRecord[]): boolean {
+	const cached = nativeInstructionsBySession.get(jsonlPath);
+	if (cached !== undefined) return cached;
+	const read = records ?? readSessionRecords(jsonlPath);
+	if (!read) return false;
+	const present = nativeInstructionFiles(read).size > 0;
+	nativeInstructionsBySession.set(jsonlPath, present);
+	return present;
+}
+
 export function appendDigest(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
@@ -568,6 +615,8 @@ interface SyncResult {
 	sessionId: string | null;
 	/** Current system-prompt append to deliver in this turn's prompt, because it differs from the recorded snapshot (see pendingAppendUpdate). */
 	appendUpdate?: { text: string; digest: string };
+	/** The resumed transcript already carries AGENTS.md attached by the CLI's own loader (see sessionHasNativeInstructions). */
+	nativeInstructions: boolean;
 }
 
 /**
@@ -679,11 +728,13 @@ export function syncSharedSession(
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
+			const jsonlPath = getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir);
 			const appendUpdate = pendingAppendUpdate(
-				getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir),
+				jsonlPath,
 				systemPromptAppend,
 				sharedSession.deliveredAppendDigest,
 			);
+			const nativeInstructions = sessionHasNativeInstructions(jsonlPath);
 			setSharedSession({
 				...sharedSession,
 				...(trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {}),
@@ -691,7 +742,7 @@ export function syncSharedSession(
 			});
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
-			return { sessionId: sharedSession.sessionId, ...(appendUpdate ? { appendUpdate } : {}) };
+			return { sessionId: sharedSession.sessionId, nativeInstructions, ...(appendUpdate ? { appendUpdate } : {}) };
 		}
 	}
 
@@ -700,7 +751,7 @@ export function syncSharedSession(
 		debug(`Case 1: clean start, ${messages.length} total messages, account=${accountProfileId ?? "default"}`);
 		debug(`syncResult: path=clean-start`);
 		pendingCleanStartAudit = syncAudit("clean", {}, customToolNameToSdk, systemPromptAppend);
-		return { sessionId: null };
+		return { sessionId: null, nativeInstructions: false };
 	}
 	const rebuildReason = sharedSession?.needsRebuild
 		? sharedSession.rebuildReason ?? "marked"
@@ -793,6 +844,10 @@ export function syncSharedSession(
 	}
 	ensuredAppend.delete(session.jsonlPath);
 	recordedAppendDigests.delete(session.jsonlPath);
+	// Only carried native records can hold the CLI's instruction attachments; a
+	// tail converted from pi history never does.
+	const nativeInstructions = coveredMessages > 0 && nativeInstructionFiles(carriedRecords).size > 0;
+	nativeInstructionsBySession.set(session.jsonlPath, nativeInstructions);
 	// A rebuild that carried native records still has a chance at the cached
 	// prefix, so its snapshot is left as recorded and an append change is
 	// delivered in the prompt like the reuse path. A full rewrite has already
@@ -833,5 +888,5 @@ export function syncSharedSession(
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeConfigDir);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"} reason=${rebuildReason}`);
-	return { sessionId: session.sessionId, ...(appendUpdate ? { appendUpdate } : {}) };
+	return { sessionId: session.sessionId, nativeInstructions, ...(appendUpdate ? { appendUpdate } : {}) };
 }

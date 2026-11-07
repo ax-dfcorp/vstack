@@ -32628,6 +32628,11 @@ ${sanitized}
 
 ${blocks.join("\n\n")}` : void 0;
 }
+var NATIVE_AGENTS_MD_PLUGIN = "cc-plugin-agents-md@builtin";
+function nativeInstructionSettings(appendSystemPrompt) {
+  if (!appendSystemPrompt || isolatedFromEnv()) return {};
+  return { pluginConfigs: { [NATIVE_AGENTS_MD_PLUGIN]: { options: { instructionFiles: "claude-md" } } } };
+}
 var STANDALONE_PI = /(?<![\w./@~-])pi(?![\w/@-]|\.\w)/gi;
 function sanitizeAgentsContent(content) {
   return content.replace(STANDALONE_PI, "environment");
@@ -48921,6 +48926,31 @@ function recordedAppendBlock(snapshot) {
   }
   return void 0;
 }
+function nativeInstructionFiles(records) {
+  const loaded = /* @__PURE__ */ new Set();
+  for (const record2 of records) {
+    if (record2?.type !== "attachment" || record2.attachment?.type !== "instructions") continue;
+    const attachment = record2.attachment;
+    if (attachment.changed !== true) loaded.clear();
+    for (const file2 of Array.isArray(attachment.files) ? attachment.files : []) {
+      if (typeof file2?.path === "string") loaded.add(file2.path);
+    }
+    for (const path of Array.isArray(attachment.removed) ? attachment.removed : []) {
+      if (typeof path === "string") loaded.delete(path);
+    }
+  }
+  return loaded;
+}
+var nativeInstructionsBySession = /* @__PURE__ */ new Map();
+function sessionHasNativeInstructions(jsonlPath, records) {
+  const cached2 = nativeInstructionsBySession.get(jsonlPath);
+  if (cached2 !== void 0) return cached2;
+  const read = records ?? readSessionRecords(jsonlPath);
+  if (!read) return false;
+  const present = nativeInstructionFiles(read).size > 0;
+  nativeInstructionsBySession.set(jsonlPath, present);
+  return present;
+}
 function appendDigest(text) {
   return createHash2("sha256").update(text).digest("hex");
 }
@@ -49310,11 +49340,13 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
     const missed = priorMessages.slice(sharedSession.cursor);
     const trailingAssistantOnly = missed.length === 1 && missed[0].role === "assistant";
     if (missed.length === 0 || trailingAssistantOnly) {
+      const jsonlPath = getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir);
       const appendUpdate2 = pendingAppendUpdate(
-        getSessionPath(sharedSession.sessionId, normalizeProjectPath(cwd), claudeConfigDir),
+        jsonlPath,
         systemPromptAppend,
         sharedSession.deliveredAppendDigest
       );
+      const nativeInstructions2 = sessionHasNativeInstructions(jsonlPath);
       setSharedSession({
         ...sharedSession,
         ...trailingAssistantOnly ? { cursor: priorMessages.length, cwd } : {},
@@ -49322,14 +49354,14 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
       });
       debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
       debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor} account=${accountProfileId ?? "default"}`);
-      return { sessionId: sharedSession.sessionId, ...appendUpdate2 ? { appendUpdate: appendUpdate2 } : {} };
+      return { sessionId: sharedSession.sessionId, nativeInstructions: nativeInstructions2, ...appendUpdate2 ? { appendUpdate: appendUpdate2 } : {} };
     }
   }
   if (priorMessages.length === 0) {
     debug(`Case 1: clean start, ${messages.length} total messages, account=${accountProfileId ?? "default"}`);
     debug(`syncResult: path=clean-start`);
     pendingCleanStartAudit = syncAudit("clean", {}, customToolNameToSdk, systemPromptAppend);
-    return { sessionId: null };
+    return { sessionId: null, nativeInstructions: false };
   }
   const rebuildReason = sharedSession?.needsRebuild ? sharedSession.rebuildReason ?? "marked" : !sharedSession ? "first" : !sameAccount ? "account-rotation" : "drift";
   const replacedSessionId = sharedSession?.sessionId;
@@ -49397,6 +49429,8 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   }
   ensuredAppend.delete(session.jsonlPath);
   recordedAppendDigests.delete(session.jsonlPath);
+  const nativeInstructions = coveredMessages > 0 && nativeInstructionFiles(carriedRecords).size > 0;
+  nativeInstructionsBySession.set(session.jsonlPath, nativeInstructions);
   const carriedPrefix = coveredMessages > 0;
   let appendUpdate;
   if (carriedPrefix) {
@@ -49433,7 +49467,7 @@ function syncSharedSession(messages, cwd, customToolNameToSdk, modelId, account,
   }
   debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeConfigDir);
   debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} account=${accountProfileId ?? "default"} ${!replacedSessionId ? "first" : preserveId ? "preserved" : "rotated"} reason=${rebuildReason}`);
-  return { sessionId: session.sessionId, ...appendUpdate ? { appendUpdate } : {} };
+  return { sessionId: session.sessionId, nativeInstructions, ...appendUpdate ? { appendUpdate } : {} };
 }
 
 // src/stream-idle-watchdog.ts
@@ -51112,7 +51146,7 @@ function streamWithContext(model, context, options) {
   const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
   const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
   const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : void 0;
-  const { sessionId: resumeSessionId, appendUpdate } = syncSharedSession(
+  const { sessionId: resumeSessionId, appendUpdate, nativeInstructions } = syncSharedSession(
     context.messages,
     cwd,
     customToolNameToSdk,
@@ -51148,7 +51182,11 @@ function streamWithContext(model, context, options) {
     // injects one shared directory for every model.
     settings: {
       ...providerSettings.fastMode ? { fastMode: true } : {},
-      autoMemoryEnabled: false
+      autoMemoryEnabled: false,
+      // The bridge forwards the AGENTS.md chain itself; the CLI's own loader
+      // would attach the same files again (see agents-md.ts). A session that
+      // already has them attached keeps the loader until its next full rebuild.
+      ...nativeInstructions ? {} : nativeInstructionSettings(appendSystemPrompt)
     },
     // Every pi turn is a fresh CLI process, and with `append` set the CLI's
     // default is to re-render the claude_code preset on every launch. The

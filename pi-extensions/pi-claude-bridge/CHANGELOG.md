@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### AGENTS.md reaches Claude once, not twice
+
+Claude Code 2.1.277+ reads AGENTS.md on its own (built-in plugin `cc-plugin-agents-md@builtin`) and attached it to every new conversation's first message, while the bridge already forwards the same chain in the system prompt. Each Claude session therefore paid for its AGENTS.md twice on every request. The bridge now passes the plugin's documented option `instructionFiles: "claude-md"` through the `--settings` channel whenever it forwards the chain itself, so the CLI only reads CLAUDE.md. Measured 2026-11-07 on Claude Code 2.1.318: a new session in `ws/hym/apps/visual` sent 53,558 tokens on its first request instead of 94,501 (the attachment held 110,528 characters of AGENTS.md text), with all four AGENTS files still in the recorded system prompt. Sessions whose transcript already carries native instruction files keep the CLI loader until their next full rebuild: turning it off mid-session makes the CLI tell the model "Instructions no longer present", and Haiku 5.5 then answered that it had no project instructions although they were still in its system prompt. With that guard an existing session resumed on the new build read 12,268 of 12,270 tokens from cache and saw no notice. The comment that called an omitted `settingSources` isolation is corrected: the SDK then passes nothing and the CLI loads its default sources.
+
+Tests: `tests/unit-native-instructions.mjs`.
+
 ### Agent SDK 0.3.318, verified on pi 1.5.0 and Claude Code 2.1.318
 
 The bundled Claude Agent SDK moves from 0.3.308 to 0.3.318 and the pi dev pins from 1.4.0 to 1.5.0. No bridge source changed. pi 1.5.0's one breaking change (tool arguments validated by `@earendil-works/pi-schema`, so TypeBox-only features such as `Type.Refine()` no longer apply) does not reach the bridge, which uses none of them. Typecheck and the unit suite (536 pass, 2 environment skips) pass on pi 1.5.0. Live on Claude Code 2.1.318: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (4 reuse / 0 rebuild). The live tests need a logged-in `CLAUDE_CONFIG_DIR` with weekly room; the default `~/.claude` is logged out on this machine.

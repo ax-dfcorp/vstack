@@ -30,7 +30,7 @@ import { teardownQuery } from "./query-teardown.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, registerExternalConfigResolver, type Config } from "./config.js";
 import { hasClaudeCredentials } from "./auth-presence.js";
 import { NATIVE_PROVIDER_UNSUPPORTED_MESSAGE, buildNativeProvider, supportsNativeProvider } from "./native-provider.js";
-import { extractAgentsAppend } from "./agents-md.js";
+import { extractAgentsAppend, nativeInstructionSettings } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
 import { jsonSchemaToZodShape, validateAgainstShape } from "./typebox-to-zod.js";
 import { readFileSync as nodeReadFileSync } from "node:fs";
@@ -1641,15 +1641,14 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	const appendParts = [agentsAppend, memoryAppend, skillsAppend, promptContextAppend.text].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 
-	// MCP auto-loading suppression: with appendSystemPrompt=true (default), the
-	// SDK uses isolation mode and avoids filesystem settings. If users turn that
-	// off, load user/project settings but pass --strict-mcp-config so Claude Code
-	// ignores auto-discovered filesystem MCP servers while Pi owns tool execution.
-	// claude.ai cloud MCP connectors only load when Claude Code resolves its
-	// filesystem setting sources. The SDK treats settingSources=undefined as
-	// isolation (no sources), which drops the connectors even with
-	// ENABLE_CLAUDEAI_MCP_SERVERS=1. When connectors are enabled we force the CLI
-	// default source set so Gmail/Calendar/Drive surface.
+	// Setting sources. With appendSystemPrompt=true (default) the option is
+	// omitted, which the SDK resolves to the CLI default (user, project, and
+	// local settings plus CLAUDE.md/AGENTS.md discovery), not isolation: the
+	// CLI's own AGENTS.md loader is limited by nativeInstructionSettings below
+	// instead. If users turn appendSystemPrompt off, user/project settings load
+	// with --strict-mcp-config so Claude Code ignores auto-discovered
+	// filesystem MCP servers while Pi owns tool execution. With claude.ai cloud
+	// MCP connectors enabled the source set is passed by name (configurable).
 	const settingSources: SettingSource[] | undefined = enableCloudMcp
 		? (providerSettings.settingSources ?? ["user", "project", "local"])
 		: appendSystemPrompt
@@ -1658,7 +1657,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = resolveClaudeExecutable(providerSettings.pathToClaudeCodeExecutable);
 	const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : undefined;
-	const { sessionId: resumeSessionId, appendUpdate } = syncSharedSession(
+	const { sessionId: resumeSessionId, appendUpdate, nativeInstructions } = syncSharedSession(
 		context.messages,
 		cwd,
 		customToolNameToSdk,
@@ -1703,6 +1702,10 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		settings: {
 			...(providerSettings.fastMode ? { fastMode: true } : {}),
 			autoMemoryEnabled: false,
+			// The bridge forwards the AGENTS.md chain itself; the CLI's own loader
+			// would attach the same files again (see agents-md.ts). A session that
+			// already has them attached keeps the loader until its next full rebuild.
+			...(nativeInstructions ? {} : nativeInstructionSettings(appendSystemPrompt)),
 		},
 		// Every pi turn is a fresh CLI process, and with `append` set the CLI's
 		// default is to re-render the claude_code preset on every launch. The
