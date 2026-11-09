@@ -4,6 +4,9 @@
 
 export const FABLE_MODEL_ID = "claude-fable-5-1";
 export const FABLE_5_MODEL_ID = "claude-fable-5";
+// Fable 5.2 (2026-11-09, Claude Code 2.1.321+): listed after 5.1 so the
+// `fable` alias keeps resolving to 5.1; selected by its full id.
+export const FABLE_5_2_MODEL_ID = "claude-fable-5-2";
 // Opus 5.5 is the preferred implementation model (Claude Code 2.1.280+ / Agent
 // SDK 0.3.280+ know its id; older CLIs treat it as an unrecognized model and
 // assume a 200k window). No Opus is a Fable fallback: a Fable request never
@@ -17,6 +20,7 @@ export const SONNET_5_MODEL_ID = "claude-sonnet-5";
 
 export const MODEL_IDS_IN_ORDER = [
 	FABLE_MODEL_ID,
+	FABLE_5_2_MODEL_ID,
 	FABLE_5_MODEL_ID,
 	OPUS_5_5_MODEL_ID,
 	OPUS_4_8_MODEL_ID,
@@ -53,6 +57,7 @@ const CLAUDE_FIVE_LEVEL_MODEL_IDS = new Set([
 	"claude-sonnet-5-5",
 	"claude-haiku-5-5",
 	FABLE_MODEL_ID,
+	FABLE_5_2_MODEL_ID,
 	FABLE_5_MODEL_ID,
 	OPUS_5_5_MODEL_ID,
 	OPUS_4_8_MODEL_ID,
@@ -63,6 +68,15 @@ const FALLBACK_MODELS: Record<string, BridgeModelMetadata> = {
 	[FABLE_MODEL_ID]: {
 		id: FABLE_MODEL_ID,
 		name: "Claude Fable 5.1",
+		reasoning: true,
+		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
+		input: ["text", "image"],
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	[FABLE_5_2_MODEL_ID]: {
+		id: FABLE_5_2_MODEL_ID,
+		name: "Claude Fable 5.2",
 		reasoning: true,
 		thinkingLevelMap: CLAUDE_FIVE_LEVEL_EFFORT_MAP,
 		input: ["text", "image"],

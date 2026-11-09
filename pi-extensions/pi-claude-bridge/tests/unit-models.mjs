@@ -5,7 +5,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { FABLE_5_MODEL_ID, OPUS_4_8_MODEL_ID, OPUS_5_5_MODEL_ID, FABLE_MODEL_ID, MODEL_IDS_IN_ORDER, OPUS_5_MODEL_ID, SONNET_5_MODEL_ID, buildModels, modelDisplayName, resolveModelId } from "../src/models.js";
+import { FABLE_5_2_MODEL_ID, FABLE_5_MODEL_ID, OPUS_4_8_MODEL_ID, OPUS_5_5_MODEL_ID, FABLE_MODEL_ID, MODEL_IDS_IN_ORDER, OPUS_5_MODEL_ID, SONNET_5_MODEL_ID, buildModels, modelDisplayName, resolveModelId } from "../src/models.js";
 
 // Simulated pi-ai registry entry — extra fields mimic the ones pi-ai exposes
 // that must not leak into the provider-registered MODELS array.
@@ -44,18 +44,19 @@ describe("MODELS projection", () => {
 		assert.deepEqual(models.map((m) => m.id), MODEL_IDS_IN_ORDER);
 	});
 
-	it("lists Fable 5.1 first, keeps Fable 5, and preserves the implementation order", () => {
+	it("lists Fable 5.1 first, then Fable 5.2 and Fable 5, and preserves the implementation order", () => {
 		const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
 		assert.equal(models[0]?.id, FABLE_MODEL_ID);
-		assert.equal(models[1]?.id, FABLE_5_MODEL_ID);
-		assert.equal(models[2]?.id, OPUS_5_5_MODEL_ID);
-		assert.equal(models[3]?.id, OPUS_4_8_MODEL_ID);
-		assert.equal(models[4]?.id, OPUS_5_MODEL_ID);
+		assert.equal(models[1]?.id, FABLE_5_2_MODEL_ID);
+		assert.equal(models[2]?.id, FABLE_5_MODEL_ID);
+		assert.equal(models[3]?.id, OPUS_5_5_MODEL_ID);
+		assert.equal(models[4]?.id, OPUS_4_8_MODEL_ID);
+		assert.equal(models[5]?.id, OPUS_5_MODEL_ID);
 	});
 
 	it("fills bridge-owned future IDs missing from pi-ai and drops unknown missing IDs", () => {
 		const models = buildModels([mockPiAiModel("claude-haiku-4-5")]);
-		assert.deepEqual(models.map((m) => m.id), ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5"]);
+		assert.deepEqual(models.map((m) => m.id), ["claude-fable-5-1", "claude-fable-5-2", "claude-fable-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5"]);
 		assert.equal(models.find((m) => m.id === "claude-fable-5-1")?.name, "Claude Fable 5.1");
 		assert.equal(models.find((m) => m.id === "claude-fable-5-1")?.contextWindow, 1000000);
 		assert.equal(models.find((m) => m.id === "claude-opus-4-8")?.maxTokens, 128000);
@@ -95,7 +96,7 @@ describe("MODELS projection", () => {
 
 	it("publishes only low through max for Fable and Opus models", () => {
 		const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
-		for (const id of [FABLE_MODEL_ID, FABLE_5_MODEL_ID, OPUS_5_5_MODEL_ID, OPUS_4_8_MODEL_ID, OPUS_5_MODEL_ID]) {
+		for (const id of [FABLE_MODEL_ID, FABLE_5_2_MODEL_ID, FABLE_5_MODEL_ID, OPUS_5_5_MODEL_ID, OPUS_4_8_MODEL_ID, OPUS_5_MODEL_ID]) {
 			assert.deepEqual(models.find((m) => m.id === id)?.thinkingLevelMap, CLAUDE_FIVE_LEVEL_EFFORT_MAP);
 		}
 	});
