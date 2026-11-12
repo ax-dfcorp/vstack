@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Agent SDK 0.3.323, verified on pi 1.5.2 and Claude Code 2.1.323
+
+The bundled Claude Agent SDK moves from 0.3.321 to 0.3.323 and the pi dev pins from 1.5.0 to 1.5.2. No bridge source changed. pi 1.5.1 turns on idle prompt-cache warming (`cacheWarming: "idle"`) and Anthropic message threads; neither reaches bridge models: the warmer needs a `promptCache` lifetime, which `buildModels` does not give them, and message threads apply only to pi's built-in `anthropic` provider. Typecheck and the unit suite (611 pass, 2 environment skips) pass on pi 1.5.2. Live on Claude Code 2.1.323: `tests/int-smoke.sh` 3/3 and `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
+
 ### Fixes to the cache levers after an independent review and live runs (2026-11-07)
 
 - A cached summary or warm-up that ends without a successful result, or with thinking and no text, now fails and takes the isolated path. Before, a resumed summary that produced only thinking was accepted, and Pi would have compacted to an empty summary.
