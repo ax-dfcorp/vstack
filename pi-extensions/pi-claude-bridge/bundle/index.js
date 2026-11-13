@@ -49540,6 +49540,12 @@ function formatAutoResumeRateLimitMessage(input) {
   const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail) ? detail.replace(/\s+/g, " ").slice(0, 200) : void 0;
   return `${parts.join(" \u2014 ")}.${quotable ? ` (${quotable})` : ""}`;
 }
+function formatAutoResumeAccountFailureMessage(input) {
+  const cause = input.kind === "billing" ? "payment problem on that account" : "sign-in no longer valid on that account";
+  const detail = input.detail?.trim();
+  const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail) ? detail.replace(/\s+/g, " ").slice(0, 200) : void 0;
+  return `Claude provider returned an error on ${input.accountLabel} (${cause}) \u2014 Pi auto-retry resumes this turn on ${input.nextAccountLabel}.${quotable ? ` (${quotable})` : ""}`;
+}
 var ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
 function normalizeRateLimitUtilization(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
@@ -54270,23 +54276,34 @@ function streamWithContext(model, context, options) {
       });
       piUI?.notify(`${RATE_LIMIT_TOKEN} Claude ${failure.message} \u2014 resets ${formatResetTimestamp(resetAtMs ?? resetAt)}`, "warning");
     }
-    const resumable = failure.kind === "rate-limit" && !aborted2 && !wasAborted && !options?.signal?.aborted && Boolean(account && router) && abortCtx.committedOutput;
+    const accountFailure = failure.kind === "rate-limit" || failure.kind === "billing" || failure.kind === "auth";
+    const resumable = accountFailure && !aborted2 && !wasAborted && !options?.signal?.aborted && Boolean(account && router) && abortCtx.committedOutput;
     if (resumable && account && router) {
       const next = reserveAutoResumeAccount(router, account, queryModel.id, options?.sessionId);
+      const what = failure.kind === "rate-limit" ? "hit a Claude limit" : failure.kind === "billing" ? "was refused for a payment problem" : "lost its sign-in";
       if (next) {
-        const limitType = info ? rateLimitTypeFromInfo(info) : void 0;
-        surfacedMessage = formatAutoResumeRateLimitMessage({
-          accountLabel: account.label,
-          nextAccountLabel: next.label,
-          rateLimitType: typeof limitType === "string" ? limitType : void 0,
-          resetAt: resetAtMs ?? resetAt,
-          detail: failure.message
-        });
-        debug(`provider: post-output rate limit on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
-        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn; Pi auto-retry resumes on ${next.label}.`, "info");
+        if (failure.kind === "rate-limit") {
+          const limitType = info ? rateLimitTypeFromInfo(info) : void 0;
+          surfacedMessage = formatAutoResumeRateLimitMessage({
+            accountLabel: account.label,
+            nextAccountLabel: next.label,
+            rateLimitType: typeof limitType === "string" ? limitType : void 0,
+            resetAt: resetAtMs ?? resetAt,
+            detail: failure.message
+          });
+        } else {
+          surfacedMessage = formatAutoResumeAccountFailureMessage({
+            accountLabel: account.label,
+            nextAccountLabel: next.label,
+            kind: failure.kind,
+            detail: failure.message
+          });
+        }
+        debug(`provider: post-output ${failure.kind} on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
+        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} ${what} mid-turn; Pi auto-retry resumes on ${next.label}.`, failure.kind === "rate-limit" ? "info" : "warning");
       } else {
-        debug(`provider: post-output rate limit on ${account.label} with no other account; surfaced as terminal`);
-        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
+        debug(`provider: post-output ${failure.kind} on ${account.label} with no other account; surfaced as terminal`);
+        piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} ${what} mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
       }
     }
     if (abortCtx.turnOutput) {
