@@ -70,7 +70,7 @@ import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, conn
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { cancelScheduledSessionPersistence, confirmAppendUpdate, piContextLength, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
-import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
+import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeAccountFailureMessage, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
 import { ensureTurnStarted, finalizeCurrentStream, finalizeToolUseTurnFromMcpInvocation, noteChildExecutedToolResults, noteModelSubstitution, processAssistantMessage, processStreamEvent, scheduleToolUseTurnEnd } from "./assistant-stream.js";
 import {
@@ -2120,29 +2120,42 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 			});
 			piUI?.notify(`${RATE_LIMIT_TOKEN} Claude ${failure.message} — resets ${formatResetTimestamp(resetAtMs ?? resetAt)}`, "warning");
 		}
-		// A managed-account limit hit after the replay boundary cannot be replayed
+		// A managed-account rejection after the replay boundary cannot be replayed
 		// here, but Pi's own auto-retry can continue the turn (strip the failed
-		// assistant message, agent.continue()) if the error reads as a rate limit.
+		// assistant message, agent.continue()) if the error reads as retryable.
+		// That holds for every failure that belongs to the ACCOUNT rather than
+		// the request: a usage limit, a payment past due, a sign-in that expired.
 		// Reserve the next account first so that retry lands on it; with no other
 		// account the message stays terminal and Pi waits for the user.
-		const resumable = failure.kind === "rate-limit" && !aborted && !wasAborted && !options?.signal?.aborted
+		const accountFailure = failure.kind === "rate-limit" || failure.kind === "billing" || failure.kind === "auth";
+		const resumable = accountFailure && !aborted && !wasAborted && !options?.signal?.aborted
 			&& Boolean(account && router) && abortCtx.committedOutput;
 		if (resumable && account && router) {
 			const next = reserveAutoResumeAccount(router, account, queryModel.id, options?.sessionId);
+			const what = failure.kind === "rate-limit" ? "hit a Claude limit" : failure.kind === "billing" ? "was refused for a payment problem" : "lost its sign-in";
 			if (next) {
-				const limitType = info ? rateLimitTypeFromInfo(info) : undefined;
-				surfacedMessage = formatAutoResumeRateLimitMessage({
-					accountLabel: account.label,
-					nextAccountLabel: next.label,
-					rateLimitType: typeof limitType === "string" ? limitType : undefined,
-					resetAt: resetAtMs ?? resetAt,
-					detail: failure.message,
-				});
-				debug(`provider: post-output rate limit on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
-				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn; Pi auto-retry resumes on ${next.label}.`, "info");
+				if (failure.kind === "rate-limit") {
+					const limitType = info ? rateLimitTypeFromInfo(info) : undefined;
+					surfacedMessage = formatAutoResumeRateLimitMessage({
+						accountLabel: account.label,
+						nextAccountLabel: next.label,
+						rateLimitType: typeof limitType === "string" ? limitType : undefined,
+						resetAt: resetAtMs ?? resetAt,
+						detail: failure.message,
+					});
+				} else {
+					surfacedMessage = formatAutoResumeAccountFailureMessage({
+						accountLabel: account.label,
+						nextAccountLabel: next.label,
+						kind: failure.kind as "billing" | "auth",
+						detail: failure.message,
+					});
+				}
+				debug(`provider: post-output ${failure.kind} on ${account.label}; surfaced as Pi-retryable, next=${next.label}`);
+				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} ${what} mid-turn; Pi auto-retry resumes on ${next.label}.`, failure.kind === "rate-limit" ? "info" : "warning");
 			} else {
-				debug(`provider: post-output rate limit on ${account.label} with no other account; surfaced as terminal`);
-				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} hit a Claude limit mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
+				debug(`provider: post-output ${failure.kind} on ${account.label} with no other account; surfaced as terminal`);
+				piUI?.notify(`${RATE_LIMIT_TOKEN} ${account.label} ${what} mid-turn and no other account is available; send a prompt to resume once one recovers.`, "warning");
 			}
 		}
 		if (abortCtx.turnOutput) {

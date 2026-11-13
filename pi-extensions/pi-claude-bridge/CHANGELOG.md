@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### A payment or sign-in problem on one account no longer stops a turn midway
+
+When one subscription account was refused after a turn had already produced output or used a tool ("Claude Code can't use your Claude subscription, usually because a payment is past due …"), the run stopped until the user typed a prompt, although other accounts were available: only usage limits were handed to Pi's auto-retry, and the CLI's copy contains "billing", which Pi treats as terminal. A post-output `billing` or `auth` failure now reserves the next account and is surfaced as "Claude provider returned an error on <account> (…) — Pi auto-retry resumes this turn on <next>", so Pi continues the turn there. With no other account the original message is kept. Before any output these failures already moved to another account. Tests: `tests/unit-account-rotation-stream.mjs` (payment copy from 2026-11-13).
+
 ### Claude gets Pi's tool guidance, the same text every other model gets
 
 Pi renders each active tool's prompt snippet and guidelines into its system prompt (`<tools>`, `<rules>`); the bridge replaced that prompt with the Claude Code preset and never carried them over, so the Claude models missed every tool rule other models follow (rpiv-todo's progress-board rules, the browser credential rules, `wait_for`, `slack_post` approval, `generate_image`). The append now carries them as a `<pi_tool_guidance>` part after the skills, taken from the text Pi rendered: tool names in the list are the ones Claude calls, a tool not offered over MCP is left out with the rules that name it, and Pi's two response-style lines are left out. On this Mac's setup that is 18,933 characters (about 5.4k tokens): 80 tool snippets and 35 rules. It sits in the frozen system-prompt append, so it is cached with it; a change to the active tools reaches a running session as a diff of that part.

@@ -125,6 +125,28 @@ export function formatAutoResumeRateLimitMessage(input: {
 	return `${parts.join(" — ")}.${quotable ? ` (${quotable})` : ""}`;
 }
 
+/** The same Pi auto-retry hand-off for an account-level rejection that is not
+ *  a usage limit: a payment past due or a sign-in that stopped being valid on
+ *  ONE subscription account says nothing about the others. The CLI's copy
+ *  ("Claude Code can't use your Claude subscription … claude.ai/settings/billing")
+ *  carries the word Pi treats as terminal, so surfaced verbatim the run stopped
+ *  while four other accounts had room (2026-11-13). "provider returned an
+ *  error" is the retryable phrase; the detail is quoted only when it holds none
+ *  of Pi's terminal words. */
+export function formatAutoResumeAccountFailureMessage(input: {
+	accountLabel: string;
+	nextAccountLabel: string;
+	kind: "billing" | "auth";
+	detail?: string;
+}): string {
+	const cause = input.kind === "billing" ? "payment problem on that account" : "sign-in no longer valid on that account";
+	const detail = input.detail?.trim();
+	const quotable = detail && !PI_NON_RETRYABLE_DETAIL_PATTERN.test(detail)
+		? detail.replace(/\s+/g, " ").slice(0, 200)
+		: undefined;
+	return `Claude provider returned an error on ${input.accountLabel} (${cause}) — Pi auto-retry resumes this turn on ${input.nextAccountLabel}.${quotable ? ` (${quotable})` : ""}`;
+}
+
 export const ALLOWED_RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 80;
 
 export function normalizeRateLimitUtilization(value: unknown): number | undefined {

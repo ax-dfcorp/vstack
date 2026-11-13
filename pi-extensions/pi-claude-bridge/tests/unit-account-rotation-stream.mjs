@@ -354,6 +354,57 @@ describe("managed account stream rotation", () => {
 		assert.deepEqual(observed.failures, [{ profileId: "a", kind: "rate-limit" }]);
 	});
 
+	it("surfaces a post-output payment rejection in Pi's retryable form after reserving the next account", async () => {
+		const observed = observedState();
+		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
+		let calls = 0;
+		// The CLI's copy when one subscription account has an unpaid invoice
+		// (2026-11-13). It names "billing", which Pi treats as terminal, so
+		// surfaced verbatim the run stopped although other accounts had room.
+		const original = "Claude Code returned an error result: Claude Code can\u2019t use your Claude subscription, usually because a payment is past due \u00b7 Pay or renew at https://claude.ai/settings/billing (if you just paid, try again shortly), or use an Anthropic API key instead";
+		__testSetSdkQueryFactory(((input) => {
+			calls += 1;
+			return fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: "session-a" },
+				{
+					type: "stream_event",
+					event: { type: "message_start", message: { model: model.id, usage: { input_tokens: 1 } } },
+				},
+				{
+					type: "stream_event",
+					event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				},
+				{
+					type: "stream_event",
+					event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "already-visible" } },
+				},
+				new Error(original),
+			], "a", observed);
+		}));
+
+		assert.equal(
+			isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: original }),
+			false,
+			"the CLI's own copy is terminal for Pi",
+		);
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "pi-session" }));
+		assert.equal(calls, 1, "no bridge-side replay after committed output");
+		const errors = events.filter((event) => event.type === "error");
+		assert.equal(errors.length, 1);
+		const errorMessage = errors[0].error.errorMessage;
+		assert.match(errorMessage, /account-a/);
+		assert.match(errorMessage, /account-b/);
+		assert.match(errorMessage, /payment/);
+		assert.ok(
+			isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage }),
+			`Pi must classify the surfaced error as retryable: ${errorMessage}`,
+		);
+		assert.equal(observed.acquires.length, 2);
+		assert.deepEqual(observed.acquires[1].excludedProfileIds, ["a"]);
+		assert.equal(observed.acquires[1].reason, "auto-resume");
+		assert.deepEqual(observed.failures, [{ profileId: "a", kind: "billing" }]);
+	});
+
 	it("keeps a post-output rate limit terminal when no other account can take the turn", async () => {
 		const observed = observedState();
 		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed, {
