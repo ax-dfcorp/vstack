@@ -33426,6 +33426,84 @@ function buildModels(piAiModels) {
   }));
 }
 
+// src/tool-guidance.ts
+var TOOL_GUIDANCE_TAG = "pi_tool_guidance";
+var DROPPED_BUILTIN_RULES = /* @__PURE__ */ new Set([
+  "Be concise in your responses",
+  "Show file paths clearly when working with files"
+]);
+var TOOL_LINE = /^- ([^:\s]+): (.*)$/;
+function extractPromptSection(systemPrompt, name) {
+  if (!systemPrompt) return void 0;
+  const open = `<${name}>
+`;
+  const close = `
+</${name}>`;
+  let start = -1;
+  for (let index = systemPrompt.indexOf(open); index >= 0; index = systemPrompt.indexOf(open, index + 1)) {
+    if (index === 0 || systemPrompt[index - 1] === "\n") {
+      start = index;
+      break;
+    }
+  }
+  if (start < 0) return void 0;
+  const end = systemPrompt.indexOf(close, start + open.length);
+  if (end < 0) return void 0;
+  return systemPrompt.slice(start + open.length, end);
+}
+function mentionsTool(rule, tool) {
+  const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9_])${escaped}([^A-Za-z0-9_]|$)`).test(rule);
+}
+function buildToolGuidanceAppend(systemPrompt, toolNameToSdk) {
+  const result = { droppedTools: [], droppedRules: [], tools: [], rules: 0 };
+  const toolsSection = extractPromptSection(systemPrompt, "tools");
+  const rulesSection = extractPromptSection(systemPrompt, "rules");
+  if (toolsSection === void 0 && rulesSection === void 0) return result;
+  const toolLines = [];
+  for (const line of (toolsSection ?? "").split("\n")) {
+    const match = TOOL_LINE.exec(line);
+    if (!match) {
+      toolLines.push(line);
+      continue;
+    }
+    const [, name, snippet2] = match;
+    const sdkName = toolNameToSdk.get(name);
+    if (!sdkName) {
+      result.droppedTools.push(name);
+      continue;
+    }
+    result.tools.push(name);
+    toolLines.push(`- ${sdkName}: ${snippet2}`);
+  }
+  const ruleLines = [];
+  for (const line of (rulesSection ?? "").split("\n")) {
+    if (!line.startsWith("- ")) {
+      if (line.trim()) ruleLines.push(line);
+      continue;
+    }
+    const rule = line.slice(2);
+    if (DROPPED_BUILTIN_RULES.has(rule) || result.droppedTools.some((tool) => mentionsTool(rule, tool))) {
+      result.droppedRules.push(rule);
+      continue;
+    }
+    ruleLines.push(line);
+  }
+  result.rules = ruleLines.filter((line) => line.startsWith("- ")).length;
+  const tools = toolLines.join("\n").trim();
+  const rules = ruleLines.join("\n").trim();
+  if (!tools && !rules) return result;
+  const parts = [
+    `<${TOOL_GUIDANCE_TAG}>`,
+    `Pi's notes and rules for the tools in this session, the same ones Pi gives every other model. The rules use Pi's tool names: tool \`name\` is the one you call as \`mcp__${MCP_SERVER_NAME}__name\`.`
+  ];
+  if (tools) parts.push("", "Tools:", tools);
+  if (rules) parts.push("", "Rules:", rules);
+  parts.push(`</${TOOL_GUIDANCE_TAG}>`);
+  result.text = parts.join("\n");
+  return result;
+}
+
 // src/extract-tool-results.ts
 function toolResultToMcpContent(content) {
   if (typeof content === "string") return [{ type: "text", text: content || "" }];
@@ -51158,16 +51236,17 @@ function appendVersion(text) {
   return createHash3("sha256").update(text).digest("hex").slice(0, VERSION_HEX);
 }
 var FULL_HEADER = "The project instructions, project memory index, and skills appended to the system prompt have changed on disk. The current full text follows. It replaces the copy in the system prompt and every earlier system_prompt_update.";
-var DIFF_HEADER = "Parts of the project instructions, project memory index, or skills appended to the system prompt have changed on disk. Below are only the changes, relative to the text as you last received it: the system prompt with every earlier system_prompt_update applied. Apply them to that text. Every part not listed below is unchanged. A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text; a `removed` part no longer exists.";
+var DIFF_HEADER = "Parts of the project instructions, project memory index, or skills appended to the system prompt have changed on disk. Below are only the changes, relative to the text as you last received it: the system prompt with every earlier system_prompt_update applied. Apply them to that text. Every part not listed below is unchanged. A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text, and an `added` part follows every other part; a `removed` part no longer exists.";
 function formatFullAppendUpdate(text) {
   return [`<${APPEND_UPDATE_TAG} version="${appendVersion(text)}">`, FULL_HEADER, "", text, `</${APPEND_UPDATE_TAG}>`].join("\n");
 }
 var PROJECT_INSTRUCTIONS_OPEN = /^<project_instructions path="([^"]*)">$/;
 var SKILLS_START = "The following skills provide specialized instructions";
+var TOOL_GUIDANCE_OPEN = "<pi_tool_guidance>";
 function splitAppendSections(text) {
   const lines = text.split("\n");
   const sections = [];
-  const startsSection = (line) => PROJECT_INSTRUCTIONS_OPEN.test(line) || line === "# Project memory" || line.startsWith(SKILLS_START) || line.startsWith("<forwarded_pi_context");
+  const startsSection = (line) => PROJECT_INSTRUCTIONS_OPEN.test(line) || line === "# Project memory" || line.startsWith(SKILLS_START) || line === TOOL_GUIDANCE_OPEN || line.startsWith("<forwarded_pi_context");
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
@@ -51184,6 +51263,9 @@ function splitAppendSections(text) {
     } else if (line.startsWith(SKILLS_START)) {
       key = "skills";
       end = lines.findIndex((candidate, index) => index > i && candidate.trimEnd().endsWith("</available_skills>"));
+    } else if (line === TOOL_GUIDANCE_OPEN) {
+      key = "pi_tool_guidance";
+      end = lines.indexOf("</pi_tool_guidance>", i + 1);
     } else if (line.startsWith("<forwarded_pi_context")) {
       key = "forwarded_pi_context";
       end = lines.indexOf("</forwarded_pi_context>", i + 1);
@@ -51272,6 +51354,11 @@ function unifiedHunks(oldLines, newLines, context = 1) {
   }
   return out.join("\n");
 }
+function withoutTrailingBlankLines(lines) {
+  let end = lines.length;
+  while (end > 0 && lines[end - 1] === "") end--;
+  return lines.slice(0, end).join("\n");
+}
 function buildAppendUpdate(baseline, current) {
   const full = () => ({ block: formatFullAppendUpdate(current), mode: "full" });
   if (baseline === void 0) return full();
@@ -51280,7 +51367,7 @@ function buildAppendUpdate(baseline, current) {
   if (!before || !after) return full();
   const beforeKeys = before.map((section) => section.key);
   const afterKeys = after.map((section) => section.key);
-  if (beforeKeys.length !== afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
+  if (beforeKeys.length > afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
   if (afterKeys.some((key) => key.includes("'"))) return full();
   const previous = new Map(before.map((section) => [section.key, section]));
   const parts = [];
@@ -51295,6 +51382,7 @@ ${text}
       continue;
     }
     if (old.lines.join("\n") === text) continue;
+    if (afterKeys.length > beforeKeys.length && section.key === beforeKeys[beforeKeys.length - 1] && withoutTrailingBlankLines(old.lines) === withoutTrailingBlankLines(section.lines)) continue;
     const hunks = unifiedHunks(old.lines, section.lines);
     if (text.includes("</part>") || hunks !== void 0 && hunks.includes("</part>")) return full();
     if (hunks === void 0 || hunks.length > text.length * SECTION_DIFF_LIMIT) {
@@ -53911,8 +53999,12 @@ function streamWithContext(model, context, options) {
   const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : void 0;
   const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : void 0;
   const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : void 0;
+  const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk) : void 0;
+  if (toolGuidance && (toolGuidance.droppedTools.length > 0 || toolGuidance.droppedRules.length > 0)) {
+    debug(`provider: tool guidance forwards ${toolGuidance.tools.length} tools and ${toolGuidance.rules} rules; left out tools [${toolGuidance.droppedTools.join(", ")}], ${toolGuidance.droppedRules.length} rules`);
+  }
   const promptContextAppend = buildPromptContextAppend(context.systemPrompt, cwd, bridgeConfig.promptContext ?? {});
-  const appendParts = [agentsAppend, memoryAppend, skillsAppend, promptContextAppend.text].filter((part) => Boolean(part));
+  const appendParts = [agentsAppend, memoryAppend, skillsAppend, toolGuidance?.text, promptContextAppend.text].filter((part) => Boolean(part));
   const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : void 0;
   const settingSources = enableCloudMcp ? providerSettings.settingSources ?? ["user", "project", "local"] : appendSystemPrompt ? void 0 : providerSettings.settingSources ?? ["user", "project"];
   const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;

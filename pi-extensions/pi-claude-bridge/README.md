@@ -47,7 +47,7 @@ Restart Pi after installation.
 
 ## Prompt context
 
-Default behavior matches upstream: append `AGENTS.md` plus Pi's skills block to Claude Code's `claude_code` preset prompt.
+By default the bridge appends `AGENTS.md`, the project-memory block, Pi's skills block, and Pi's tool guidance to Claude Code's `claude_code` preset prompt. The tool guidance is what Pi renders for every other model from the active tools (each tool's prompt snippet and guidelines), with tool names written the way Claude calls them; tools Claude cannot call and Pi's two response-style lines are left out.
 
 Extra Pi context is off by default. Enable per item in the extension manager when you want Claude Code to see prompt blocks that other Pi extensions add to your session. Forwarded blocks are wrapped in explicit XML tags so Pi 0.75+ project-context boundaries do not bleed into adjacent sections.
 
@@ -69,7 +69,7 @@ The bridge also reads `claude-bridge.json` (`~/.pi/agent/claude-bridge.json`, an
 
 | Setting | What it does |
 | --- | --- |
-| Forward AGENTS.md + skills | Append AGENTS.md and Pi's skills block. |
+| Forward AGENTS.md + skills | Append AGENTS.md, the project-memory block, Pi's skills block, and Pi's tool guidance. |
 
 ### Pi prompt context
 

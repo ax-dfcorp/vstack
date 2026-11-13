@@ -24,6 +24,7 @@ import {
 import { createQueryInputChannel, type QueryInputChannel } from "./input-channel.js";
 import { buildModels, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractMemoryBlock, extractSkillsBlock } from "./skills.js";
+import { buildToolGuidanceAppend } from "./tool-guidance.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, rootCtx, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
@@ -1800,8 +1801,13 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 	const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : undefined;
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
+	// Pi's per-tool notes and rules, the ones it renders for every other model (tool-guidance.ts).
+	const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk) : undefined;
+	if (toolGuidance && (toolGuidance.droppedTools.length > 0 || toolGuidance.droppedRules.length > 0)) {
+		debug(`provider: tool guidance forwards ${toolGuidance.tools.length} tools and ${toolGuidance.rules} rules; left out tools [${toolGuidance.droppedTools.join(", ")}], ${toolGuidance.droppedRules.length} rules`);
+	}
 	const promptContextAppend = buildPromptContextAppend(context.systemPrompt, cwd, bridgeConfig.promptContext ?? {});
-	const appendParts = [agentsAppend, memoryAppend, skillsAppend, promptContextAppend.text].filter((part): part is string => Boolean(part));
+	const appendParts = [agentsAppend, memoryAppend, skillsAppend, toolGuidance?.text, promptContextAppend.text].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 
 	// Setting sources. With appendSystemPrompt=true (default) the option is

@@ -248,17 +248,22 @@ describe("only the changed parts are delivered", () => {
 		assert.ok(toC.appendUpdate.block.includes("-- Legacy rule."));
 	});
 
-	it("sends a large change, an added part, a removed part, or a reorder as the full text", () => {
+	it("sends a large change, a part added before others, a removed part, or a reorder as the full text", () => {
 		setup();
 		// Most of the memory index rewritten: full text.
 		const rewritten = realisticAppend({ memoryLines: 0, extraMemory: Array.from({ length: 300 }, (_, i) => `- [Other ${i}](o-${i}.md) — rewritten line ${i} with a long description of different content`) });
 		assert.equal(sync(rewritten).appendUpdate.mode, "full");
-		// A diff cannot say where a new part goes, and order is precedence.
+		// A diff cannot say where a part added between others goes, and order is precedence.
+		setup();
+		const midContext = BASE.replace("# Project memory", "<forwarded_pi_context>\nextra hook text\n</forwarded_pi_context>\n\n# Project memory");
+		assert.equal(sync(midContext).appendUpdate.mode, "full");
+		// A part added after every other part has one place to go: it travels alone, as an added part.
 		setup();
 		const withContext = `${BASE}\n\n<forwarded_pi_context>\nextra hook text\n</forwarded_pi_context>`;
 		const added = sync(withContext);
-		assert.equal(added.appendUpdate.mode, "full");
-		assert.ok(added.appendUpdate.block.includes("<forwarded_pi_context>\nextra hook text"));
+		assert.equal(added.appendUpdate.mode, "diff");
+		assert.ok(added.appendUpdate.block.includes(`<part name='forwarded_pi_context' change="added">\n<forwarded_pi_context>\nextra hook text\n</forwarded_pi_context>\n</part>`));
+		assert.ok(!added.appendUpdate.block.includes("project_instructions"));
 		confirmAppendUpdate(added.appendUpdate);
 		const withoutRepo = withContext.replace(/\n\n<project_instructions path="\/repo\/repo\/AGENTS.md">[\s\S]*?<\/project_instructions>/, "");
 		const removed = sync(withoutRepo);

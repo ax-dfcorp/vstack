@@ -12,7 +12,7 @@
 // Now the block names only the parts that changed, against the text the model
 // last received. The append is split into its natural parts (one per
 // <project_instructions path="…">, the project-memory block, the skills block,
-// the forwarded Pi context); a changed part is sent as a line diff, an added
+// Pi's tool guidance, the forwarded Pi context); a changed part is sent as a line diff, an added
 // one in full, a removed one by name. A part whose diff would exceed 40% of
 // its length is sent whole, and an update larger than half of the full text
 // falls back to the full text, as before.
@@ -53,7 +53,7 @@ const DIFF_HEADER =
 	"Parts of the project instructions, project memory index, or skills appended to the system prompt have changed on disk. " +
 	"Below are only the changes, relative to the text as you last received it: the system prompt with every earlier system_prompt_update applied. " +
 	"Apply them to that text. Every part not listed below is unchanged. " +
-	"A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text; a `removed` part no longer exists.";
+	"A `modified` part is a unified diff whose line numbers count from the first line of that part; `replaced` and `added` parts give the part's full new text, and an `added` part follows every other part; a `removed` part no longer exists.";
 
 export function formatFullAppendUpdate(text: string): string {
 	return [`<${APPEND_UPDATE_TAG} version="${appendVersion(text)}">`, FULL_HEADER, "", text, `</${APPEND_UPDATE_TAG}>`].join("\n");
@@ -69,6 +69,7 @@ export interface AppendSection {
 
 const PROJECT_INSTRUCTIONS_OPEN = /^<project_instructions path="([^"]*)">$/;
 const SKILLS_START = "The following skills provide specialized instructions";
+const TOOL_GUIDANCE_OPEN = "<pi_tool_guidance>";
 
 /**
  * Split the append into its parts, or undefined when it does not split into
@@ -78,7 +79,7 @@ export function splitAppendSections(text: string): AppendSection[] | undefined {
 	const lines = text.split("\n");
 	const sections: AppendSection[] = [];
 	const startsSection = (line: string): boolean =>
-		PROJECT_INSTRUCTIONS_OPEN.test(line) || line === "# Project memory" || line.startsWith(SKILLS_START) || line.startsWith("<forwarded_pi_context");
+		PROJECT_INSTRUCTIONS_OPEN.test(line) || line === "# Project memory" || line.startsWith(SKILLS_START) || line === TOOL_GUIDANCE_OPEN || line.startsWith("<forwarded_pi_context");
 	let i = 0;
 	while (i < lines.length) {
 		const line = lines[i];
@@ -95,6 +96,9 @@ export function splitAppendSections(text: string): AppendSection[] | undefined {
 		} else if (line.startsWith(SKILLS_START)) {
 			key = "skills";
 			end = lines.findIndex((candidate, index) => index > i && candidate.trimEnd().endsWith("</available_skills>"));
+		} else if (line === TOOL_GUIDANCE_OPEN) {
+			key = "pi_tool_guidance";
+			end = lines.indexOf("</pi_tool_guidance>", i + 1);
 		} else if (line.startsWith("<forwarded_pi_context")) {
 			key = "forwarded_pi_context";
 			end = lines.indexOf("</forwarded_pi_context>", i + 1);
@@ -196,6 +200,12 @@ export function unifiedHunks(oldLines: string[], newLines: string[], context = 1
  * The block that brings a model from `baseline` to `current`: only the
  * changed parts when that is meaningfully smaller, otherwise the full text.
  */
+function withoutTrailingBlankLines(lines: string[]): string {
+	let end = lines.length;
+	while (end > 0 && lines[end - 1] === "") end--;
+	return lines.slice(0, end).join("\n");
+}
+
 export function buildAppendUpdate(baseline: string | undefined, current: string): { block: string; mode: "diff" | "full" } {
 	const full = () => ({ block: formatFullAppendUpdate(current), mode: "full" as const });
 	if (baseline === undefined) return full();
@@ -203,12 +213,14 @@ export function buildAppendUpdate(baseline: string | undefined, current: string)
 	const after = splitAppendSections(current);
 	if (!before || !after) return full();
 	// A diff names parts but not their positions, so it can only express edits
-	// inside parts that keep their order: an added, removed, or reordered part
-	// (instruction precedence follows order) is sent as the full text. So is a
-	// part whose name or text would collide with the <part> markup.
+	// inside parts that keep their order, plus parts added after all of them (an
+	// added part comes last, which the header states): a removed, reordered, or
+	// mid-text added part (instruction precedence follows order) is sent as the
+	// full text. So is a part whose name or text would collide with the <part>
+	// markup.
 	const beforeKeys = before.map((section) => section.key);
 	const afterKeys = after.map((section) => section.key);
-	if (beforeKeys.length !== afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
+	if (beforeKeys.length > afterKeys.length || beforeKeys.some((key, index) => key !== afterKeys[index])) return full();
 	if (afterKeys.some((key) => key.includes("'"))) return full();
 	const previous = new Map(before.map((section) => [section.key, section]));
 	const parts: string[] = [];
@@ -221,6 +233,8 @@ export function buildAppendUpdate(baseline: string | undefined, current: string)
 			continue;
 		}
 		if (old.lines.join("\n") === text) continue;
+		// The blank line that separates a part added after it is not a change to the part before.
+		if (afterKeys.length > beforeKeys.length && section.key === beforeKeys[beforeKeys.length - 1] && withoutTrailingBlankLines(old.lines) === withoutTrailingBlankLines(section.lines)) continue;
 		const hunks = unifiedHunks(old.lines, section.lines);
 		if (text.includes("</part>") || (hunks !== undefined && hunks.includes("</part>"))) return full();
 		if (hunks === undefined || hunks.length > text.length * SECTION_DIFF_LIMIT) {
