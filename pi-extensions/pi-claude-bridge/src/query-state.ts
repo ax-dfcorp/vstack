@@ -428,6 +428,12 @@ export class QueryContext {
 	 * call unrecordable at teardown — which is the one case the trail exists for.
 	 */
 	connectorCallAudit = new Map<string, ConnectorCallAuditState>();
+	/**
+	 * Calls the child resolves itself that are not connector calls: names not on
+	 * the bridge's tool server (see child-resolved.ts). Query-scoped like
+	 * connectorCallAudit, for the same reason.
+	 */
+	childResolvedCalls = new Map<string, { name: string; recorded: boolean }>();
 	/** Claude Code session id for this query, from the SDK's `system` init message.
 	 *  Undefined until it arrives; the audit trail omits the field rather than
 	 *  guessing. */
@@ -575,6 +581,19 @@ export class QueryContext {
 					recorded: false,
 				});
 			}
+		}
+		if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
+	}
+
+	/** Note a tool_use whose name is not on the bridge's tool server and is not a
+	 *  connector: the child runs it on a server of its own or rejects it, and Pi
+	 *  never sees it (child-resolved.ts). `streamIndex` as for connector calls. */
+	noteChildResolvedToolCall(id: string | undefined, rawName: string, streamIndex?: number): void {
+		// A server the child loaded itself may have side effects; same boundary as a connector call.
+		this.markOutputCommitted();
+		if (id) {
+			this.childExecutedToolCalls.set(id, rawName);
+			if (!this.childResolvedCalls.has(id)) this.childResolvedCalls.set(id, { name: rawName, recorded: false });
 		}
 		if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
 	}

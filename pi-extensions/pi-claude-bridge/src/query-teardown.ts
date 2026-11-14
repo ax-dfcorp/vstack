@@ -6,6 +6,7 @@
 // flush, and activeQuery clear were skipped, leaking its pending MCP handlers.
 
 import { reportToolResultMismatch } from "./bridge-state.js";
+import { flushChildResolvedCalls } from "./child-resolved.js";
 import { flushConnectorCallAudit } from "./connector-audit.js";
 import { debug } from "./debug.js";
 import { drainPendingToolCalls, popContextFor, type QueryContext, type ToolCallDrainCause } from "./query-state.js";
@@ -41,6 +42,8 @@ export function teardownQuery(
 	// transcript is never the only evidence a connector call was made.
 	const unobserved = flushConnectorCallAudit(queryCtx, cause);
 	if (unobserved > 0) debug(`provider: query teardown recorded ${unobserved} connector call(s) with no observed result (cause=${cause})`);
+	const unobservedChildResolved = flushChildResolvedCalls(queryCtx, cause);
+	if (unobservedChildResolved > 0) debug(`provider: query teardown recorded ${unobservedChildResolved} child-resolved call(s) with no observed result (cause=${cause})`);
 
 	if (isReentrant) {
 		// Merges deferred messages and restores/repairs the stack. popContextFor

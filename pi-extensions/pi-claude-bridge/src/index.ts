@@ -2043,7 +2043,8 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 				activeQuery: abortCtx.activeQuery,
 				currentPiStream: abortCtx.currentPiStream,
 				turnOutput: abortCtx.turnOutput,
-				childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded),
+				childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded)
+					|| [...abortCtx.childResolvedCalls.values()].some((call) => !call.recorded),
 			}),
 			onTimeout: ({ idleMs, timeoutMs }) => {
 				if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;

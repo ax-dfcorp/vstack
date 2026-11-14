@@ -33786,6 +33786,12 @@ var QueryContext = class {
    * call unrecordable at teardown — which is the one case the trail exists for.
    */
   connectorCallAudit = /* @__PURE__ */ new Map();
+  /**
+   * Calls the child resolves itself that are not connector calls: names not on
+   * the bridge's tool server (see child-resolved.ts). Query-scoped like
+   * connectorCallAudit, for the same reason.
+   */
+  childResolvedCalls = /* @__PURE__ */ new Map();
   /** Claude Code session id for this query, from the SDK's `system` init message.
    *  Undefined until it arrives; the audit trail omits the field rather than
    *  guessing. */
@@ -33922,6 +33928,17 @@ var QueryContext = class {
           recorded: false
         });
       }
+    }
+    if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
+  }
+  /** Note a tool_use whose name is not on the bridge's tool server and is not a
+   *  connector: the child runs it on a server of its own or rejects it, and Pi
+   *  never sees it (child-resolved.ts). `streamIndex` as for connector calls. */
+  noteChildResolvedToolCall(id2, rawName, streamIndex) {
+    this.markOutputCommitted();
+    if (id2) {
+      this.childExecutedToolCalls.set(id2, rawName);
+      if (!this.childResolvedCalls.has(id2)) this.childResolvedCalls.set(id2, { name: rawName, recorded: false });
     }
     if (typeof streamIndex === "number") this.childExecutedStreamIndexes.add(streamIndex);
   }
@@ -34532,6 +34549,39 @@ function __testGetBridgeIntegrityState() {
   return { sharedSession };
 }
 
+// src/child-resolved.ts
+var CHILD_RESOLVED_INTEGRITY_LABEL = "child_resolved_tool_call";
+var REJECTION_MARKER = /No such tool available/;
+function isPiToolCall(name, toolNameToPi) {
+  if (typeof name !== "string" || !toolNameToPi || !name.startsWith(MCP_TOOL_PREFIX)) return false;
+  const piName = toolNameToPi.get(name);
+  return piName !== void 0 && `${MCP_TOOL_PREFIX}${piName}` === name;
+}
+function childResolvedOutcome(block) {
+  if (block.is_error !== true) return "ran";
+  let text = "";
+  if (typeof block.content === "string") text = block.content;
+  else if (Array.isArray(block.content)) {
+    text = block.content.map((part) => part && typeof part === "object" && typeof part.text === "string" ? part.text : "").join(" ");
+  }
+  return REJECTION_MARKER.test(text) ? "rejected" : "error";
+}
+function recordChildResolvedResult(queryCtx, toolUseId, outcome) {
+  const state = queryCtx.childResolvedCalls.get(toolUseId);
+  if (!state || state.recorded) return false;
+  queryCtx.childResolvedCalls.set(toolUseId, { ...state, recorded: true });
+  return appendIntegrityEntry(CHILD_RESOLVED_INTEGRITY_LABEL, { name: state.name, toolUseId, outcome });
+}
+function flushChildResolvedCalls(queryCtx, reason) {
+  let appended = 0;
+  for (const [toolUseId, state] of queryCtx.childResolvedCalls) {
+    if (state.recorded) continue;
+    queryCtx.childResolvedCalls.set(toolUseId, { ...state, recorded: true });
+    if (appendIntegrityEntry(CHILD_RESOLVED_INTEGRITY_LABEL, { name: state.name, toolUseId, outcome: "unobserved", reason })) appended++;
+  }
+  return appended;
+}
+
 // src/connector-audit.ts
 var CONNECTOR_CALL_CUSTOM_TYPE = "claude-bridge-connector-call";
 function connectorResultByteSize(content) {
@@ -34610,6 +34660,8 @@ function teardownQuery(queryCtx, sdkQuery, cause, cwd, isReentrant) {
   queryCtx.pendingResults.clear();
   const unobserved = flushConnectorCallAudit(queryCtx, cause);
   if (unobserved > 0) debug(`provider: query teardown recorded ${unobserved} connector call(s) with no observed result (cause=${cause})`);
+  const unobservedChildResolved = flushChildResolvedCalls(queryCtx, cause);
+  if (unobservedChildResolved > 0) debug(`provider: query teardown recorded ${unobservedChildResolved} child-resolved call(s) with no observed result (cause=${cause})`);
   if (isReentrant) {
     if (!popContextFor(queryCtx)) debug("provider: query teardown found context already popped; skipping pop");
   } else {
@@ -52642,6 +52694,11 @@ function processStreamEvent(message, customToolNameToPi, model) {
       debug(`processStreamEvent: child-executed tool ${event.content_block.name} [${event.content_block.id}] \u2014 not mirrored as a Pi tool call`);
       return;
     }
+    if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi)) {
+      c.noteChildResolvedToolCall(event.content_block.id, event.content_block.name, event.index);
+      debug(`processStreamEvent: child-resolved tool ${event.content_block.name} [${event.content_block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
+      return;
+    }
     if (event.content_block?.type === "text") {
       c.turnBlocks.push({ type: "text", text: "", index: event.index });
       c.currentPiStream.push({ type: "text_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
@@ -52749,6 +52806,11 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
       debug(`assistant message: child-executed tool ${block.name} [${block.id}] \u2014 not mirrored as a Pi tool call`);
       continue;
     }
+    if (!isPiToolCall(block.name, customToolNameToPi)) {
+      c.noteChildResolvedToolCall(block.id, block.name);
+      debug(`assistant message: child-resolved tool ${block.name} [${block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
+      continue;
+    }
     sawToolUse = true;
     const existingIdx = c.turnBlocks.findIndex((b) => b.type === "toolCall" && b.id === block.id);
     const name = mapToolName(block.name, customToolNameToPi);
@@ -52800,6 +52862,12 @@ function noteChildExecutedToolResults(message) {
     if (block?.type !== "tool_result") continue;
     const name = c.childExecutedToolCalls.get(block.tool_use_id);
     if (!name) continue;
+    if (c.childResolvedCalls.has(block.tool_use_id)) {
+      const outcome = childResolvedOutcome(block);
+      const recorded = recordChildResolvedResult(c, block.tool_use_id, outcome);
+      debug(`child-resolved tool result: ${name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
+      continue;
+    }
     const isError = block.is_error === true;
     const byteSize = connectorResultByteSize(block.content);
     const audited = recordConnectorCallResult(c, block.tool_use_id, name, isError, byteSize);
@@ -52847,6 +52915,11 @@ function processAssistantMessage(message, model, customToolNameToPi) {
       if (isChildExecutedTool(block.name)) {
         c.noteChildExecutedToolCall(block.id, block.name);
         debug(`processAssistantMessage fallback: child-executed tool ${block.name} [${block.id}] \u2014 not mirrored as a Pi tool call`);
+        continue;
+      }
+      if (!isPiToolCall(block.name, customToolNameToPi)) {
+        c.noteChildResolvedToolCall(block.id, block.name);
+        debug(`processAssistantMessage fallback: child-resolved tool ${block.name} [${block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
         continue;
       }
       ensureTurnStarted();
@@ -54226,7 +54299,7 @@ function streamWithContext(model, context, options) {
       activeQuery: abortCtx.activeQuery,
       currentPiStream: abortCtx.currentPiStream,
       turnOutput: abortCtx.turnOutput,
-      childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded)
+      childExecutedToolPending: [...abortCtx.connectorCallAudit.values()].some((call) => !call.recorded) || [...abortCtx.childResolvedCalls.values()].some((call) => !call.recorded)
     }),
     onTimeout: ({ idleMs, timeoutMs }) => {
       if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;

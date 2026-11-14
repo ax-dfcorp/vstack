@@ -3,6 +3,7 @@ import { type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { appendIntegrityEntry, modelSubstitutionStreak, resetModelSubstitutionStreak, safeNotify, setSharedSession, sharedSession } from "./bridge-state.js";
 import { modelDisplayName } from "./models.js";
 import { connectorResultByteSize, recordConnectorCallResult } from "./connector-audit.js";
+import { childResolvedOutcome, isPiToolCall, recordChildResolvedResult } from "./child-resolved.js";
 import { isChildExecutedTool } from "./connectors.js";
 import { debug, diagDump } from "./debug.js";
 import { ctx, type QueryContext } from "./query-state.js";
@@ -469,6 +470,14 @@ export function processStreamEvent(
 			debug(`processStreamEvent: child-executed tool ${event.content_block.name} [${event.content_block.id}] — not mirrored as a Pi tool call`);
 			return;
 		}
+		if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi)) {
+			// Not a tool on the bridge's server: the child runs it on a server of its
+			// own or rejects it. Mirroring it made Pi run rejected calls the model
+			// never saw the output of (child-resolved.ts).
+			c.noteChildResolvedToolCall(event.content_block.id, event.content_block.name, event.index);
+			debug(`processStreamEvent: child-resolved tool ${event.content_block.name} [${event.content_block.id}] — not on the bridge's tool server, not mirrored as a Pi tool call`);
+			return;
+		}
 		if (event.content_block?.type === "text") {
 			c.turnBlocks.push({ type: "text", text: "", index: event.index });
 			c.currentPiStream!.push({ type: "text_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
@@ -609,6 +618,11 @@ function appendMissingToolUsesFromAssistant(
 			debug(`assistant message: child-executed tool ${block.name} [${block.id}] — not mirrored as a Pi tool call`);
 			continue;
 		}
+		if (!isPiToolCall(block.name, customToolNameToPi)) {
+			c.noteChildResolvedToolCall(block.id, block.name);
+			debug(`assistant message: child-resolved tool ${block.name} [${block.id}] — not on the bridge's tool server, not mirrored as a Pi tool call`);
+			continue;
+		}
 		sawToolUse = true;
 		const existingIdx = c.turnBlocks.findIndex((b: any) => b.type === "toolCall" && b.id === block.id);
 		const name = mapToolName(block.name, customToolNameToPi);
@@ -689,6 +703,12 @@ export function noteChildExecutedToolResults(message: SDKMessage): void {
 		if (block?.type !== "tool_result") continue;
 		const name = c.childExecutedToolCalls.get(block.tool_use_id);
 		if (!name) continue;
+		if (c.childResolvedCalls.has(block.tool_use_id)) {
+			const outcome = childResolvedOutcome(block);
+			const recorded = recordChildResolvedResult(c, block.tool_use_id, outcome);
+			debug(`child-resolved tool result: ${name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
+			continue;
+		}
 		const isError = block.is_error === true;
 		const byteSize = connectorResultByteSize(block.content);
 		const audited = recordConnectorCallResult(c, block.tool_use_id, name, isError, byteSize);
@@ -768,6 +788,11 @@ export function processAssistantMessage(message: SDKMessage, model: Model<any>, 
 				// becomes a Pi tool call and never ends the turn.
 				c.noteChildExecutedToolCall(block.id, block.name);
 				debug(`processAssistantMessage fallback: child-executed tool ${block.name} [${block.id}] — not mirrored as a Pi tool call`);
+				continue;
+			}
+			if (!isPiToolCall(block.name, customToolNameToPi)) {
+				c.noteChildResolvedToolCall(block.id, block.name);
+				debug(`processAssistantMessage fallback: child-resolved tool ${block.name} [${block.id}] — not on the bridge's tool server, not mirrored as a Pi tool call`);
 				continue;
 			}
 			ensureTurnStarted();
