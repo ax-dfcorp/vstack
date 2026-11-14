@@ -5,7 +5,9 @@ export const MCP_SERVER_NAME = "custom-tools";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
 // Extract skills block from pi's system prompt for forwarding to Claude Code.
-export function extractSkillsBlock(systemPrompt?: string): string | undefined {
+// `naming` is the name the read tool is offered under (tool-names.ts): with bare
+// names Pi's own sentence already names the callable tool and is kept as is.
+export function extractSkillsBlock(systemPrompt?: string, naming: "bare" | "prefixed" = "prefixed"): string | undefined {
 	if (!systemPrompt) return undefined;
 	const startMarker = "The following skills provide specialized instructions for specific tasks.";
 	const endMarker = "</available_skills>";
@@ -13,7 +15,8 @@ export function extractSkillsBlock(systemPrompt?: string): string | undefined {
 	if (start === -1) return undefined;
 	const end = systemPrompt.indexOf(endMarker, start);
 	if (end === -1) return undefined;
-	return rewriteSkillsBlock(systemPrompt.slice(start, end + endMarker.length).trim());
+	const block = systemPrompt.slice(start, end + endMarker.length).trim();
+	return naming === "bare" ? block : rewriteSkillsBlock(block);
 }
 
 // Extract the shared project-memory block that a Pi extension appends to the

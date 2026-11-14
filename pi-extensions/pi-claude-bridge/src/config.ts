@@ -51,6 +51,13 @@ export interface Config {
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
 		appendSystemPrompt?: boolean;
+		/**
+		 * Offer Pi's tools to Claude under their own names (`bash`) instead of
+		 * `mcp__custom-tools__bash` (tool-names.ts). Default on. Applies to Pi
+		 * sessions whose first Claude turn comes after the change; a session keeps
+		 * the names it started with.
+		 */
+		bareToolNames?: boolean;
 		/** Enable Claude Code fast mode for bridge requests. */
 		fastMode?: boolean;
 		/** Force this Claude Code effort level for every bridge request. */
@@ -400,6 +407,8 @@ function managerToConfig(raw: SettingsRecord): Partial<Config> {
 
 	const appendSystemPrompt = boolFrom(raw, "appendSystemPrompt");
 	if (appendSystemPrompt !== undefined) provider.appendSystemPrompt = appendSystemPrompt;
+	const bareToolNames = boolFrom(raw, "bareToolNames");
+	if (bareToolNames !== undefined) provider.bareToolNames = bareToolNames;
 	const fastMode = boolFrom(raw, "fastMode");
 	if (fastMode !== undefined) provider.fastMode = fastMode;
 	if (hasOwn(raw, "forceEffort")) {
@@ -510,6 +519,7 @@ export function loadConfig(cwd: string): Config {
 
 const PROVIDER_KEYS = new Set([
 	"appendSystemPrompt",
+	"bareToolNames",
 	"connectorWriteMode",
 	"enableConnectors",
 	"fastMode",

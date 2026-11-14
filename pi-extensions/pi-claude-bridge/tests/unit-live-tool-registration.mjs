@@ -24,7 +24,7 @@ const claudeConfigDir = join(scratch, "claude-profile");
 const cwd = join(scratch, "project");
 mkdirSync(cwd);
 
-const { __testSetBridgeIntegrityState, __testSetSdkQueryFactory, streamClaudeAgentSdk } = await import("../src/index.ts");
+const { __testSetBridgeIntegrityState, __testSetSdkQueryFactory, setSessionToolNaming, streamClaudeAgentSdk } = await import("../src/index.ts");
 const { CLAUDE_ACCOUNT_ROUTER_SYMBOL } = await import("../src/account-router.ts");
 const { ctx, resetStack } = await import("../src/query-state.ts");
 const { waitForChildToolList } = await import("../src/live-tools.ts");
@@ -88,6 +88,7 @@ function installFactory({ statusTools = true } = {}) {
 	__testSetSdkQueryFactory((input) => {
 		const server = input.options.mcpServers?.["custom-tools"];
 		observed.server = server;
+		observed.env = input.options.env;
 		let release;
 		const closedSignal = new Promise((resolve) => { release = resolve; });
 		let closed = false;
@@ -150,7 +151,8 @@ async function endQuery(live) {
 }
 
 beforeEach(() => {
-	observed = { timeline: [], server: undefined, client: undefined };
+	observed = { timeline: [], server: undefined, client: undefined, env: undefined };
+	setSessionToolNaming(undefined);
 	process.env.CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT = "0";
 	globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = router;
 	resetStack();
@@ -158,6 +160,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	setSessionToolNaming(undefined);
 	delete process.env.CLAUDE_BRIDGE_STREAM_IDLE_TIMEOUT;
 	delete globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL];
 	__testSetSdkQueryFactory();
@@ -180,7 +183,22 @@ describe("a tool Pi activates during a query", () => {
 		assert.ok(observed.timeline.indexOf("list_changed") >= 0 && observed.timeline.indexOf("list_changed") < released, `list_changed must reach the child before the result: ${observed.timeline}`);
 		const listed = observed.timeline.findIndex((event) => event.startsWith("listed:") && event.includes("poc_vault_read"));
 		assert.ok(listed >= 0 && listed < released, `the result was released before the child listed the new tool: ${observed.timeline}`);
-		assert.equal(live.liveMcpServer.toolNameToPi.get("mcp__custom-tools__poc_vault_read"), "poc_vault_read", "the stream cannot map the new tool's calls");
+		// A new session offers bare names (tool-names.ts): the stream maps the new tool's bare calls.
+		assert.equal(live.liveMcpServer.toolNameToPi.get("poc_vault_read"), "poc_vault_read", "the stream cannot map the new tool's calls");
+		assert.equal(live.liveMcpServer.toolNameToPi.has("mcp__custom-tools__poc_vault_read"), false);
+		assert.equal(observed.env.CLAUDE_AGENT_SDK_MCP_NO_PREFIX, "1");
+		await endQuery(live);
+	});
+
+	it("registers the new tool under its prefixed name in a session that keeps prefixed names", async () => {
+		setSessionToolNaming("prefixed");
+		installFactory();
+		const { live, loaderResult } = await startLoaderCall();
+		streamClaudeAgentSdk(model, resultContext([loaderTool, vaultTool]), { cwd, sessionId: "pi-session" });
+		await loaderResult;
+		assert.equal(live.liveMcpServer.toolNameToPi.get("mcp__custom-tools__poc_vault_read"), "poc_vault_read");
+		assert.equal(live.liveMcpServer.toolNameToPi.has("poc_vault_read"), false);
+		assert.equal(observed.env.CLAUDE_AGENT_SDK_MCP_NO_PREFIX, undefined, "a prefixed session must not pass the no-prefix switch");
 		await endQuery(live);
 	});
 

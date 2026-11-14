@@ -23,9 +23,10 @@ import {
 } from "./user-prompt.js";
 import { createQueryInputChannel, type QueryInputChannel } from "./input-channel.js";
 import { buildModels, modelDisplayName } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractMemoryBlock, extractSkillsBlock } from "./skills.js";
+import { MCP_SERVER_NAME, extractMemoryBlock, extractSkillsBlock } from "./skills.js";
 import { type ChildToolLister, waitForChildToolList } from "./live-tools.js";
 import { buildToolGuidanceAppend } from "./tool-guidance.js";
+import { sdkToolName, sessionToolNamingFor, toolNamingEnv, type ToolNaming } from "./tool-names.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, canInjectSteer, ctx, drainPendingToolCalls, failUndeliveredPendingToolCalls, isTurnContinuation, isUndeliverableToolCall, popContext, rootCtx, stackDepth, pushContext, toolCallDrainCause, undeliveredToolCallResult } from "./query-state.js";
 import { teardownQuery } from "./query-teardown.js";
@@ -66,10 +67,10 @@ export {
 export { connectorCachePath, connectorCacheScopeKey, readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
 import { debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "./claude-executable.js";
-import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, lastTopLevelRequest, setLastTopLevelRequest, setPiUI, setSharedSession, sharedSession, type TopLevelRequest } from "./bridge-state.js";
+import { appendIntegrityEntry, argKeys, extensionApi, isCompactionRebuild, MODEL_SUBSTITUTION_RESTART_CAP, modelSubstitutionStreak, piUI, reportToolResultMismatch, safeNotify, safeToolCallSummary, scopeModelSubstitutionStreak, setExtensionApi, lastTopLevelRequest, setLastTopLevelRequest, setPiUI, setSessionToolNaming, setSharedSession, sessionToolNaming, sharedSession, type TopLevelRequest } from "./bridge-state.js";
 import { connectorMcpServers, connectorQueryOptions, connectorWriteModeFor, connectorsEnabledFor, isChildExecutedTool } from "./connectors.js";
 import { readCachedConnectors, writeCachedConnectors } from "./connector-cache.js";
-import { cancelScheduledSessionPersistence, confirmAppendUpdate, piContextLength, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
+import { cancelScheduledSessionPersistence, confirmAppendUpdate, piContextLength, readPersistedToolNaming, restoreSharedSessionFromPi, schedulePersistSharedSession, syncSharedSession, takePendingCleanStartAudit } from "./session-persistence.js";
 import { STREAM_IDLE_BACKOFF_HINT_MS, activeStreamIdleWatchdogs, buildStreamIdleTimeoutErrorMessage, createStreamIdleWatchdog, formatDurationShort, streamIdleTimeoutMsFromEnv } from "./stream-idle-watchdog.js";
 import { RATE_LIMIT_AUTO_RESUME_EVENT, RATE_LIMIT_TOKEN, attachAttemptFailure, attachedAttemptFailure, formatAllowedRateLimitWarning, formatAutoResumeAccountFailureMessage, formatAutoResumeRateLimitMessage, formatResetTimestamp, isUsageLimitMessage, modelFamilyFromLimitMessage, uniqueNonEmptyLines } from "./rate-limit.js";
 import { mapToolArgs } from "./tool-mapping.js";
@@ -94,7 +95,7 @@ import {
 // public surface — unit tests and downstream consumers import these from
 // bundle/index.js.
 export { classifyClaudeExecutableBytes, preflightClaudeExecutable, resolveClaudeExecutable, spawnClaudeCodeWithDiagnostics, wrapClaudeSpawnErrorForSdk, type ClaudeExecutableFileType, type ClaudeExecutablePreflightResult } from "./claude-executable.js";
-export { __testGetBridgeIntegrityState, __testSetBridgeIntegrityState, INTEGRITY_CUSTOM_TYPE, appendIntegrityEntry, reportToolResultMismatch } from "./bridge-state.js";
+export { __testGetBridgeIntegrityState, __testSetBridgeIntegrityState, INTEGRITY_CUSTOM_TYPE, appendIntegrityEntry, reportToolResultMismatch, setSessionToolNaming } from "./bridge-state.js";
 export { CONNECTOR_CALL_CUSTOM_TYPE, connectorResultByteSize, flushConnectorCallAudit, recordConnectorCallResult, setConnectorCallAuditSink, type ConnectorCallAuditData, type ConnectorCallAuditSink, type ConnectorCallOutcome } from "./connector-audit.js";
 export { CLAUDE_AI_CONNECTOR_TOOL_PATTERNS, connectorMcpServers, connectorDeclarationsDisabled, CLAUDE_BRIDGE_TOOL_ISOLATION, CONNECTOR_DISCOVERY_TOOLS, CONNECTOR_WRITE_TOOLS, DISALLOWED_BUILTIN_TOOLS, connectorQueryOptions, connectorWriteDenyHook, connectorWriteModeFor, connectorWriteModeFromEnv, connectorsEnabledFor, connectorsEnabledFromEnv, isChildExecutedTool, isConnectorWriteTool, toolIsolationForQuery } from "./connectors.js";
 export { cancelScheduledSessionPersistence, restoreSharedSessionFromPi, shouldRestorePersistedBridgeEntry } from "./session-persistence.js";
@@ -399,7 +400,7 @@ function pinToolDescription(tool: Tool): Tool {
 	return tool;
 }
 
-export function resolveMcpTools(context: Context, excludeToolName?: string): {
+export function resolveMcpTools(context: Context, excludeToolName?: string, naming: ToolNaming = "prefixed"): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
 	customToolNameToPi: Map<string, string>;
@@ -425,7 +426,7 @@ export function resolveMcpTools(context: Context, excludeToolName?: string): {
 			debug(`resolveMcpTools: not re-offering child-native tool ${tool.name}`);
 			continue;
 		}
-		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
+		const sdkName = sdkToolName(tool.name, naming);
 		mcpTools.push(tool);
 		// Case-insensitive aliases mean two tools differing only by case would
 		// silently overwrite each other's mapping — surface it if it ever happens.
@@ -462,9 +463,11 @@ function buildMcpServers(
 	tools: Tool[],
 	queryCtx: QueryContext,
 	toolNameToPi: Map<string, string> = new Map(),
+	naming: ToolNaming = "prefixed",
 ): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	queryCtx.liveMcpServer = null;
 	queryCtx.toolListReady = null;
+	queryCtx.toolNaming = naming;
 	if (!tools.length) return undefined;
 	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: tools.map((tool) => mcpToolDefinition(tool, queryCtx)) });
 	queryCtx.liveMcpServer = { server, toolNames: new Set(tools.map((tool) => tool.name)), tools, toolNameToPi };
@@ -480,7 +483,7 @@ function buildMcpServers(
 function registerActivatedTools(context: Context, queryCtx: QueryContext): void {
 	const live = queryCtx.liveMcpServer;
 	if (!live || !context.tools?.length) return;
-	const { mcpTools, customToolNameToPi } = resolveMcpTools(context);
+	const { mcpTools, customToolNameToPi } = resolveMcpTools(context, undefined, queryCtx.toolNaming);
 	const added = mcpTools.filter((tool) => !live.toolNames.has(tool.name));
 	if (added.length === 0) return;
 	for (const tool of added) {
@@ -493,7 +496,7 @@ function registerActivatedTools(context: Context, queryCtx: QueryContext): void 
 		if (live.toolNames.has(piName) && !live.toolNameToPi.has(sdkName)) live.toolNameToPi.set(sdkName, piName);
 	}
 	const piNames = added.map((tool) => tool.name);
-	const sdkNames = piNames.map((name) => `${MCP_TOOL_PREFIX}${name}`);
+	const sdkNames = piNames.map((name) => sdkToolName(name, queryCtx.toolNaming));
 	debug(`provider: registered ${piNames.length} tool(s) Pi activated during the query: ${piNames.join(", ")}`);
 	const query = queryCtx.activeQuery as Partial<ChildToolLister> | null;
 	if (!query || typeof query.mcpServerStatus !== "function") return;
@@ -671,9 +674,11 @@ function effortExtraArgs(effort: EffortLevel | undefined): Record<string, string
 // Manual /compact in CC still works (we never invoke it).
 // When connectors are enabled, allow claude.ai cloud MCP servers so the
 // authenticated account's Gmail/Calendar/Drive tools load. Default stays "0".
-function buildChildEnv(account: ClaudeAccountRoute | undefined, enableCloudMcp: boolean): Record<string, string | undefined> {
+function buildChildEnv(account: ClaudeAccountRoute | undefined, enableCloudMcp: boolean, naming: ToolNaming = "prefixed"): Record<string, string | undefined> {
 	return {
 		...(account ? subscriberProfileEnv(account) : process.env),
+		// The names Pi's tools are offered under (tool-names.ts).
+		...toolNamingEnv(naming),
 		ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
 		DISABLE_AUTO_COMPACT: "1",
 		// Static system prompt ("carved slate"). Without it the CLI renders the
@@ -1809,7 +1814,15 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		: undefined;
 	if (attemptBuffer) ctx().currentPiStream = attemptBuffer as unknown as AssistantMessageEventStream;
 
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
+	const bridgeConfig = loadConfig(cwd);
+	const providerSettings = bridgeConfig.provider ?? {};
+	// The names Pi's tools are offered under, fixed for the Pi session (tool-names.ts).
+	const toolNaming: ToolNaming = sessionToolNamingFor(sessionToolNaming, providerSettings.bareToolNames);
+	if (sessionToolNaming === undefined) {
+		setSessionToolNaming(toolNaming);
+		debug(`provider: this session offers Pi's tools under ${toolNaming} names`);
+	}
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, undefined, toolNaming);
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -1837,9 +1850,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 		promptText = "[continue]";
 	}
 
-	const mcpServers = buildMcpServers(mcpTools, ctx(), customToolNameToPi);
-	const bridgeConfig = loadConfig(cwd);
-	const providerSettings = bridgeConfig.provider ?? {};
+	const mcpServers = buildMcpServers(mcpTools, ctx(), customToolNameToPi, toolNaming);
 	// Whether to expose the Claude account's claude.ai cloud MCP connectors
 	// (Gmail/Calendar/Drive). Enabled via env or config; drives setting-sources,
 	// tool isolation, and the ENABLE_CLAUDEAI_MCP_SERVERS child-env gate below.
@@ -1854,9 +1865,9 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 	const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : undefined;
-	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
+	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt, toolNaming) : undefined;
 	// Pi's per-tool notes and rules, the ones it renders for every other model (tool-guidance.ts).
-	const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk) : undefined;
+	const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk, toolNaming) : undefined;
 	if (toolGuidance && (toolGuidance.droppedTools.length > 0 || toolGuidance.droppedRules.length > 0)) {
 		debug(`provider: tool guidance forwards ${toolGuidance.tools.length} tools and ${toolGuidance.rules} rules; left out tools [${toolGuidance.droppedTools.join(", ")}], ${toolGuidance.droppedRules.length} rules`);
 	}
@@ -1907,7 +1918,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 
 	const effort = resolveRequestEffort(queryModel, options?.reasoning, providerSettings);
 	const extraArgs = effortExtraArgs(effort);
-	const childEnv = buildChildEnv(account, enableCloudMcp);
+	const childEnv = buildChildEnv(account, enableCloudMcp, toolNaming);
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		model: queryModel.id,
@@ -1973,7 +1984,7 @@ function streamWithContext(model: Model<any>, context: Context, options?: Simple
 				const { debug: _debug, debugFile: _debugFile, stderr: _stderr, resume: _resume, ...rest } = sideOptions;
 				// Fresh in-process servers: the declarations must match this turn, and a
 				// side question never calls a tool, so the handlers are never reached.
-				const piServers = buildMcpServers(mcpTools, new QueryContext());
+				const piServers = buildMcpServers(mcpTools, new QueryContext(), new Map(), toolNaming);
 				return {
 					...rest,
 					...(piServers || Object.keys(connectorServers).length > 0
@@ -2659,6 +2670,7 @@ export default function (pi: ExtensionAPI) {
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		setSharedSession(null);
+		setSessionToolNaming(undefined);
 		clearSideQuestionBase();
 		keepWarm.cancel();
 		setLastTopLevelRequest(null);
@@ -2676,6 +2688,9 @@ export default function (pi: ExtensionAPI) {
 		// them would --resume the parent's Claude jsonl and leak conversation past the
 		// fork point. Letting the first fork turn rebuild is the correct path.
 		if (event.reason === "startup" || event.reason === "resume") restoreSharedSessionFromPi(ctx);
+		// A session that already ran on the bridge keeps its tool names (tool-names.ts);
+		// a fork inherits its parent's with the parent's entries.
+		setSessionToolNaming(readPersistedToolNaming(ctx.sessionManager));
 		// Live availability flip: re-evaluate credential presence every
 		// session_start so login/logout since load is reflected without /reload.
 		applyProviderRegistration(`session_start:${event.reason}`);

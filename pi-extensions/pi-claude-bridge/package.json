@@ -130,6 +130,15 @@
           "apply": "live"
         },
         {
+          "key": "bareToolNames",
+          "label": "Bare tool names",
+          "description": "Offer Pi's tools to Claude under their own names (bash, read) instead of mcp__custom-tools__bash. Applies to sessions whose first Claude turn comes after the change; a running session keeps the names it started with.",
+          "type": "boolean",
+          "default": true,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
           "key": "keepWarm.enabled",
           "label": "Keep cache warm when idle",
           "description": "Send one small request to a large idle conversation shortly before its prompt cache expires, so the next turn reads the conversation from cache instead of writing it again.",

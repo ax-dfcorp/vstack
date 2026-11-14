@@ -470,7 +470,7 @@ export function processStreamEvent(
 			debug(`processStreamEvent: child-executed tool ${event.content_block.name} [${event.content_block.id}] — not mirrored as a Pi tool call`);
 			return;
 		}
-		if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi)) {
+		if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi, c.toolNaming)) {
 			// Not a tool on the bridge's server: the child runs it on a server of its
 			// own or rejects it. Mirroring it made Pi run rejected calls the model
 			// never saw the output of (child-resolved.ts).
@@ -618,7 +618,7 @@ function appendMissingToolUsesFromAssistant(
 			debug(`assistant message: child-executed tool ${block.name} [${block.id}] — not mirrored as a Pi tool call`);
 			continue;
 		}
-		if (!isPiToolCall(block.name, customToolNameToPi)) {
+		if (!isPiToolCall(block.name, customToolNameToPi, c.toolNaming)) {
 			c.noteChildResolvedToolCall(block.id, block.name);
 			debug(`assistant message: child-resolved tool ${block.name} [${block.id}] — not on the bridge's tool server, not mirrored as a Pi tool call`);
 			continue;
@@ -696,19 +696,25 @@ function appendMissingToolUsesFromAssistant(
  */
 export function noteChildExecutedToolResults(message: SDKMessage): void {
 	const c = ctx();
-	if (c.childExecutedToolCalls.size === 0) return;
+	if (c.childExecutedToolCalls.size === 0 && c.childResolvedCalls.size === 0 && c.connectorCallAudit.size === 0) return;
 	const content = (message as SDKMessage & { message?: { content?: unknown } }).message?.content;
 	if (!Array.isArray(content)) return;
 	for (const block of content) {
 		if (block?.type !== "tool_result") continue;
-		const name = c.childExecutedToolCalls.get(block.tool_use_id);
-		if (!name) continue;
-		if (c.childResolvedCalls.has(block.tool_use_id)) {
+		// Looked up in the query-scoped records, not only in childExecutedToolCalls:
+		// that one is cleared at every child message boundary (resetToolTracking),
+		// and the result of a call the child ran on its own server can arrive after
+		// the next assistant message started (a call issued beside a Pi tool call),
+		// which left a call that ran recorded as `unobserved` at teardown.
+		const resolved = c.childResolvedCalls.get(block.tool_use_id);
+		if (resolved) {
 			const outcome = childResolvedOutcome(block);
 			const recorded = recordChildResolvedResult(c, block.tool_use_id, outcome);
-			debug(`child-resolved tool result: ${name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
+			debug(`child-resolved tool result: ${resolved.name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
 			continue;
 		}
+		const name = c.childExecutedToolCalls.get(block.tool_use_id) ?? c.connectorCallAudit.get(block.tool_use_id)?.name;
+		if (!name) continue;
 		const isError = block.is_error === true;
 		const byteSize = connectorResultByteSize(block.content);
 		const audited = recordConnectorCallResult(c, block.tool_use_id, name, isError, byteSize);
@@ -790,7 +796,7 @@ export function processAssistantMessage(message: SDKMessage, model: Model<any>, 
 				debug(`processAssistantMessage fallback: child-executed tool ${block.name} [${block.id}] — not mirrored as a Pi tool call`);
 				continue;
 			}
-			if (!isPiToolCall(block.name, customToolNameToPi)) {
+			if (!isPiToolCall(block.name, customToolNameToPi, c.toolNaming)) {
 				c.noteChildResolvedToolCall(block.id, block.name);
 				debug(`processAssistantMessage fallback: child-resolved tool ${block.name} [${block.id}] — not on the bridge's tool server, not mirrored as a Pi tool call`);
 				continue;

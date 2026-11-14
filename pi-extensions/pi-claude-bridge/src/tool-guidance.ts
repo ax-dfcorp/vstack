@@ -11,8 +11,10 @@
 //
 // The block is taken from the text Pi rendered, so Claude gets the same words
 // as GPT, with three adjustments for the Claude side:
-// - tool names in the list are the names Claude calls (`mcp__custom-tools__…`);
-//   rules keep Pi's bare names, mapped once by the block's first line;
+// - tool names in the list are the names Claude calls; when the query offers
+//   Pi's tools under their own names (tool-names.ts) the rules' names are the
+//   callable ones, otherwise (`mcp__custom-tools__…`) the rules keep Pi's bare
+//   names, mapped once by the block's first line;
 // - a tool Claude cannot call (not offered over MCP, e.g. a child-native
 //   connector) is left out of the list, and so is every rule that names it;
 // - Pi's two built-in style lines are left out: they are not tool guidance, and
@@ -21,6 +23,7 @@
 // running session as a diff of this part (append-update.ts), never a rebuild.
 
 import { MCP_SERVER_NAME } from "./skills.js";
+import type { ToolNaming } from "./tool-names.js";
 
 export const TOOL_GUIDANCE_TAG = "pi_tool_guidance";
 
@@ -71,7 +74,7 @@ function mentionsTool(rule: string, tool: string): boolean {
  * Build the `<pi_tool_guidance>` append part from Pi's rendered system prompt.
  * `toolNameToSdk` maps each Pi tool Claude can call to the name Claude calls it by.
  */
-export function buildToolGuidanceAppend(systemPrompt: string | undefined, toolNameToSdk: ReadonlyMap<string, string>): ToolGuidance {
+export function buildToolGuidanceAppend(systemPrompt: string | undefined, toolNameToSdk: ReadonlyMap<string, string>, naming: ToolNaming = "prefixed"): ToolGuidance {
 	const result: ToolGuidance = { droppedTools: [], droppedRules: [], tools: [], rules: 0 };
 	const toolsSection = extractPromptSection(systemPrompt, "tools");
 	const rulesSection = extractPromptSection(systemPrompt, "rules");
@@ -115,7 +118,9 @@ export function buildToolGuidanceAppend(systemPrompt: string | undefined, toolNa
 	if (!tools && !rules) return result;
 	const parts = [
 		`<${TOOL_GUIDANCE_TAG}>`,
-		`Pi's notes and rules for the tools in this session, the same ones Pi gives every other model. The rules use Pi's tool names: tool \`name\` is the one you call as \`mcp__${MCP_SERVER_NAME}__name\`.`,
+		naming === "bare"
+			? "Pi's notes and rules for the tools in this session, the same ones Pi gives every other model."
+			: `Pi's notes and rules for the tools in this session, the same ones Pi gives every other model. The rules use Pi's tool names: tool \`name\` is the one you call as \`mcp__${MCP_SERVER_NAME}__name\`.`,
 	];
 	if (tools) parts.push("", "Tools:", tools);
 	if (rules) parts.push("", "Rules:", rules);

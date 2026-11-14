@@ -95,6 +95,7 @@ The bridge also reads `claude-bridge.json` (`~/.pi/agent/claude-bridge.json`, an
 | Model effort overrides | JSON object mapping model IDs to Claude Code efforts, e.g. `{"claude-opus-4-8":"max"}`. Per-model entries beat the global force setting. |
 | Summary model overrides | JSON object naming the model that writes compaction and branch summaries for a session model, e.g. `{"claude-fable-5-1":{"model":"claude-opus-5-5","effort":"high"}}`. Empty keeps every summary on the session model. |
 | Claude executable path | Explicit `claude` binary path; empty auto-detects. |
+| Bare tool names | Offer Pi's tools to Claude under their own names (`bash`, `read`) instead of `mcp__custom-tools__bash`. On by default. Applies to sessions whose first Claude turn comes after the change; a running session keeps the names it started with. Tools of other MCP servers and claude.ai connectors keep their `mcp__<server>__` names. |
 | Keep cache warm when idle | Send one small request to a large idle conversation shortly before its prompt cache expires, so the next turn reads the conversation from cache instead of writing it again. On by default. |
 | Keep-warm after (minutes) | Silence after the last request before the warm-up. Default `53` (the cache lives 60 minutes); 1–59. |
 | Keep-warm minimum context | Only conversations whose last request carried at least this many tokens. Default `100000`. |

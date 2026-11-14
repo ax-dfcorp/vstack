@@ -3,7 +3,8 @@ import { createSession, deleteSession, getSessionPath, normalizeProjectPath, ope
 import { createHash, randomUUID } from "crypto";
 import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { resolve as pathResolve } from "path";
-import { extensionApi, piUI, reportSyntheticToolResultRepair, setSharedSession, sharedSession, type SessionState, type SyncAudit } from "./bridge-state.js";
+import { extensionApi, piUI, reportSyntheticToolResultRepair, sessionToolNaming, setSharedSession, sharedSession, type SessionState, type SyncAudit } from "./bridge-state.js";
+import { persistedToolNaming, type ToolNaming } from "./tool-names.js";
 import { convertPiMessages, sanitizeToolId } from "./convert.js";
 import { withoutSystemMessages } from "./transcript-context.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
@@ -22,6 +23,8 @@ const BRIDGE_SESSION_CUSTOM_TYPE = "claude-bridge-session";
 interface PersistedBridgeSessionState extends SessionState {
 	fingerprint: string;
 	piSessionId?: string;
+	/** The session's tool naming (tool-names.ts); absent in entries written before it existed. */
+	toolNaming?: ToolNaming;
 	updatedAt: string;
 }
 
@@ -63,6 +66,11 @@ function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeS
 		return data as PersistedBridgeSessionState;
 	}
 	return undefined;
+}
+
+/** The tool naming the Pi session's bridge entries fix (tool-names.ts); undefined for a session with no bridge entry. */
+export function readPersistedToolNaming(sessionManager: unknown): ToolNaming | undefined {
+	return persistedToolNaming(latestPersistedBridgeSession(sessionManager));
 }
 
 const PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
@@ -611,6 +619,7 @@ export function schedulePersistSharedSession(ctxLike?: { sessionManager?: unknow
 	// on shutdown rather than dereferencing the ctx proxy from the next tick.
 	const sessionManager = ctxLike.sessionManager;
 	const snapshot = { ...sharedSession };
+	const naming = sessionToolNaming;
 	const timer = setTimeout(() => {
 		scheduledPersistenceTimers.delete(timer);
 		try {
@@ -622,6 +631,7 @@ export function schedulePersistSharedSession(ctxLike?: { sessionManager?: unknow
 				cursor,
 				fingerprint: fingerprintMessages(built.messages.slice(0, cursor)),
 				piSessionId: typeof (sessionManager as any)?.getSessionId === "function" ? (sessionManager as any).getSessionId() : undefined,
+				...(naming ? { toolNaming: naming } : {}),
 				updatedAt: new Date().toISOString(),
 			};
 			extensionApi?.appendEntry(BRIDGE_SESSION_CUSTOM_TYPE, data);

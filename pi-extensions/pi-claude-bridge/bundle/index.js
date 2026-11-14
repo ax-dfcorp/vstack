@@ -32374,6 +32374,8 @@ function managerToConfig(raw) {
   const promptContext = {};
   const appendSystemPrompt = boolFrom(raw, "appendSystemPrompt");
   if (appendSystemPrompt !== void 0) provider.appendSystemPrompt = appendSystemPrompt;
+  const bareToolNames = boolFrom(raw, "bareToolNames");
+  if (bareToolNames !== void 0) provider.bareToolNames = bareToolNames;
   const fastMode = boolFrom(raw, "fastMode");
   if (fastMode !== void 0) provider.fastMode = fastMode;
   if (hasOwn(raw, "forceEffort")) {
@@ -32463,6 +32465,7 @@ function loadConfig(cwd) {
 }
 var PROVIDER_KEYS = /* @__PURE__ */ new Set([
   "appendSystemPrompt",
+  "bareToolNames",
   "connectorWriteMode",
   "enableConnectors",
   "fastMode",
@@ -32510,7 +32513,7 @@ function registerExternalConfigResolver() {
 // src/skills.ts
 var MCP_SERVER_NAME = "custom-tools";
 var MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
-function extractSkillsBlock(systemPrompt) {
+function extractSkillsBlock(systemPrompt, naming = "prefixed") {
   if (!systemPrompt) return void 0;
   const startMarker = "The following skills provide specialized instructions for specific tasks.";
   const endMarker = "</available_skills>";
@@ -32518,7 +32521,8 @@ function extractSkillsBlock(systemPrompt) {
   if (start === -1) return void 0;
   const end = systemPrompt.indexOf(endMarker, start);
   if (end === -1) return void 0;
-  return rewriteSkillsBlock(systemPrompt.slice(start, end + endMarker.length).trim());
+  const block = systemPrompt.slice(start, end + endMarker.length).trim();
+  return naming === "bare" ? block : rewriteSkillsBlock(block);
 }
 function extractMemoryBlock(systemPrompt) {
   if (!systemPrompt) return void 0;
@@ -33485,7 +33489,7 @@ function mentionsTool(rule, tool) {
   const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(^|[^A-Za-z0-9_])${escaped}([^A-Za-z0-9_]|$)`).test(rule);
 }
-function buildToolGuidanceAppend(systemPrompt, toolNameToSdk) {
+function buildToolGuidanceAppend(systemPrompt, toolNameToSdk, naming = "prefixed") {
   const result = { droppedTools: [], droppedRules: [], tools: [], rules: 0 };
   const toolsSection = extractPromptSection(systemPrompt, "tools");
   const rulesSection = extractPromptSection(systemPrompt, "rules");
@@ -33525,13 +33529,29 @@ function buildToolGuidanceAppend(systemPrompt, toolNameToSdk) {
   if (!tools && !rules) return result;
   const parts = [
     `<${TOOL_GUIDANCE_TAG}>`,
-    `Pi's notes and rules for the tools in this session, the same ones Pi gives every other model. The rules use Pi's tool names: tool \`name\` is the one you call as \`mcp__${MCP_SERVER_NAME}__name\`.`
+    naming === "bare" ? "Pi's notes and rules for the tools in this session, the same ones Pi gives every other model." : `Pi's notes and rules for the tools in this session, the same ones Pi gives every other model. The rules use Pi's tool names: tool \`name\` is the one you call as \`mcp__${MCP_SERVER_NAME}__name\`.`
   ];
   if (tools) parts.push("", "Tools:", tools);
   if (rules) parts.push("", "Rules:", rules);
   parts.push(`</${TOOL_GUIDANCE_TAG}>`);
   result.text = parts.join("\n");
   return result;
+}
+
+// src/tool-names.ts
+var SDK_MCP_NO_PREFIX_ENV = "CLAUDE_AGENT_SDK_MCP_NO_PREFIX";
+function sdkToolName(piName, naming) {
+  return naming === "bare" ? piName : `${MCP_TOOL_PREFIX}${piName}`;
+}
+function toolNamingEnv(naming) {
+  return { [SDK_MCP_NO_PREFIX_ENV]: naming === "bare" ? "1" : void 0 };
+}
+function persistedToolNaming(entry) {
+  if (!entry) return void 0;
+  return entry.toolNaming === "bare" || entry.toolNaming === "prefixed" ? entry.toolNaming : "prefixed";
+}
+function sessionToolNamingFor(fixed, bareToolNames) {
+  return fixed ?? (bareToolNames === false ? "prefixed" : "bare");
 }
 
 // src/extract-tool-results.ts
@@ -33703,6 +33723,9 @@ var QueryContext = class {
    *  the Pi tools registered on it, and the query's name maps. Tools Pi activates
    *  during the query are registered on it live (live-tools.ts). */
   liveMcpServer = null;
+  /** The names this query offers Pi's tools under (tool-names.ts); a tool_use
+   *  reaches Pi only under exactly that spelling (child-resolved.ts). */
+  toolNaming = "prefixed";
   /** Set while the child refetches its tool list after a live registration;
    *  tool results are released to the child only after it settles. */
   toolListReady = null;
@@ -34416,6 +34439,10 @@ var piUI;
 function setSharedSession(next) {
   sharedSession = next;
 }
+var sessionToolNaming;
+function setSessionToolNaming(next) {
+  sessionToolNaming = next;
+}
 var lastTopLevelRequest = null;
 function setLastTopLevelRequest(next) {
   lastTopLevelRequest = next;
@@ -34552,10 +34579,10 @@ function __testGetBridgeIntegrityState() {
 // src/child-resolved.ts
 var CHILD_RESOLVED_INTEGRITY_LABEL = "child_resolved_tool_call";
 var REJECTION_MARKER = /No such tool available/;
-function isPiToolCall(name, toolNameToPi) {
-  if (typeof name !== "string" || !toolNameToPi || !name.startsWith(MCP_TOOL_PREFIX)) return false;
+function isPiToolCall(name, toolNameToPi, naming) {
+  if (typeof name !== "string" || !toolNameToPi) return false;
   const piName = toolNameToPi.get(name);
-  return piName !== void 0 && `${MCP_TOOL_PREFIX}${piName}` === name;
+  return piName !== void 0 && sdkToolName(piName, naming) === name;
 }
 function childResolvedOutcome(block) {
   if (block.is_error !== true) return "ran";
@@ -51672,6 +51699,9 @@ function latestPersistedBridgeSession(sessionManager) {
   }
   return void 0;
 }
+function readPersistedToolNaming(sessionManager) {
+  return persistedToolNaming(latestPersistedBridgeSession(sessionManager));
+}
 var PROMPT_SNAPSHOT_ATTACHMENT = "prompt_snapshot";
 function readSessionRecords(jsonlPath) {
   let text;
@@ -52049,6 +52079,7 @@ function schedulePersistSharedSession(ctxLike) {
   if (!extensionApi || !sharedSession || !ctxLike?.sessionManager) return;
   const sessionManager = ctxLike.sessionManager;
   const snapshot = { ...sharedSession };
+  const naming = sessionToolNaming;
   const timer = setTimeout(() => {
     scheduledPersistenceTimers.delete(timer);
     try {
@@ -52060,6 +52091,7 @@ function schedulePersistSharedSession(ctxLike) {
         cursor,
         fingerprint: fingerprintMessages(built.messages.slice(0, cursor)),
         piSessionId: typeof sessionManager?.getSessionId === "function" ? sessionManager.getSessionId() : void 0,
+        ...naming ? { toolNaming: naming } : {},
         updatedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
       extensionApi?.appendEntry(BRIDGE_SESSION_CUSTOM_TYPE, data);
@@ -52694,7 +52726,7 @@ function processStreamEvent(message, customToolNameToPi, model) {
       debug(`processStreamEvent: child-executed tool ${event.content_block.name} [${event.content_block.id}] \u2014 not mirrored as a Pi tool call`);
       return;
     }
-    if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi)) {
+    if (event.content_block?.type === "tool_use" && !isPiToolCall(event.content_block.name, customToolNameToPi, c.toolNaming)) {
       c.noteChildResolvedToolCall(event.content_block.id, event.content_block.name, event.index);
       debug(`processStreamEvent: child-resolved tool ${event.content_block.name} [${event.content_block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
       return;
@@ -52806,7 +52838,7 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
       debug(`assistant message: child-executed tool ${block.name} [${block.id}] \u2014 not mirrored as a Pi tool call`);
       continue;
     }
-    if (!isPiToolCall(block.name, customToolNameToPi)) {
+    if (!isPiToolCall(block.name, customToolNameToPi, c.toolNaming)) {
       c.noteChildResolvedToolCall(block.id, block.name);
       debug(`assistant message: child-resolved tool ${block.name} [${block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
       continue;
@@ -52855,19 +52887,20 @@ function appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameT
 }
 function noteChildExecutedToolResults(message) {
   const c = ctx();
-  if (c.childExecutedToolCalls.size === 0) return;
+  if (c.childExecutedToolCalls.size === 0 && c.childResolvedCalls.size === 0 && c.connectorCallAudit.size === 0) return;
   const content = message.message?.content;
   if (!Array.isArray(content)) return;
   for (const block of content) {
     if (block?.type !== "tool_result") continue;
-    const name = c.childExecutedToolCalls.get(block.tool_use_id);
-    if (!name) continue;
-    if (c.childResolvedCalls.has(block.tool_use_id)) {
+    const resolved = c.childResolvedCalls.get(block.tool_use_id);
+    if (resolved) {
       const outcome = childResolvedOutcome(block);
       const recorded = recordChildResolvedResult(c, block.tool_use_id, outcome);
-      debug(`child-resolved tool result: ${name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
+      debug(`child-resolved tool result: ${resolved.name} [${block.tool_use_id}] outcome=${outcome} recorded=${recorded}`);
       continue;
     }
+    const name = c.childExecutedToolCalls.get(block.tool_use_id) ?? c.connectorCallAudit.get(block.tool_use_id)?.name;
+    if (!name) continue;
     const isError = block.is_error === true;
     const byteSize = connectorResultByteSize(block.content);
     const audited = recordConnectorCallResult(c, block.tool_use_id, name, isError, byteSize);
@@ -52917,7 +52950,7 @@ function processAssistantMessage(message, model, customToolNameToPi) {
         debug(`processAssistantMessage fallback: child-executed tool ${block.name} [${block.id}] \u2014 not mirrored as a Pi tool call`);
         continue;
       }
-      if (!isPiToolCall(block.name, customToolNameToPi)) {
+      if (!isPiToolCall(block.name, customToolNameToPi, c.toolNaming)) {
         c.noteChildResolvedToolCall(block.id, block.name);
         debug(`processAssistantMessage fallback: child-resolved tool ${block.name} [${block.id}] \u2014 not on the bridge's tool server, not mirrored as a Pi tool call`);
         continue;
@@ -53123,7 +53156,7 @@ function pinToolDescription(tool) {
   pinnedToolDescriptions.set(tool.name, { schema, description: tool.description });
   return tool;
 }
-function resolveMcpTools(context, excludeToolName) {
+function resolveMcpTools(context, excludeToolName, naming = "prefixed") {
   const mcpTools = [];
   const customToolNameToSdk = /* @__PURE__ */ new Map();
   const customToolNameToPi = /* @__PURE__ */ new Map();
@@ -53135,7 +53168,7 @@ function resolveMcpTools(context, excludeToolName) {
       debug(`resolveMcpTools: not re-offering child-native tool ${tool.name}`);
       continue;
     }
-    const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
+    const sdkName = sdkToolName(tool.name, naming);
     mcpTools.push(tool);
     const lowerName = tool.name.toLowerCase();
     const collision = customToolNameToSdk.get(lowerName);
@@ -53149,9 +53182,10 @@ function resolveMcpTools(context, excludeToolName) {
   }
   return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
-function buildMcpServers(tools, queryCtx, toolNameToPi = /* @__PURE__ */ new Map()) {
+function buildMcpServers(tools, queryCtx, toolNameToPi = /* @__PURE__ */ new Map(), naming = "prefixed") {
   queryCtx.liveMcpServer = null;
   queryCtx.toolListReady = null;
+  queryCtx.toolNaming = naming;
   if (!tools.length) return void 0;
   const server = u1e({ name: MCP_SERVER_NAME, version: "1.0.0", tools: tools.map((tool) => mcpToolDefinition(tool, queryCtx)) });
   queryCtx.liveMcpServer = { server, toolNames: new Set(tools.map((tool) => tool.name)), tools, toolNameToPi };
@@ -53160,7 +53194,7 @@ function buildMcpServers(tools, queryCtx, toolNameToPi = /* @__PURE__ */ new Map
 function registerActivatedTools(context, queryCtx) {
   const live = queryCtx.liveMcpServer;
   if (!live || !context.tools?.length) return;
-  const { mcpTools, customToolNameToPi } = resolveMcpTools(context);
+  const { mcpTools, customToolNameToPi } = resolveMcpTools(context, void 0, queryCtx.toolNaming);
   const added = mcpTools.filter((tool) => !live.toolNames.has(tool.name));
   if (added.length === 0) return;
   for (const tool of added) {
@@ -53173,7 +53207,7 @@ function registerActivatedTools(context, queryCtx) {
     if (live.toolNames.has(piName) && !live.toolNameToPi.has(sdkName)) live.toolNameToPi.set(sdkName, piName);
   }
   const piNames = added.map((tool) => tool.name);
-  const sdkNames = piNames.map((name) => `${MCP_TOOL_PREFIX}${name}`);
+  const sdkNames = piNames.map((name) => sdkToolName(name, queryCtx.toolNaming));
   debug(`provider: registered ${piNames.length} tool(s) Pi activated during the query: ${piNames.join(", ")}`);
   const query = queryCtx.activeQuery;
   if (!query || typeof query.mcpServerStatus !== "function") return;
@@ -53301,9 +53335,11 @@ function effortExtraArgs(effort) {
   if (effort) extraArgs["thinking-display"] = "summarized";
   return extraArgs;
 }
-function buildChildEnv(account, enableCloudMcp) {
+function buildChildEnv(account, enableCloudMcp, naming = "prefixed") {
   return {
     ...account ? subscriberProfileEnv(account) : process.env,
+    // The names Pi's tools are offered under (tool-names.ts).
+    ...toolNamingEnv(naming),
     ENABLE_CLAUDEAI_MCP_SERVERS: enableCloudMcp ? "1" : "0",
     DISABLE_AUTO_COMPACT: "1",
     // Static system prompt ("carved slate"). Without it the CLI renders the
@@ -54123,7 +54159,14 @@ function streamWithContext(model, context, options) {
   const queryModel = model;
   const attemptBuffer = account ? new RetryEventBuffer(stream, () => ctx().markOutputCommitted()) : void 0;
   if (attemptBuffer) ctx().currentPiStream = attemptBuffer;
-  const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
+  const bridgeConfig = loadConfig(cwd);
+  const providerSettings = bridgeConfig.provider ?? {};
+  const toolNaming = sessionToolNamingFor(sessionToolNaming, providerSettings.bareToolNames);
+  if (sessionToolNaming === void 0) {
+    setSessionToolNaming(toolNaming);
+    debug(`provider: this session offers Pi's tools under ${toolNaming} names`);
+  }
+  const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, void 0, toolNaming);
   const promptBlocks = extractUserPromptBlocks(context.messages);
   let promptText = extractUserPrompt(context.messages) ?? "";
   if (isContinuation && !promptText && !promptBlocks) {
@@ -54142,17 +54185,15 @@ function streamWithContext(model, context, options) {
     });
     promptText = "[continue]";
   }
-  const mcpServers = buildMcpServers(mcpTools, ctx(), customToolNameToPi);
-  const bridgeConfig = loadConfig(cwd);
-  const providerSettings = bridgeConfig.provider ?? {};
+  const mcpServers = buildMcpServers(mcpTools, ctx(), customToolNameToPi, toolNaming);
   const enableCloudMcp = connectorsEnabledFor(bridgeConfig);
   const connectorWriteMode = connectorWriteModeFor(bridgeConfig);
   const connectorServers = enableCloudMcp ? connectorServersSnapshot(account?.configDir) : {};
   const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
   const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : void 0;
   const memoryAppend = appendSystemPrompt ? extractMemoryBlock(context.systemPrompt) : void 0;
-  const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : void 0;
-  const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk) : void 0;
+  const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt, toolNaming) : void 0;
+  const toolGuidance = appendSystemPrompt ? buildToolGuidanceAppend(context.systemPrompt, customToolNameToSdk, toolNaming) : void 0;
   if (toolGuidance && (toolGuidance.droppedTools.length > 0 || toolGuidance.droppedRules.length > 0)) {
     debug(`provider: tool guidance forwards ${toolGuidance.tools.length} tools and ${toolGuidance.rules} rules; left out tools [${toolGuidance.droppedTools.join(", ")}], ${toolGuidance.droppedRules.length} rules`);
   }
@@ -54182,7 +54223,7 @@ function streamWithContext(model, context, options) {
   const prompt = inputChannel.stream;
   const effort = resolveRequestEffort(queryModel, options?.reasoning, providerSettings);
   const extraArgs = effortExtraArgs(effort);
-  const childEnv = buildChildEnv(account, enableCloudMcp);
+  const childEnv = buildChildEnv(account, enableCloudMcp, toolNaming);
   const queryOptions = {
     cwd,
     model: queryModel.id,
@@ -54241,7 +54282,7 @@ function streamWithContext(model, context, options) {
       claudeConfigDir: account?.configDir,
       buildOptions: () => {
         const { debug: _debug, debugFile: _debugFile, stderr: _stderr, resume: _resume, ...rest } = sideOptions;
-        const piServers = buildMcpServers(mcpTools, new QueryContext());
+        const piServers = buildMcpServers(mcpTools, new QueryContext(), /* @__PURE__ */ new Map(), toolNaming);
         return {
           ...rest,
           ...piServers || Object.keys(connectorServers).length > 0 ? { mcpServers: { ...piServers ?? {}, ...connectorServers } } : {},
@@ -54788,6 +54829,7 @@ function index_default(pi2) {
   const clearSession = (event) => {
     debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
     setSharedSession(null);
+    setSessionToolNaming(void 0);
     clearSideQuestionBase();
     keepWarm.cancel();
     setLastTopLevelRequest(null);
@@ -54800,6 +54842,7 @@ function index_default(pi2) {
       resetPinnedToolDescriptions();
     }
     if (event.reason === "startup" || event.reason === "resume") restoreSharedSessionFromPi(ctx2);
+    setSessionToolNaming(readPersistedToolNaming(ctx2.sessionManager));
     applyProviderRegistration(`session_start:${event.reason}`);
   });
   pi2.on("session_shutdown", () => {
@@ -54913,6 +54956,7 @@ export {
   restoreSharedSessionFromPi,
   scheduleToolUseTurnEnd,
   setConnectorCallAuditSink,
+  setSessionToolNaming,
   shouldRestorePersistedBridgeEntry,
   spawnClaudeCodeWithDiagnostics,
   streamClaudeAgentSdk,

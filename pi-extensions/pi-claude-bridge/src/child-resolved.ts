@@ -2,8 +2,9 @@
 //
 // The bridge offers Pi's tools to the child on one in-process MCP server, so a
 // `tool_use` is a request for Pi to execute something only when its name is
-// exactly `mcp__custom-tools__<tool>` for a tool registered on that server
-// (including tools registered live, see live-tools.ts). Every other name is
+// exactly the name of a tool registered on that server (`<tool>` or
+// `mcp__custom-tools__<tool>`, see tool-names.ts), including tools registered
+// live (live-tools.ts). Every other name is
 // resolved by the child alone, without Pi:
 // - a claude.ai connector or an MCP server Claude Code loaded itself (a project
 //   `.mcp.json`, user or local settings) runs it on its own server;
@@ -21,7 +22,7 @@
 // returned, never the arguments or the payload.
 
 import { appendIntegrityEntry } from "./bridge-state.js";
-import { MCP_TOOL_PREFIX } from "./skills.js";
+import { sdkToolName, type ToolNaming } from "./tool-names.js";
 import type { QueryContext, ToolCallDrainCause } from "./query-state.js";
 
 export const CHILD_RESOLVED_INTEGRITY_LABEL = "child_resolved_tool_call";
@@ -31,15 +32,17 @@ export type ChildResolvedOutcome = "ran" | "error" | "rejected" | "unobserved";
 const REJECTION_MARKER = /No such tool available/;
 
 /**
- * Whether a raw SDK tool name is a call for Pi to execute: exactly
- * `mcp__custom-tools__<name>` for a Pi tool registered on this query's server.
+ * Whether a raw SDK tool name is a call for Pi to execute: exactly the name Pi
+ * tool `<name>` has on this query's server (`bash` when the query offers bare
+ * names, `mcp__custom-tools__bash` when it offers prefixed ones; tool-names.ts).
  * `toolNameToPi` is the query's SDK-name → Pi-name map (which also carries
- * lower-cased aliases; an alias is not an exact name and does not count).
+ * lower-cased aliases; an alias is not an exact name and does not count), and
+ * the other mode's spelling is not a name on the server either.
  */
-export function isPiToolCall(name: string | undefined, toolNameToPi: ReadonlyMap<string, string> | undefined): boolean {
-	if (typeof name !== "string" || !toolNameToPi || !name.startsWith(MCP_TOOL_PREFIX)) return false;
+export function isPiToolCall(name: string | undefined, toolNameToPi: ReadonlyMap<string, string> | undefined, naming: ToolNaming): boolean {
+	if (typeof name !== "string" || !toolNameToPi) return false;
 	const piName = toolNameToPi.get(name);
-	return piName !== undefined && `${MCP_TOOL_PREFIX}${piName}` === name;
+	return piName !== undefined && sdkToolName(piName, naming) === name;
 }
 
 /** What the child returned for a call it resolved itself. */

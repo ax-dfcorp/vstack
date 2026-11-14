@@ -2,6 +2,7 @@ import { type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-c
 import { debug, diagDump, diagLogPath } from "./debug.js";
 import { type QueryContext } from "./query-state.js";
 import { summarizeMissingToolNames, type MissingToolResult } from "./tool-pairing-audit.js";
+import type { ToolNaming } from "./tool-names.js";
 
 export interface SessionState {
 	sessionId: string;
@@ -82,6 +83,14 @@ export let piUI: ExtensionUIContext | undefined;
 
 export function setSharedSession(next: SessionState | null): void {
 	sharedSession = next;
+}
+
+/** The names this Pi session offers its tools under, fixed by its first bridge
+ *  query and persisted with its bridge entries (tool-names.ts). */
+export let sessionToolNaming: ToolNaming | undefined;
+
+export function setSessionToolNaming(next: ToolNaming | undefined): void {
+	sessionToolNaming = next;
 }
 
 /** The last model request the top-level conversation sent: when it started

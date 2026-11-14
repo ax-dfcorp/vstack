@@ -182,6 +182,44 @@ describe("a call whose name is not on the bridge's tool server", () => {
 	});
 });
 
+describe("the child's result arriving after the next assistant message started", () => {
+	// Measured 2026-11-14: a `.mcp.json` tool called beside a Pi tool in one message.
+	// The SDK yields the second block's message copy before the child's result,
+	// which clears the per-message tracking (resetToolTracking); the result then
+	// went unrecognized and teardown recorded a call that ran as `unobserved`.
+	it("records a child-run call as ran, once", () => {
+		const map = toolMap(REGISTERED);
+		const c = ctx();
+		c.resetTurnState(model);
+		installFakeStream();
+		processStreamEvent(streamEvent({ type: "message_start", message: { id: "msg_late", usage: { input_tokens: 1, output_tokens: 1 } } }), map, model);
+		streamToolUse(0, "toolu_native_late", "mcp__localsrv__ping", { word: "hello" }, map);
+		streamToolUse(1, "toolu_pi_late", "mcp__custom-tools__bash", { command: "echo NATIVE" }, map);
+		c.resetToolTracking();
+		noteChildExecutedToolResults(childResults([{ id: "toolu_native_late", text: "pong hello" }]));
+		assert.deepEqual(integrity().map(({ name, toolUseId, outcome }) => ({ name, toolUseId, outcome })), [
+			{ name: "mcp__localsrv__ping", toolUseId: "toolu_native_late", outcome: "ran" },
+		]);
+		assert.equal(flushChildResolvedCalls(c, "query-end"), 0, "a recorded call must not be flushed as unobserved");
+	});
+
+	it("records a connector call's result the same way", () => {
+		const map = toolMap(REGISTERED);
+		const c = ctx();
+		c.resetTurnState(model);
+		installFakeStream();
+		processStreamEvent(streamEvent({ type: "message_start", message: { id: "msg_conn", usage: { input_tokens: 1, output_tokens: 1 } } }), map, model);
+		streamToolUse(0, "toolu_conn_late", "mcp__claude_ai_Slack__slack_read_channel", { channel_id: "C1" }, map);
+		c.resetToolTracking();
+		noteChildExecutedToolResults(childResults([{ id: "toolu_conn_late", text: "messages" }]));
+		const audit = entries.filter((entry) => entry.customType === "claude-bridge-connector-call").map((entry) => entry.data);
+		assert.deepEqual(audit.map(({ name, toolUseId, outcome }) => ({ name, toolUseId, outcome })), [
+			{ name: "mcp__claude_ai_Slack__slack_read_channel", toolUseId: "toolu_conn_late", outcome: "ok" },
+		]);
+		assert.equal(c.connectorCallAudit.get("toolu_conn_late").recorded, true);
+	});
+});
+
 describe("calls to registered tools are unchanged", () => {
 	it("mirrors 100 qualified calls, including a tool registered live mid-turn, with the same ids and names", () => {
 		const map = toolMap(REGISTERED);
@@ -200,6 +238,77 @@ describe("calls to registered tools are unchanged", () => {
 			const sdkName = `mcp__custom-tools__${piName}`;
 			streamToolUse(i, `toolu_q_${i}`, sdkName, { n: i }, map);
 			expected.push([`toolu_q_${i}`, mapToolName(sdkName, map)]);
+		}
+		const piCalls = c.turnBlocks.filter((block) => block.type === "toolCall");
+		assert.deepEqual(piCalls.map((block) => [block.id, block.name]), expected);
+		assert.deepEqual(piCalls.map((block) => block.arguments.n), Array.from({ length: 100 }, (_, i) => i));
+		assert.equal(c.childResolvedCalls.size, 0);
+		assert.equal(piCalls.filter((block) => block.name === "hym_db_query").length, 10);
+	});
+});
+
+// With CLAUDE_AGENT_SDK_MCP_NO_PREFIX the query offers Pi's tools under their own
+// names (tool-names.ts). The exact-name rule is the same: a call reaches Pi only
+// under the name the tool has on the server, never another casing, a PascalCase
+// guess, the prefixed spelling of the other mode, or an inactive tool.
+describe("bare tool names (no-prefix mode)", () => {
+	function bareMap(piNames) {
+		const map = new Map();
+		for (const name of piNames) {
+			map.set(name, name);
+			map.set(name.toLowerCase(), name);
+		}
+		return map;
+	}
+	const BARE_REJECTED = [
+		"Bash", "BASH", "Read", "HymDbQuery",
+		"mcp__custom-tools__bash", // the prefixed spelling is not a name on a bare server
+		"mcp__custom-tools__mcp__mcpScript",
+		"hym_db_query", // not active
+		"no_such_tool_xyz",
+	];
+
+	it("isPiToolCall accepts exactly the registered bare names", () => {
+		const map = bareMap(REGISTERED);
+		for (const name of REGISTERED) assert.equal(isPiToolCall(name, map, "bare"), true, name);
+		for (const name of [...BARE_REJECTED, "mcpscript", "mcp__localsrv__ping", "mcp__claude_ai_Slack__slack_read_channel", "", undefined]) {
+			assert.equal(isPiToolCall(name, map, "bare"), false, String(name));
+		}
+		// The bare spelling is not a name on a prefixed server either.
+		assert.equal(isPiToolCall("bash", toolMap(REGISTERED), "prefixed"), false);
+	});
+
+	it("never mirrors a rejected shape to Pi; the bare call in the same message is mirrored under its own id", () => {
+		const map = bareMap(REGISTERED);
+		const c = ctx();
+		c.resetTurnState(model);
+		c.toolNaming = "bare";
+		const events = installFakeStream();
+		processStreamEvent(streamEvent({ type: "message_start", message: { id: "msg_b1", usage: { input_tokens: 1, output_tokens: 1 } } }), map, model);
+		BARE_REJECTED.forEach((name, index) => streamToolUse(index, `toolu_brej_${index}`, name, { command: "echo once" }, map));
+		streamToolUse(BARE_REJECTED.length, "toolu_bok", "bash", { command: "echo once" }, map);
+		const piCalls = c.turnBlocks.filter((block) => block.type === "toolCall");
+		assert.deepEqual(piCalls.map((block) => [block.id, block.name, block.arguments.command]), [["toolu_bok", "bash", "echo once"]]);
+		assert.deepEqual(c.turnToolCallIds, ["toolu_bok"]);
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 1);
+		assert.deepEqual([...c.childResolvedCalls.keys()], BARE_REJECTED.map((_, index) => `toolu_brej_${index}`));
+	});
+
+	it("mirrors 100 bare calls, including a tool registered live mid-turn, with the same ids, names, and arguments", () => {
+		const map = bareMap(REGISTERED);
+		const c = ctx();
+		c.resetTurnState(model);
+		c.toolNaming = "bare";
+		installFakeStream();
+		processStreamEvent(streamEvent({ type: "message_start", message: { id: "msg_b2", usage: { input_tokens: 1, output_tokens: 1 } } }), map, model);
+		const expected = [];
+		for (let i = 0; i < 100; i++) {
+			if (i === 50) {
+				map.set("hym_db_query", "hym_db_query");
+			}
+			const piName = i >= 50 && i % 5 === 0 ? "hym_db_query" : REGISTERED[i % REGISTERED.length];
+			streamToolUse(i, `toolu_bq_${i}`, piName, { n: i }, map);
+			expected.push([`toolu_bq_${i}`, piName]);
 		}
 		const piCalls = c.turnBlocks.filter((block) => block.type === "toolCall");
 		assert.deepEqual(piCalls.map((block) => [block.id, block.name]), expected);

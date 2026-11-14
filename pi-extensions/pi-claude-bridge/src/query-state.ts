@@ -10,6 +10,7 @@ import type { AssistantMessage, AssistantMessageEventStream, Model } from "@eare
 import type { McpResult } from "./extract-tool-results.js";
 import type { QueryInputChannel } from "./input-channel.js";
 import type { DeferredUserPrompt } from "./user-prompt.js";
+import type { ToolNaming } from "./tool-names.js";
 
 /** See QueryContext.liveMcpServer. */
 export interface LiveMcpServer {
@@ -337,6 +338,9 @@ export class QueryContext {
 	 *  the Pi tools registered on it, and the query's name maps. Tools Pi activates
 	 *  during the query are registered on it live (live-tools.ts). */
 	liveMcpServer: LiveMcpServer | null = null;
+	/** The names this query offers Pi's tools under (tool-names.ts); a tool_use
+	 *  reaches Pi only under exactly that spelling (child-resolved.ts). */
+	toolNaming: ToolNaming = "prefixed";
 	/** Set while the child refetches its tool list after a live registration;
 	 *  tool results are released to the child only after it settles. */
 	toolListReady: Promise<void> | null = null;
