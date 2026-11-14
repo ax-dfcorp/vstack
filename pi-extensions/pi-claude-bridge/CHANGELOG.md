@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### A tool a loader turns on mid-turn can be called in that same turn
+
+A Pi tool that activates other tools while it runs (pi-local's `hym_ops_tools` loads the HYM database, Vercel, and migration tools) used to make them callable only from the next turn: the model's call in the same turn got `No such tool available`. The bridge now registers newly active tools on the running query's tool server and hands the loader's result back only after Claude Code lists them (about 25 ms), so the model sees the new tool before its next request. Prompt caching is unchanged: Claude Code announces the tool after the conversation instead of changing the tool block. Measured 2026-11-14 with a throwaway loader in a copy of the package: 10 of 10 Haiku 5.5 runs, plus one Opus 5.5 and one Fable 5.2 run, called the new tool in the same turn and got its result, with 0 duplicate executions, every tool call paired with one result, and the request after the refresh reading 100-102% of the previously cached prefix. Test: `tests/unit-live-tool-registration.mjs`.
+
 ### A payment or sign-in problem on one account no longer stops a turn midway
 
 When one subscription account was refused after a turn had already produced output or used a tool ("Claude Code can't use your Claude subscription, usually because a payment is past due …"), the run stopped until the user typed a prompt, although other accounts were available: only usage limits were handed to Pi's auto-retry, and the CLI's copy contains "billing", which Pi treats as terminal. A post-output `billing` or `auth` failure now reserves the next account and is surfaced as "Claude provider returned an error on <account> (…) — Pi auto-retry resumes this turn on <next>", so Pi continues the turn there. With no other account the original message is kept. Before any output these failures already moved to another account. Tests: `tests/unit-account-rotation-stream.mjs` (payment copy from 2026-11-13).

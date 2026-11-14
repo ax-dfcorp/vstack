@@ -11,6 +11,18 @@ import type { McpResult } from "./extract-tool-results.js";
 import type { QueryInputChannel } from "./input-channel.js";
 import type { DeferredUserPrompt } from "./user-prompt.js";
 
+/** See QueryContext.liveMcpServer. */
+export interface LiveMcpServer {
+	/** The server config handed to the SDK; `instance` is the live MCP server. */
+	server: { instance: { registerTool: (...args: any[]) => unknown } };
+	/** Pi tool names registered on the server. */
+	toolNames: Set<string>;
+	/** The query's tool list (shared with the side-question base). */
+	tools: unknown[];
+	/** SDK name → Pi name map the query's stream processing reads. */
+	toolNameToPi: Map<string, string>;
+}
+
 export interface PendingToolCall {
 	toolName: string;
 	resolve: (result: McpResult) => void;
@@ -321,6 +333,13 @@ export class QueryContext {
 	 *  written here; consumeQuery closes it at `result`, which is also what ends
 	 *  the query. Null for continuation queries, which use a one-shot prompt. */
 	inputChannel: QueryInputChannel | null = null;
+	/** This query's in-process MCP server (the one Claude calls Pi tools through),
+	 *  the Pi tools registered on it, and the query's name maps. Tools Pi activates
+	 *  during the query are registered on it live (live-tools.ts). */
+	liveMcpServer: LiveMcpServer | null = null;
+	/** Set while the child refetches its tool list after a live registration;
+	 *  tool results are released to the child only after it settles. */
+	toolListReady: Promise<void> | null = null;
 	private querySettledPromise: Promise<void> = Promise.resolve();
 	private resolveQuerySettled: (() => void) | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;

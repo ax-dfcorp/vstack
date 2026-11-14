@@ -33426,6 +33426,36 @@ function buildModels(piAiModels) {
   }));
 }
 
+// src/live-tools.ts
+var LIVE_TOOL_LIST_TIMEOUT_MS = 3e3;
+var LIVE_TOOL_LIST_POLL_MS = 20;
+function listsAll(server, sdkNames, piNames) {
+  const listed = new Set((server.tools ?? []).map((tool) => tool.name));
+  return piNames.every((name, index) => listed.has(name) || listed.has(sdkNames[index]));
+}
+async function waitForChildToolList(lister, serverName, piNames, sdkNames, options = {}) {
+  const timeoutMs = options.timeoutMs ?? LIVE_TOOL_LIST_TIMEOUT_MS;
+  const pollMs = options.pollMs ?? LIVE_TOOL_LIST_POLL_MS;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms2) => new Promise((resolve5) => setTimeout(resolve5, ms2)));
+  const started = now();
+  let polls = 0;
+  for (; ; ) {
+    polls += 1;
+    let servers;
+    try {
+      servers = await lister.mcpServerStatus();
+    } catch (error51) {
+      return { outcome: "error", elapsedMs: now() - started, polls, error: error51 instanceof Error ? error51.message : String(error51) };
+    }
+    const server = Array.isArray(servers) ? servers.find((entry) => entry?.name === serverName) : void 0;
+    if (!server || !Array.isArray(server.tools)) return { outcome: "unsupported", elapsedMs: now() - started, polls };
+    if (listsAll(server, sdkNames, piNames)) return { outcome: "listed", elapsedMs: now() - started, polls };
+    if (now() - started >= timeoutMs) return { outcome: "timeout", elapsedMs: now() - started, polls };
+    await sleep(pollMs);
+  }
+}
+
 // src/tool-guidance.ts
 var TOOL_GUIDANCE_TAG = "pi_tool_guidance";
 var DROPPED_BUILTIN_RULES = /* @__PURE__ */ new Set([
@@ -33669,6 +33699,13 @@ var QueryContext = class {
    *  written here; consumeQuery closes it at `result`, which is also what ends
    *  the query. Null for continuation queries, which use a one-shot prompt. */
   inputChannel = null;
+  /** This query's in-process MCP server (the one Claude calls Pi tools through),
+   *  the Pi tools registered on it, and the query's name maps. Tools Pi activates
+   *  during the query are registered on it live (live-tools.ts). */
+  liveMcpServer = null;
+  /** Set while the child refetches its tool list after a live registration;
+   *  tool results are released to the child only after it settles. */
+  toolListReady = null;
   querySettledPromise = Promise.resolve();
   resolveQuerySettled = null;
   currentPiStream = null;
@@ -53039,85 +53076,121 @@ function resolveMcpTools(context, excludeToolName) {
   }
   return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
-function buildMcpServers(tools, queryCtx) {
+function buildMcpServers(tools, queryCtx, toolNameToPi = /* @__PURE__ */ new Map()) {
+  queryCtx.liveMcpServer = null;
+  queryCtx.toolListReady = null;
   if (!tools.length) return void 0;
-  const mcpTools = tools.map((tool) => {
-    const inputSchema = jsonSchemaToZodShape(tool.parameters);
-    const normalizeRecorded = (recorded) => {
-      const validated = validateAgainstShape(inputSchema, recorded);
-      return validated ? mapToolArgs(tool.name, validated) : void 0;
-    };
-    return {
-      name: tool.name,
-      description: tool.description,
-      inputSchema,
-      handler: async (args) => {
-        const mappedArgs = mapToolArgs(tool.name, args);
-        const claim = await queryCtx.claimToolCallWhenSettled(tool.name, mappedArgs, { normalizeRecorded });
-        const toolCallId = claim.toolCallId;
-        if (!toolCallId) {
-          debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
-          diagDump("tool_handler_unmatched", {
-            toolName: tool.name,
-            argKeys: argKeys(mappedArgs),
-            available: claim.available,
-            turnToolCallIds: queryCtx.turnToolCallIds,
-            turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls)
-          });
-          appendIntegrityEntry("tool_handler_unmatched", {
-            toolName: tool.name,
-            argKeys: argKeys(mappedArgs),
-            available: claim.available,
-            turnToolCallIds: queryCtx.turnToolCallIds
-          });
-          return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true };
-        }
-        queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
-        if (claim.argsMismatch) {
-          debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
-          diagDump("tool_claim_args_mismatch", {
-            toolName: tool.name,
-            toolCallId,
-            handlerArgKeys: argKeys(mappedArgs),
-            recordedArgKeys: claim.recordedArgKeys ?? []
-          });
-        } else if (claim.match !== "tool-args" || claim.ambiguous || claim.waited) {
-          debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}${claim.waited ? " after waiting for records to finalize" : ""}`);
-        }
-        if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
-          const result = queryCtx.pendingResults.get(toolCallId);
-          queryCtx.pendingResults.delete(toolCallId);
-          queryCtx.markToolResultResolved(toolCallId);
-          debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 resolved from queue (${queryCtx.pendingResults.size} remaining)`);
-          return result;
-        }
-        if (isUndeliverableToolCall(queryCtx, toolCallId)) {
-          debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 undeliverable: pi turn ended without this call; failing fast`);
-          diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
-          appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
-          queryCtx.markToolResultResolved(toolCallId);
-          return undeliveredToolCallResult(tool.name);
-        }
-        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 waiting`);
-        scheduleToolUseTurnEnd(
-          queryCtx,
-          () => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
-          `mcp-invocation:${tool.name}`
-        );
-        return new Promise((resolve5) => {
-          queryCtx.pendingToolCalls.set(toolCallId, {
-            toolName: tool.name,
-            resolve: (result) => {
-              queryCtx.markToolResultResolved(toolCallId);
-              resolve5(result);
-            }
-          });
-        });
-      }
-    };
-  });
-  const server = u1e({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
+  const server = u1e({ name: MCP_SERVER_NAME, version: "1.0.0", tools: tools.map((tool) => mcpToolDefinition(tool, queryCtx)) });
+  queryCtx.liveMcpServer = { server, toolNames: new Set(tools.map((tool) => tool.name)), tools, toolNameToPi };
   return { [MCP_SERVER_NAME]: server };
+}
+function registerActivatedTools(context, queryCtx) {
+  const live = queryCtx.liveMcpServer;
+  if (!live || !context.tools?.length) return;
+  const { mcpTools, customToolNameToPi } = resolveMcpTools(context);
+  const added = mcpTools.filter((tool) => !live.toolNames.has(tool.name));
+  if (added.length === 0) return;
+  for (const tool of added) {
+    const definition = mcpToolDefinition(tool, queryCtx);
+    live.server.instance.registerTool(definition.name, { description: definition.description, inputSchema: definition.inputSchema }, definition.handler);
+    live.toolNames.add(tool.name);
+    live.tools.push(tool);
+  }
+  for (const [sdkName, piName] of customToolNameToPi) {
+    if (live.toolNames.has(piName) && !live.toolNameToPi.has(sdkName)) live.toolNameToPi.set(sdkName, piName);
+  }
+  const piNames = added.map((tool) => tool.name);
+  const sdkNames = piNames.map((name) => `${MCP_TOOL_PREFIX}${name}`);
+  debug(`provider: registered ${piNames.length} tool(s) Pi activated during the query: ${piNames.join(", ")}`);
+  const query = queryCtx.activeQuery;
+  if (!query || typeof query.mcpServerStatus !== "function") return;
+  const ready = waitForChildToolList(query, MCP_SERVER_NAME, piNames, sdkNames).then((result) => {
+    debug(`provider: child tool list after live registration: ${result.outcome} in ${result.elapsedMs}ms (${result.polls} polls)${result.error ? `: ${result.error}` : ""}`);
+    if (result.outcome !== "listed") diagDump("live_tool_list_unconfirmed", { toolNames: piNames, ...result });
+    if (queryCtx.toolListReady === ready) queryCtx.toolListReady = null;
+  });
+  queryCtx.toolListReady = ready;
+}
+function releaseToolResult(queryCtx, release) {
+  const ready = queryCtx.toolListReady;
+  if (ready) void ready.then(release);
+  else release();
+}
+function mcpToolDefinition(tool, queryCtx) {
+  const inputSchema = jsonSchemaToZodShape(tool.parameters);
+  const normalizeRecorded = (recorded) => {
+    const validated = validateAgainstShape(inputSchema, recorded);
+    return validated ? mapToolArgs(tool.name, validated) : void 0;
+  };
+  return {
+    name: tool.name,
+    description: tool.description,
+    inputSchema,
+    handler: async (args) => {
+      const mappedArgs = mapToolArgs(tool.name, args);
+      const claim = await queryCtx.claimToolCallWhenSettled(tool.name, mappedArgs, { normalizeRecorded });
+      const toolCallId = claim.toolCallId;
+      if (!toolCallId) {
+        debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
+        diagDump("tool_handler_unmatched", {
+          toolName: tool.name,
+          argKeys: argKeys(mappedArgs),
+          available: claim.available,
+          turnToolCallIds: queryCtx.turnToolCallIds,
+          turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls)
+        });
+        appendIntegrityEntry("tool_handler_unmatched", {
+          toolName: tool.name,
+          argKeys: argKeys(mappedArgs),
+          available: claim.available,
+          turnToolCallIds: queryCtx.turnToolCallIds
+        });
+        return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true };
+      }
+      queryCtx.recordAuthoritativeToolCallArgs(toolCallId, mappedArgs);
+      if (claim.argsMismatch) {
+        debug(`mcp handler: ${tool.name} [${toolCallId}] claimed sole same-name call despite args mismatch`);
+        diagDump("tool_claim_args_mismatch", {
+          toolName: tool.name,
+          toolCallId,
+          handlerArgKeys: argKeys(mappedArgs),
+          recordedArgKeys: claim.recordedArgKeys ?? []
+        });
+      } else if (claim.match !== "tool-args" || claim.ambiguous || claim.waited) {
+        debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}${claim.waited ? " after waiting for records to finalize" : ""}`);
+      }
+      if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
+        if (queryCtx.toolListReady) await queryCtx.toolListReady;
+        const result = queryCtx.pendingResults.get(toolCallId);
+        queryCtx.pendingResults.delete(toolCallId);
+        queryCtx.markToolResultResolved(toolCallId);
+        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 resolved from queue (${queryCtx.pendingResults.size} remaining)`);
+        return result;
+      }
+      if (isUndeliverableToolCall(queryCtx, toolCallId)) {
+        debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 undeliverable: pi turn ended without this call; failing fast`);
+        diagDump("undelivered_tool_call_failed_fast", { toolName: tool.name, toolCallId, site: "handler" });
+        appendIntegrityEntry("undelivered_tool_call_failed_fast", { count: 1, toolNames: [tool.name], site: "handler" });
+        queryCtx.markToolResultResolved(toolCallId);
+        return undeliveredToolCallResult(tool.name);
+      }
+      debug(`mcp handler: ${tool.name} [${toolCallId}] \u2192 waiting`);
+      scheduleToolUseTurnEnd(
+        queryCtx,
+        () => finalizeToolUseTurnFromMcpInvocation(queryCtx, toolCallId, tool.name, mappedArgs),
+        `mcp-invocation:${tool.name}`
+      );
+      return new Promise((resolve5) => {
+        queryCtx.pendingToolCalls.set(toolCallId, {
+          toolName: tool.name,
+          resolve: (result) => {
+            queryCtx.markToolResultResolved(toolCallId);
+            resolve5(result);
+          }
+        });
+      });
+    }
+  };
 }
 var REASONING_TO_EFFORT = {
   minimal: "low",
@@ -53826,6 +53899,7 @@ function streamWithContext(model, context, options) {
         }
       }
     }
+    registerActivatedTools(context, queryCtx);
     const allResults = extractAllToolResults2(context);
     debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
     const unmatchedResultIds = [];
@@ -53842,7 +53916,7 @@ function streamWithContext(model, context, options) {
         const pending = queryCtx.pendingToolCalls.get(id2);
         queryCtx.pendingToolCalls.delete(id2);
         debug(`provider: resolving ${pending.toolName} [${id2}]${result.isError ? " (error)" : ""}`, JSON.stringify(result.content).slice(0, 200));
-        pending.resolve(result);
+        releaseToolResult(queryCtx, () => pending.resolve(result));
       } else if (id2) {
         queryCtx.pendingResults.set(id2, result);
         debug(`provider: queued result [${id2}] (${queryCtx.pendingResults.size} pending)`);
@@ -53995,7 +54069,7 @@ function streamWithContext(model, context, options) {
     });
     promptText = "[continue]";
   }
-  const mcpServers = buildMcpServers(mcpTools, ctx());
+  const mcpServers = buildMcpServers(mcpTools, ctx(), customToolNameToPi);
   const bridgeConfig = loadConfig(cwd);
   const providerSettings = bridgeConfig.provider ?? {};
   const enableCloudMcp = connectorsEnabledFor(bridgeConfig);
