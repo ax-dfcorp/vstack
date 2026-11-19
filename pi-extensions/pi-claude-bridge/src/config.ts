@@ -29,6 +29,17 @@ export interface KeepWarmConfig {
 	maxWarms?: number;
 }
 
+export interface IdleCompactConfig {
+	/** Default false. `CLAUDE_BRIDGE_IDLE_COMPACT=0|1` overrides it. */
+	enabled?: boolean;
+	/** Minutes since the conversation's last cache refresh after which its cache counts as expired (default 60; 60-1440). */
+	idleMinutes?: number;
+	/** Only conversations whose last request carried at least this many tokens (see idle-compact.ts for the default). */
+	minContextTokens?: number;
+	/** Session model ids it applies to (default the Fable models). */
+	models?: string[];
+}
+
 export type BridgeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface SummaryModelOverride {
@@ -108,6 +119,11 @@ export interface Config {
 		 * and the next turn then re-writes all of it.
 		 */
 		keepWarm?: KeepWarmConfig;
+		/**
+		 * Summarize a large conversation before the user's next message when its
+		 * prompt cache has expired (idle-compact.ts). Off by default.
+		 */
+		idleCompact?: IdleCompactConfig;
 	};
 	/** Extra Pi context forwarded to Claude Code on top of AGENTS.md + skills. */
 	promptContext?: {
@@ -372,6 +388,23 @@ export function normalizeKeepWarm(value: unknown): KeepWarmConfig | undefined {
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
+export function normalizeIdleCompact(value: unknown): IdleCompactConfig | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const out: IdleCompactConfig = {};
+	if (typeof record.enabled === "boolean") out.enabled = record.enabled;
+	const idleMinutes = boundedNumber(record.idleMinutes, 60, 1440);
+	if (idleMinutes !== undefined) out.idleMinutes = idleMinutes;
+	const minContextTokens = boundedNumber(record.minContextTokens, 0, 10_000_000);
+	if (minContextTokens !== undefined) out.minContextTokens = Math.round(minContextTokens);
+	const rawModels = typeof record.models === "string" ? record.models.split(",") : record.models;
+	if (Array.isArray(rawModels)) {
+		const models = rawModels.filter((model): model is string => typeof model === "string").map((model) => model.trim()).filter(Boolean);
+		out.models = [...new Set(models)];
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeProviderConfig(provider: Config["provider"] | undefined): Config["provider"] {
 	if (!provider) return {};
 	const raw = provider as SettingsRecord;
@@ -398,6 +431,9 @@ function normalizeProviderConfig(provider: Config["provider"] | undefined): Conf
 	const keepWarm = normalizeKeepWarm(raw.keepWarm);
 	if (keepWarm) out.keepWarm = keepWarm;
 	else delete out.keepWarm;
+	const idleCompact = normalizeIdleCompact(raw.idleCompact);
+	if (idleCompact) out.idleCompact = idleCompact;
+	else delete out.idleCompact;
 	return out;
 }
 
@@ -438,6 +474,13 @@ function managerToConfig(raw: SettingsRecord): Partial<Config> {
 		maxWarms: raw["keepWarm.maxWarms"],
 	});
 	if (keepWarm) provider.keepWarm = keepWarm;
+	const idleCompact = normalizeIdleCompact({
+		enabled: raw["idleCompact.enabled"],
+		idleMinutes: raw["idleCompact.idleMinutes"],
+		minContextTokens: raw["idleCompact.minContextTokens"],
+		models: raw["idleCompact.models"],
+	});
+	if (idleCompact) provider.idleCompact = idleCompact;
 
 	const includeAppendSystemPromptMd = boolFrom(raw, "includeAppendSystemPromptMd");
 	if (includeAppendSystemPromptMd !== undefined) promptContext.includeAppendSystemPromptMd = includeAppendSystemPromptMd;
@@ -489,10 +532,11 @@ function legacyLayers(cwd: string): LegacyLayer[] {
 	return [...layers, { path: projectPath, config: legacyFileConfig(projectPath) }];
 }
 
-/** Later provider settings win key by key; `keepWarm` merges field by field, so one layer can change a single knob. */
+/** Later provider settings win key by key; `keepWarm` and `idleCompact` merge field by field, so one layer can change a single knob. */
 function mergeProvider(base: Config["provider"] | undefined, next: Config["provider"] | undefined): Config["provider"] {
 	const merged = { ...base, ...next };
 	if (base?.keepWarm && next?.keepWarm) merged.keepWarm = { ...normalizeKeepWarm(base.keepWarm), ...normalizeKeepWarm(next.keepWarm) };
+	if (base?.idleCompact && next?.idleCompact) merged.idleCompact = { ...normalizeIdleCompact(base.idleCompact), ...normalizeIdleCompact(next.idleCompact) };
 	return merged;
 }
 
@@ -539,10 +583,12 @@ const PROMPT_CONTEXT_KEYS = new Set([
 ]);
 
 const KEEP_WARM_KEYS = new Set(["keepWarm.enabled", "keepWarm.afterMinutes", "keepWarm.minContextTokens", "keepWarm.maxWarms"]);
+const IDLE_COMPACT_KEYS = new Set(["idleCompact.enabled", "idleCompact.idleMinutes", "idleCompact.minContextTokens", "idleCompact.models"]);
 
 function configValueForKey(config: Partial<Config>, key: string): unknown {
 	if (key === "enabled") return config.enabled;
 	if (KEEP_WARM_KEYS.has(key)) return normalizeProviderConfig(config.provider)?.keepWarm?.[key.slice("keepWarm.".length) as keyof KeepWarmConfig];
+	if (IDLE_COMPACT_KEYS.has(key)) return normalizeProviderConfig(config.provider)?.idleCompact?.[key.slice("idleCompact.".length) as keyof IdleCompactConfig];
 	if (PROVIDER_KEYS.has(key)) return normalizeProviderConfig(config.provider)?.[key as keyof NonNullable<Config["provider"]>];
 	if (PROMPT_CONTEXT_KEYS.has(key)) return config.promptContext?.[key as keyof NonNullable<Config["promptContext"]>];
 	return undefined;

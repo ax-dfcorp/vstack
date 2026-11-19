@@ -175,6 +175,33 @@
           "apply": "live"
         },
         {
+          "key": "idleCompact.enabled",
+          "label": "Summarize first after a long idle",
+          "description": "Before the next message to a large conversation whose prompt cache has expired, compact it (the summary model override writes the summary) instead of re-writing the whole conversation. Off by default.",
+          "type": "boolean",
+          "default": false,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
+          "key": "idleCompact.idleMinutes",
+          "label": "Idle limit (minutes)",
+          "description": "Time since the conversation's last request or warm-up after which its cache counts as expired. The cache lives 60 minutes; 60-1440.",
+          "type": "number",
+          "default": 60,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
+          "key": "idleCompact.minContextTokens",
+          "label": "Summarize-first minimum context",
+          "description": "Only conversations whose last request carried at least this many tokens are summarized first.",
+          "type": "number",
+          "default": 250000,
+          "category": "Claude Code",
+          "apply": "live"
+        },
+        {
           "key": "pathToClaudeCodeExecutable",
           "label": "Claude executable path",
           "description": "Optional explicit path to the claude binary. If empty, the bridge auto-detects claude or claude-code on PATH.",

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Summarize first when returning to a large idle conversation (off by default)
+
+Coming back to a conversation more than an hour after its last request, the prompt cache is gone and the next turn re-writes the whole context; on Fable that was 77 returns and 711.7M weekly-limit units of the windows that followed them in 2026-11-12..19. With `provider.idleCompact.enabled` (or `CLAUDE_BRIDGE_IDLE_COMPACT=1`), the bridge's Pi `input` handler runs Pi's own compaction before the message when the session model is listed (default Fable 5.2 and 5.1), the last request or recorded warm-up is at least `idleMinutes` (60) old, and its context was at least `minContextTokens` (250,000). The summary goes through the existing summary path (Opus for Fable through `summaryModelOverrides`). A failed compaction sends the message on the full context as before; a compaction the user stops drops the message. While the feature is on, each successful keep-warm is recorded as a `claude-bridge-cache-warm` session entry so a process started after Daseo's idle unload still knows the cache outlived the last request. Tests: `tests/unit-idle-compact.mjs`. PoC data and scripts: `poc-idle-compact/`.
+
 ### Claude calls Pi's tools by their own names in new sessions
 
 Pi's tools reached Claude as `mcp__custom-tools__bash`, `mcp__custom-tools__read`, and so on, while Pi, its tool guidance, skills, and briefings call them `bash` and `read`. Claude models called the bare name anyway: 73 `No such tool available` rejections in 14 days, about 2% of sessions, 30 of them the session's first call, each a lost tool call. The bridge now sets Claude Code's documented `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1` for its own tool server, so a new session offers `bash`, `read`, `hym_db_query` under those names. Tools of other MCP servers and claude.ai connectors keep their `mcp__<server>__` names. A call still reaches Pi only under the exact name the tool has (`Bash`, `BASH`, the old prefixed name, an inactive or unknown tool run nothing), Claude Code's built-ins stay removed, and the existing auto-allow rule still covers the tools and nothing else.

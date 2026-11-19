@@ -3,6 +3,7 @@ import * as piAi from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
+	type ExtensionContext,
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
@@ -40,6 +41,7 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 import { resolveGetModels } from "./pi-ai-compat.js";
 import { toLegacyContext } from "./transcript-context.js";
 import { driveSummaryQuery, isOneShotSummaryRequest, isSelfContainedCompletion, streamOneShotSummary } from "./one-shot-summary.js";
+import { CACHE_WARM_CUSTOM_TYPE, idleCompactRefusal, idleCompactSettings, mergeCacheActivity, readSessionCacheActivity, runCompaction, type CacheActivity, type CompactFailure } from "./idle-compact.js";
 import { KEEP_WARM_MIN_CACHE_READ_SHARE, KEEP_WARM_PROMPT, KeepWarmScheduler, keepWarmSettings, type WarmUsage } from "./keep-warm.js";
 import { buildCachedSummaryPrompt, cachedSummaryOptions, conversationDigestOf, cachedSummaryRefusal, describeBoundaryMessage, noteCompaction, summaryInstructions, takeCompactionNote, withFallback } from "./cached-summary.js";
 import { SIDE_QUESTION_HOST_SYMBOL, askSideQuestion, clearSideQuestionBase, recordSideQuestionBase, sideQuestionBase, type ClaudeBridgeSideQuestionHostV1, type SideQuestionModel } from "./side-question.js";
@@ -1250,6 +1252,15 @@ const keepWarm = new KeepWarmScheduler({
 		const session = sharedSession;
 		if (session?.accountProfileId) resolveClaudeAccountRouter()?.recordCacheWarm?.(session.accountProfileId, request.routerSessionId, request.model);
 		debug(`keep-warm: done cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} in=${usage.input} out=${usage.output}`);
+		// A later process (Daseo unloads an idle Pi at 60 minutes) reads this to
+		// know the cache outlived the last request (idle-compact.ts).
+		if (idleCompactSettings(loadConfig(session?.cwd ?? process.cwd()).provider?.idleCompact).enabled) {
+			try {
+				extensionApi?.appendEntry(CACHE_WARM_CUSTOM_TYPE, { at: Date.now(), model: request.model, cacheRead: usage.cacheRead });
+			} catch (error) {
+				debug(`keep-warm: could not record the warm-up: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 		diagDump("cache_keep_warm", {
 			model: request.model,
 			sessionId: session?.sessionId,
@@ -1267,6 +1278,79 @@ const keepWarm = new KeepWarmScheduler({
 
 export function __testKeepWarm(): KeepWarmScheduler {
 	return keepWarm;
+}
+
+export const __testIdleCompact = {
+	run: (event: Parameters<typeof compactBeforeIdleReturn>[0], piCtx: Parameters<typeof compactBeforeIdleReturn>[1]) => compactBeforeIdleReturn(event, piCtx),
+	noteFailure: (event: { aborted: boolean; fromExtension: boolean }) => noteIdleCompactFailure(event),
+};
+
+/** This process's own record of the conversation's last cache refresh: its last top-level request, or a later warm-up of it. */
+function liveCacheActivity(): CacheActivity | undefined {
+	const request = lastTopLevelRequest;
+	if (!request) return undefined;
+	const warmedAt = keepWarm.status().lastWarmAt;
+	return { at: Math.max(request.at, warmedAt ?? 0), model: request.model, contextTokens: request.contextTokens };
+}
+
+let idleCompactInFlight = false;
+let idleCompactFailure: CompactFailure | undefined;
+
+/** Pi's `session_compact_failed`: kept only for the idle compaction this bridge started. */
+function noteIdleCompactFailure(event: { aborted: boolean; fromExtension: boolean }): void {
+	if (idleCompactInFlight) idleCompactFailure = { aborted: event.aborted, fromExtension: event.fromExtension };
+}
+
+/**
+ * Pi's `input` handler: compact a large conversation whose cache expired before
+ * the message goes out (idle-compact.ts). Returns the handler result.
+ */
+async function compactBeforeIdleReturn(event: { source: "interactive" | "rpc" | "extension"; streamingBehavior?: "steer" | "followUp" }, piCtx: ExtensionContext): Promise<{ action: "continue" } | { action: "handled" }> {
+	const settings = idleCompactSettings(loadConfig(piCtx.cwd).provider?.idleCompact);
+	if (!settings.enabled) return { action: "continue" };
+	const model = piCtx.model && isClaudeProvider(piCtx.model.provider) ? piCtx.model.id : undefined;
+	let view: ReturnType<typeof readSessionCacheActivity> = { activity: undefined, compactedSince: false };
+	try {
+		view = readSessionCacheActivity(piCtx.sessionManager.getBranch());
+	} catch (error) {
+		debug(`idle-compact: could not read the session branch: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const activity = mergeCacheActivity(view.activity, liveCacheActivity());
+	const now = Date.now();
+	const refusal = idleCompactRefusal({
+		settings,
+		model,
+		idle: piCtx.isIdle() && !piCtx.hasPendingMessages(),
+		streaming: event.streamingBehavior !== undefined,
+		source: event.source,
+		inFlight: idleCompactInFlight,
+		activity,
+		compactedSince: view.compactedSince,
+		now,
+	});
+	if (refusal) {
+		debug(`idle-compact: not compacting (${refusal})`);
+		return { action: "continue" };
+	}
+	const idleMs = now - activity!.at;
+	debug(`idle-compact: compacting before the message: model=${model} context=${activity!.contextTokens} idle=${Math.round(idleMs / 60_000)}min`);
+	diagDump("idle_compact_start", { model, contextTokens: activity!.contextTokens, idleMs });
+	idleCompactInFlight = true;
+	idleCompactFailure = undefined;
+	const started = Date.now();
+	try {
+		const outcome = await runCompaction((options) => piCtx.compact(options), () => idleCompactFailure);
+		diagDump("idle_compact_end", { model, contextTokens: activity!.contextTokens, idleMs, durationMs: Date.now() - started, ...outcome });
+		if (outcome.kind === "cancelled") {
+			debug("idle-compact: the user stopped the compaction; the message is not sent");
+			return { action: "handled" };
+		}
+		if (outcome.kind === "failed") debug(`idle-compact: compaction failed (${outcome.error}); sending the message on the full context`);
+		return { action: "continue" };
+	} finally {
+		idleCompactInFlight = false;
+		idleCompactFailure = undefined;
+	}
 }
 
 /** The summary written by the conversation's own resumed session while its
@@ -2725,6 +2809,9 @@ export default function (pi: ExtensionAPI) {
 		debug(`session_before_compact: reason=${event.reason} split=${event.preparation.isSplitTurn} summarize=${summarized.length} contextLength=${contextLength ?? "?"} cursor=${session?.cursor ?? "none"}`);
 	});
 	pi.on("session_compact", () => markHistoryRewrite("session_compact"));
+	pi.on("session_compact_failed", (event) => noteIdleCompactFailure(event));
+	// Awaited by Pi before the message is expanded, queued, or started.
+	pi.on("input", (event, ctx) => compactBeforeIdleReturn(event, ctx));
 	pi.on("session_tree", () => markHistoryRewrite("session_tree"));
 
 	// --- Provider ---
