@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Agent SDK 0.3.330, verified on pi 1.6.0 and Claude Code 2.1.330
+
+The bundled Claude Agent SDK moves from 0.3.323 to 0.3.330 and the pi dev pins from 1.5.2 to 1.6.0. No bridge source changed. SDK 0.3.330 makes `query()` fail when `settings` is a JSON string that does not parse; the bridge passes `settings` as an object in every call (main query, one-shot summary). pi 1.6.0 turns Anthropic message threads on for any provider whose base URL is on api.anthropic.com; bridge models register with the base URL `claude-bridge`, so they are not affected. Checked 2026-11-21: typecheck clean, unit 687 pass (2 environment skips), `tests/int-smoke.sh` 3/3, `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
+
 ### Summarize first when returning to a large idle conversation (off by default)
 
 Coming back to a conversation more than an hour after its last request, the prompt cache is gone and the next turn re-writes the whole context; on Fable that was 77 returns and 711.7M weekly-limit units of the windows that followed them in 2026-11-12..19. With `provider.idleCompact.enabled` (or `CLAUDE_BRIDGE_IDLE_COMPACT=1`), the bridge's Pi `input` handler runs Pi's own compaction before the message when the session model is listed (default Fable 5.2 and 5.1), the last request or recorded warm-up is at least `idleMinutes` (60) old, and its context was at least `minContextTokens` (250,000). The summary goes through the existing summary path (Opus for Fable through `summaryModelOverrides`). A failed compaction sends the message on the full context as before; a compaction the user stops drops the message. While the feature is on, each successful keep-warm is recorded as a `claude-bridge-cache-warm` session entry so a process started after Daseo's idle unload still knows the cache outlived the last request. Tests: `tests/unit-idle-compact.mjs`. PoC data and scripts: `poc-idle-compact/`.
