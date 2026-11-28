@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Agent SDK 0.3.332, verified on pi 1.7.0 and Claude Code 2.1.332
+
+The bundled Claude Agent SDK moves from 0.3.330 to 0.3.332, `@anthropic-ai/sdk` to 0.112.5, `cc-session-io` to 0.4.1, `@types/node` to 24.19.4, and the pi dev pins from 1.6.0 to 1.7.0. No bridge source changed. pi 1.7.0's provider and session changes (removed install telemetry, Copilot cache handling, codemode image options) do not touch the bridge's provider path. Checked 2026-11-28: typecheck clean, unit 687 pass (2 environment skips), `tests/int-smoke.sh` 3/3, `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
+
 ### Agent SDK 0.3.330, verified on pi 1.6.0 and Claude Code 2.1.330
 
 The bundled Claude Agent SDK moves from 0.3.323 to 0.3.330 and the pi dev pins from 1.5.2 to 1.6.0. No bridge source changed. SDK 0.3.330 makes `query()` fail when `settings` is a JSON string that does not parse; the bridge passes `settings` as an object in every call (main query, one-shot summary). pi 1.6.0 turns Anthropic message threads on for any provider whose base URL is on api.anthropic.com; bridge models register with the base URL `claude-bridge`, so they are not affected. Checked 2026-11-21: typecheck clean, unit 687 pass (2 environment skips), `tests/int-smoke.sh` 3/3, `tests/int-cache.sh` PASS (99% hit, 4 reuse / 0 rebuild).
